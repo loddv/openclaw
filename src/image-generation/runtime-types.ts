@@ -1,40 +1,24 @@
-import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { FallbackAttempt } from "../agents/model-fallback.types.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { ImageGenerationRequest } from "./provider-types.js";
 import type {
-  GeneratedImageAsset,
   ImageGenerationIgnoredOverride,
   ImageGenerationNormalization,
-  ImageGenerationProvider,
   ImageGenerationResolution,
-  ImageGenerationSourceImage,
+  ImageGenerationResult,
 } from "./types.js";
 
-export type GenerateImageParams = {
-  cfg: OpenClawConfig;
-  prompt: string;
-  agentDir?: string;
-  authStore?: AuthProfileStore;
+export type GenerateImageParams = Omit<ImageGenerationRequest, "provider" | "model"> & {
   modelOverride?: string;
-  count?: number;
-  size?: string;
-  aspectRatio?: string;
-  resolution?: ImageGenerationResolution;
-  inputImages?: ImageGenerationSourceImage[];
+  /** Resolution inferred from reference images; omitted for incompatible fallback models. */
+  inferredResolution?: ImageGenerationResolution;
+  autoProviderFallback?: boolean;
 };
 
-export type GenerateImageRuntimeResult = {
-  images: GeneratedImageAsset[];
+export type GenerateImageRuntimeResult = Omit<ImageGenerationResult, "model"> & {
   provider: string;
   model: string;
   attempts: FallbackAttempt[];
+  appliedResolution?: ImageGenerationResolution;
   normalization?: ImageGenerationNormalization;
-  metadata?: Record<string, unknown>;
   ignoredOverrides: ImageGenerationIgnoredOverride[];
 };
-
-export type ListRuntimeImageGenerationProvidersParams = {
-  config?: OpenClawConfig;
-};
-
-export type RuntimeImageGenerationProvider = ImageGenerationProvider;

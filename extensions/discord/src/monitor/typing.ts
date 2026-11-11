@@ -1,23 +1,19 @@
-import type { RequestClient } from "@buape/carbon";
 import { Routes } from "discord-api-types/v10";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
+import type { RequestClient } from "../internal/discord.js";
 
 const DISCORD_TYPING_START_TIMEOUT_MS = 5_000;
 
 export async function sendTyping(params: { rest: RequestClient; channelId: string }) {
-  let timer: NodeJS.Timeout | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new Error(`discord typing start timed out after ${DISCORD_TYPING_START_TIMEOUT_MS}ms`),
-      );
-    }, DISCORD_TYPING_START_TIMEOUT_MS);
-    timer.unref?.();
-  });
-  try {
-    await Promise.race([params.rest.post(Routes.channelTyping(params.channelId)), timeoutPromise]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
+  const result = await raceWithTimeout(
+    params.rest.post(Routes.channelTyping(params.channelId)).then(() => ({
+      kind: "sent" as const,
+    })),
+    DISCORD_TYPING_START_TIMEOUT_MS,
+    () => ({ kind: "timeout" as const }),
+    { ref: false },
+  );
+  if (result.kind === "timeout") {
+    throw new Error(`discord typing start timed out after ${DISCORD_TYPING_START_TIMEOUT_MS}ms`);
   }
 }

@@ -1,16 +1,13 @@
+// Test routing roots for miscellaneous messaging extension suites.
 import { bundledPluginRoot } from "../../scripts/lib/bundled-plugin-paths.mjs";
 
-export const messagingExtensionIds = [
-  "bluebubbles",
+const messagingExtensionIds = [
   "googlechat",
-  "mattermost",
   "nextcloud-talk",
   "nostr",
-  "qqbot",
   "synology-chat",
   "tlon",
   "twitch",
-  "voice-call",
 ];
 
 export const messagingExtensionTestRoots = messagingExtensionIds.map((id) => bundledPluginRoot(id));

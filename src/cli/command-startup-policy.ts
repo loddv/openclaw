@@ -1,62 +1,48 @@
 import { isTruthyEnvValue } from "../infra/env.js";
 import { resolveCliCommandPathPolicy } from "./command-path-policy.js";
 
-export function shouldBypassConfigGuardForCommandPath(commandPath: string[]): boolean {
-  return resolveCliCommandPathPolicy(commandPath).bypassConfigGuard;
-}
-
-export function shouldSkipRouteConfigGuardForCommandPath(params: {
-  commandPath: string[];
-  suppressDoctorStdout: boolean;
-}): boolean {
-  const routeConfigGuard = resolveCliCommandPathPolicy(params.commandPath).routeConfigGuard;
-  return (
-    routeConfigGuard === "always" ||
-    (routeConfigGuard === "when-suppressed" && params.suppressDoctorStdout)
-  );
-}
-
-export function shouldLoadPluginsForCommandPath(params: {
-  commandPath: string[];
-  jsonOutputMode: boolean;
-}): boolean {
-  const loadPlugins = resolveCliCommandPathPolicy(params.commandPath).loadPlugins;
-  return loadPlugins === "always" || (loadPlugins === "text-only" && !params.jsonOutputMode);
-}
-
-export function shouldHideCliBannerForCommandPath(
-  commandPath: string[],
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return (
-    isTruthyEnvValue(env.OPENCLAW_HIDE_BANNER) ||
-    resolveCliCommandPathPolicy(commandPath).hideBanner
-  );
-}
-
-export function shouldEnsureCliPathForCommandPath(commandPath: string[]): boolean {
-  return commandPath.length === 0 || resolveCliCommandPathPolicy(commandPath).ensureCliPath;
-}
-
 export function resolveCliStartupPolicy(params: {
+  argv?: string[];
+  /** Commander-owned option values, available after parsing. */
+  options?: Readonly<Record<string, unknown>>;
   commandPath: string[];
   jsonOutputMode: boolean;
+  machineOutputMode?: boolean;
   env?: NodeJS.ProcessEnv;
-  routeMode?: boolean;
+  /** Set only by the parsed, registered native capability action. */
+  nativeUpdateExecutorCheck?: boolean;
 }) {
-  const suppressDoctorStdout = params.jsonOutputMode;
+  const commandPolicy = resolveCliCommandPathPolicy(params.commandPath);
+  const nativeCheck = params.nativeUpdateExecutorCheck === true;
+  const machineOutputMode =
+    nativeCheck || params.jsonOutputMode || params.machineOutputMode === true;
+  // Protocol commands own stdout from process startup, before their action installs later routing.
+  const suppressDoctorStdout = machineOutputMode || commandPolicy.ownsProtocolStdout;
+  const configGuard =
+    typeof commandPolicy.configGuard === "function"
+      ? commandPolicy.configGuard({
+          argv: params.argv ?? [],
+          commandPath: params.commandPath,
+          options: params.options,
+        })
+      : commandPolicy.configGuard;
+  const env = params.env ?? process.env;
+  const hideBanner = machineOutputMode || commandPolicy.hideBanner;
   return {
     suppressDoctorStdout,
-    hideBanner: shouldHideCliBannerForCommandPath(params.commandPath, params.env),
-    skipConfigGuard: params.routeMode
-      ? shouldSkipRouteConfigGuardForCommandPath({
-          commandPath: params.commandPath,
-          suppressDoctorStdout,
-        })
-      : false,
-    loadPlugins: shouldLoadPluginsForCommandPath({
-      commandPath: params.commandPath,
-      jsonOutputMode: params.jsonOutputMode,
-    }),
+    hideBanner: hideBanner || isTruthyEnvValue(env.OPENCLAW_HIDE_BANNER),
+    skipConfigGuard: nativeCheck || configGuard === "skip" || configGuard === "defer",
+    // Deferred actions own full preparation; early routing/proxy reads need only core config.
+    ...(configGuard === "validate" || configGuard === "defer" ? { validateConfigOnly: true } : {}),
+    loadPlugins:
+      !nativeCheck &&
+      (typeof commandPolicy.loadPlugins === "function"
+        ? commandPolicy.loadPlugins({
+            argv: params.argv ?? [],
+            commandPath: params.commandPath,
+            jsonOutputMode: params.jsonOutputMode,
+          })
+        : commandPolicy.loadPlugins === "always"),
+    pluginRegistry: commandPolicy.pluginRegistry,
   };
 }

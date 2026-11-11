@@ -1,6 +1,75 @@
-import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
-import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import {
+  defineBundledChannelEntry,
+  type OpenClawPluginApi,
+} from "openclaw/plugin-sdk/channel-entry-contract";
+import { runWithLocalStateMutationOwner } from "openclaw/plugin-sdk/gateway-runtime";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { registerMatrixCliMetadata } from "./cli-metadata.js";
+import { setMatrixRuntimeLifecycle } from "./runtime-setter-api.js";
+import { registerMatrixSubagentHooks } from "./subagent-hooks-api.js";
+
+const loadMatrixHandlersRuntimeModule = createLazyRuntimeModule(
+  () => import("./plugin-entry.handlers.runtime.js"),
+);
+
+export function registerMatrixFullRuntime(api: OpenClawPluginApi): void {
+  setMatrixRuntimeLifecycle(api.runtime, api.lifecycle);
+  const methods = {
+    "matrix.verify.recoveryKey": "handleVerifyRecoveryKey",
+    "matrix.verify.bootstrap": "handleVerificationBootstrap",
+    "matrix.verify.status": "handleVerificationStatus",
+  } as const;
+  for (const [method, handler] of Object.entries(methods)) {
+    for (const ownerBound of [false, true]) {
+      api.registerGatewayMethod(ownerBound ? `${method}.owner` : method, async (ctx) => {
+        let response: Parameters<typeof ctx.respond> | undefined;
+        let assertOwnerCurrent: (() => void) | undefined;
+        let accepted = false;
+        const run = async (assertCurrent?: () => void) => {
+          const runtime = await loadMatrixHandlersRuntimeModule();
+          assertCurrent?.();
+          assertOwnerCurrent = assertCurrent;
+          accepted = true;
+          await runtime[handler](
+            assertCurrent
+              ? {
+                  ...ctx,
+                  respond: (...args) => {
+                    response = args;
+                  },
+                }
+              : ctx,
+          );
+        };
+        if (!ownerBound && ctx.params.expectedOwnerId === undefined) {
+          await run();
+          return;
+        }
+        try {
+          if (
+            typeof ctx.params.expectedOwnerId !== "string" ||
+            !ctx.params.expectedOwnerId.trim()
+          ) {
+            throw new Error("expectedOwnerId must be a non-empty string");
+          }
+          await runWithLocalStateMutationOwner(ctx.params.expectedOwnerId, ctx, run);
+          assertOwnerCurrent?.();
+          if (response) {
+            ctx.respond(...response);
+          }
+        } catch (error) {
+          ctx.respond(false, undefined, {
+            code: "UNAVAILABLE",
+            message: String(error),
+            ...(!accepted ? { details: { mutationAccepted: false } } : {}),
+          });
+        }
+      });
+    }
+  }
+
+  registerMatrixSubagentHooks(api);
+}
 
 export default defineBundledChannelEntry({
   id: "matrix",
@@ -16,36 +85,9 @@ export default defineBundledChannelEntry({
     exportName: "channelSecrets",
   },
   runtime: {
-    specifier: "./runtime-api.js",
+    specifier: "./runtime-setter-api.js",
     exportName: "setMatrixRuntime",
   },
   registerCliMetadata: registerMatrixCliMetadata,
-  registerFull(api) {
-    void import("./plugin-entry.handlers.runtime.js")
-      .then(({ ensureMatrixCryptoRuntime }) =>
-        ensureMatrixCryptoRuntime({ log: api.logger.info }).catch((err: unknown) => {
-          const message = formatErrorMessage(err);
-          api.logger.warn?.(`matrix: crypto runtime bootstrap failed: ${message}`);
-        }),
-      )
-      .catch((err: unknown) => {
-        const message = formatErrorMessage(err);
-        api.logger.warn?.(`matrix: failed loading crypto bootstrap runtime: ${message}`);
-      });
-
-    api.registerGatewayMethod("matrix.verify.recoveryKey", async (ctx) => {
-      const { handleVerifyRecoveryKey } = await import("./plugin-entry.handlers.runtime.js");
-      await handleVerifyRecoveryKey(ctx);
-    });
-
-    api.registerGatewayMethod("matrix.verify.bootstrap", async (ctx) => {
-      const { handleVerificationBootstrap } = await import("./plugin-entry.handlers.runtime.js");
-      await handleVerificationBootstrap(ctx);
-    });
-
-    api.registerGatewayMethod("matrix.verify.status", async (ctx) => {
-      const { handleVerificationStatus } = await import("./plugin-entry.handlers.runtime.js");
-      await handleVerificationStatus(ctx);
-    });
-  },
+  registerFull: registerMatrixFullRuntime,
 });

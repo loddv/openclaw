@@ -1,96 +1,66 @@
-import { describe, expect, it } from "vitest";
-import { buildStatusCommandReportLines } from "./status.command-report.ts";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import * as terminalTable from "../../packages/terminal-core/src/table.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
+import { buildStatusCommandReportLines } from "./status.command-report.js";
+import { createStatusCommandReportDataParams } from "./status.test-support.js";
 
-function createRenderTable() {
-  return ({ columns, rows }: { columns: Array<Record<string, unknown>>; rows: unknown[] }) =>
-    `table:${String(columns[0]?.header)}:${rows.length}`;
-}
+// mock-isolation: Report layout needs fixed backup facts, not a live database read.
+vi.mock("../state/backup-run-records.js", () => ({ readBackupRunFreshness: async () => ({}) }));
+vi.mock("./status-overview-rows.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./status-overview-rows.ts")>()),
+  buildStatusCommandOverviewRows: () => [{ Item: "OS", Value: "macOS" }],
+}));
 
-describe("buildStatusCommandReportLines", () => {
-  it("builds the full command report with optional sections", async () => {
-    const lines = await buildStatusCommandReportLines({
-      heading: (text) => `# ${text}`,
-      muted: (text) => `muted(${text})`,
-      renderTable: createRenderTable(),
-      width: 120,
-      overviewRows: [{ Item: "OS", Value: "macOS" }],
-      showTaskMaintenanceHint: true,
-      taskMaintenanceHint: "maintenance hint",
-      pluginCompatibilityLines: ["warn 1"],
-      pairingRecoveryLines: ["pairing needed"],
-      securityAuditLines: ["audit line"],
-      channelsColumns: [{ key: "Channel", header: "Channel" }],
-      channelsRows: [{ Channel: "telegram" }],
-      sessionsColumns: [{ key: "Key", header: "Key" }],
-      sessionsRows: [{ Key: "main" }],
-      systemEventsRows: [{ Event: "queued" }],
-      systemEventsTrailer: "muted(… +1 more)",
-      healthColumns: [{ key: "Item", header: "Item" }],
-      healthRows: [{ Item: "Gateway" }],
-      usageLines: ["usage line"],
-      footerLines: ["FAQ", "Next steps:"],
+beforeEach(() => {
+  vi.spyOn(theme, "heading").mockImplementation((text) => `# ${String(text)}`);
+  for (const color of ["success", "warn", "muted", "error"] as const) {
+    vi.spyOn(theme, color).mockImplementation(String);
+  }
+  vi.spyOn(terminalTable, "renderTable").mockImplementation(
+    ({ columns, rows }) =>
+      `table:${columns.map((column) => column.header).join("+")}:${rows.length} \n\t`,
+  );
+});
+afterEach(() => vi.restoreAllMocks());
+
+it.each([true, false])("orders and trims report sections (full=%s)", async (full) => {
+  const params = createStatusCommandReportDataParams({ opts: { deep: true, verbose: false } });
+  params.summary.queuedSystemEvents = full ? ["one", "two", "three", "four", "five", "six"] : [];
+  if (!full) {
+    Object.assign(params, {
+      channels: { rows: [] },
+      usageLines: undefined,
+      pluginCompatibility: [],
+      pairingRecovery: null,
+      health: undefined,
+      securityAudit: undefined,
     });
-
-    expect(lines).toEqual([
-      "# OpenClaw status",
-      "",
-      "# Overview",
-      "table:Item:1",
-      "",
-      "muted(maintenance hint)",
-      "",
-      "# Plugin compatibility",
-      "warn 1",
-      "",
-      "pairing needed",
-      "",
-      "# Security audit",
-      "audit line",
-      "",
-      "# Channels",
-      "table:Channel:1",
-      "",
-      "# Sessions",
-      "table:Key:1",
-      "",
-      "# System events",
-      "table:Event:1",
-      "muted(… +1 more)",
-      "",
-      "# Health",
-      "table:Item:1",
-      "",
-      "# Usage",
-      "usage line",
-      "",
-      "FAQ",
-      "Next steps:",
-    ]);
-  });
-
-  it("omits optional sections when inputs are absent", async () => {
-    const lines = await buildStatusCommandReportLines({
-      heading: (text) => `# ${text}`,
-      muted: (text) => text,
-      renderTable: createRenderTable(),
-      width: 120,
-      overviewRows: [{ Item: "OS", Value: "macOS" }],
-      showTaskMaintenanceHint: false,
-      taskMaintenanceHint: "ignored",
-      pluginCompatibilityLines: [],
-      pairingRecoveryLines: [],
-      securityAuditLines: ["audit line"],
-      channelsColumns: [{ key: "Channel", header: "Channel" }],
-      channelsRows: [{ Channel: "telegram" }],
-      sessionsColumns: [{ key: "Key", header: "Key" }],
-      sessionsRows: [{ Key: "main" }],
-      footerLines: ["FAQ"],
-    });
-
-    expect(lines).not.toContain("# Plugin compatibility");
-    expect(lines).not.toContain("# System events");
-    expect(lines).not.toContain("# Health");
-    expect(lines).not.toContain("# Usage");
-    expect(lines.at(-1)).toBe("FAQ");
-  });
+    params.summary.sessions.recent = [];
+  }
+  const lines = await buildStatusCommandReportLines(params);
+  const output = lines.join("\n");
+  expect(lines.filter((line) => line.startsWith("# "))).toEqual([
+    "# OpenClaw status",
+    "# Overview",
+    ...(full ? ["# Plugin compatibility"] : []),
+    "# Security audit",
+    "# Channels",
+    "# Sessions",
+    ...(full ? ["# System events", "# Health", "# Usage"] : []),
+  ]);
+  if (full) {
+    expect(output).toContain("# Overview\ntable:Item+Value:1\n\n# Plugin compatibility");
+    expect(output).toContain(
+      "# System events\ntable:Event:5\n… +1 more\n\n# Health\ntable:Item+Status+Detail:1\n\n# Usage\nusage line\n\nFAQ: https://docs.openclaw.ai/faq",
+    );
+  } else {
+    expect(output).toContain(
+      "# Channels\nNo channels configured\n\n# Sessions\nNo sessions\n\nFAQ: https://docs.openclaw.ai/faq",
+    );
+  }
+  expect(output).not.toContain(" \n\t");
+  expect(output).toContain(
+    "FAQ: https://docs.openclaw.ai/faq\nTroubleshooting: https://docs.openclaw.ai/troubleshooting\nSupport: https://community.openclaw.ai/",
+  );
+  expect(lines.at(-1)).toBe("  Need to test channels? openclaw status --deep");
 });

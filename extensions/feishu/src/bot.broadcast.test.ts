@@ -1,373 +1,346 @@
-import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClawdbotConfig, PluginRuntime } from "../runtime-api.js";
-import type { FeishuMessageEvent } from "./bot.js";
-import { handleFeishuMessage } from "./bot.js";
-import { setFeishuRuntime } from "./runtime.js";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { describe, expect, it, vi } from "vitest";
+import { createRuntimeEnv, setupFeishuBroadcastTestHarness } from "./bot.broadcast.test-support.js";
+import { feishuDedupeState } from "./dedup-state.js";
+import type { FeishuMessageProcessingClaim } from "./dedup.js";
+import type { FeishuIngressLifecycle } from "./feishu-ingress.js";
 
-const { mockCreateFeishuReplyDispatcher, mockCreateFeishuClient, mockResolveAgentRoute } =
-  vi.hoisted(() => ({
-    mockCreateFeishuReplyDispatcher: vi.fn(() => ({
-      dispatcher: {
-        sendToolResult: vi.fn(),
-        sendBlockReply: vi.fn(),
-        sendFinalReply: vi.fn(),
-        waitForIdle: vi.fn(),
-        getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
-        getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
-        markComplete: vi.fn(),
-      },
-      replyOptions: {},
-      markDispatchIdle: vi.fn(),
-    })),
-    mockCreateFeishuClient: vi.fn(),
-    mockResolveAgentRoute: vi.fn(),
-  }));
+const failedFinalReceipt = {
+  counts: { final: { failedBeforeSend: 1 } },
+  anyVisibleDelivered: false,
+};
 
-vi.mock("./reply-dispatcher.js", () => ({
-  createFeishuReplyDispatcher: mockCreateFeishuReplyDispatcher,
-}));
-
-vi.mock("./client.js", () => ({
-  createFeishuClient: mockCreateFeishuClient,
-}));
-
-function createRuntimeEnv() {
+function createIngressLifecycle() {
   return {
-    log: vi.fn(),
-    error: vi.fn(),
-    writeStdout: vi.fn(),
-    writeJson: vi.fn(),
-    exit: vi.fn((code: number): never => {
-      throw new Error(`exit ${code}`);
-    }),
+    abortSignal: new AbortController().signal,
+    onAdopted: vi.fn(async () => {}),
+    onDeferred: vi.fn(),
+    onDeferredHeartbeat: vi.fn(),
+    onAdoptionFinalizing: vi.fn(),
+    onAbandoned: vi.fn(async () => {}),
+  } satisfies FeishuIngressLifecycle;
+}
+
+function createReplayClaim(key: string): FeishuMessageProcessingClaim {
+  return {
+    keys: [key],
+    commit: vi.fn(async () => true),
+    release: vi.fn(),
   };
 }
 
-describe("broadcast dispatch", () => {
-  const finalizeInboundContextCalls: Array<Record<string, unknown>> = [];
-  const mockFinalizeInboundContext: PluginRuntime["channel"]["reply"]["finalizeInboundContext"] = (
-    ctx,
-  ) => {
-    finalizeInboundContextCalls.push(ctx);
-    return {
-      ...ctx,
-      CommandAuthorized: typeof ctx.CommandAuthorized === "boolean" ? ctx.CommandAuthorized : false,
-    };
-  };
-  const mockDispatchReplyFromConfig = vi
-    .fn()
-    .mockResolvedValue({ queuedFinal: false, counts: { final: 1 } });
-  const mockWithReplyDispatcher: PluginRuntime["channel"]["reply"]["withReplyDispatcher"] = async ({
-    dispatcher,
-    run,
-    onSettled,
-  }) => {
-    try {
-      return await run();
-    } finally {
-      dispatcher.markComplete();
-      try {
-        await dispatcher.waitForIdle();
-      } finally {
-        await onSettled?.();
-      }
+function expectClaim(claim: FeishuMessageProcessingClaim, committed: boolean) {
+  expect(claim.commit).toHaveBeenCalledTimes(committed ? 1 : 0);
+  expect(claim.release).toHaveBeenCalledTimes(committed ? 0 : 1);
+}
+
+function mockBroadcastClaims(key: string, redelivery = false) {
+  const broadcastClaim = createReplayClaim(key);
+  const susanClaim = createReplayClaim(`${key}-susan`);
+  const mainClaim = createReplayClaim(`${key}-main`);
+  const retryClaim = createReplayClaim(`${key}-retry`);
+  const retrySusanClaim = createReplayClaim(`${key}-susan-retry`);
+  const claims = new Map([
+    ["broadcast", redelivery ? [broadcastClaim, retryClaim] : [broadcastClaim]],
+    ["broadcast:susan", redelivery ? [susanClaim, retrySusanClaim] : [susanClaim]],
+    ["broadcast:main", [mainClaim]],
+  ]);
+  vi.spyOn(feishuDedupeState.guard, "claim").mockImplementation(async (_messageId, options) => {
+    const attempts = claims.get(options?.namespace ?? "");
+    if (!attempts) {
+      return { kind: "invalid" };
     }
-  };
-  const resolveEnvelopeFormatOptionsMock: PluginRuntime["channel"]["reply"]["resolveEnvelopeFormatOptions"] =
-    () => ({}) satisfies EnvelopeFormatOptions;
-  const mockShouldComputeCommandAuthorized = vi.fn(() => false);
-  const mockSaveMediaBuffer = vi.fn().mockResolvedValue({
-    path: "/tmp/inbound-clip.mp4",
-    contentType: "video/mp4",
+    const handle = attempts.shift();
+    return handle ? { kind: "claimed", handle } : { kind: "duplicate" };
   });
-  const runtimeStub = {
-    system: {
-      enqueueSystemEvent: vi.fn(),
-    },
-    channel: {
-      routing: {
-        resolveAgentRoute: (params: unknown) => mockResolveAgentRoute(params),
-      },
-      session: {
-        resolveStorePath: vi.fn(() => "/tmp/feishu-session-store.json"),
-      },
-      reply: {
-        resolveEnvelopeFormatOptions: resolveEnvelopeFormatOptionsMock,
-        formatAgentEnvelope: vi.fn((params: { body: string }) => params.body),
-        finalizeInboundContext:
-          mockFinalizeInboundContext as unknown as PluginRuntime["channel"]["reply"]["finalizeInboundContext"],
-        dispatchReplyFromConfig: mockDispatchReplyFromConfig,
-        withReplyDispatcher:
-          mockWithReplyDispatcher as unknown as PluginRuntime["channel"]["reply"]["withReplyDispatcher"],
-      },
-      commands: {
-        shouldComputeCommandAuthorized: mockShouldComputeCommandAuthorized,
-        resolveCommandAuthorizedFromAuthorizers: vi.fn(() => false),
-      },
-      media: {
-        saveMediaBuffer: mockSaveMediaBuffer,
-      },
-      pairing: {
-        readAllowFromStore: vi.fn().mockResolvedValue([]),
-        upsertPairingRequest: vi.fn().mockResolvedValue({ code: "ABCDEFGH", created: false }),
-        buildPairingReply: vi.fn(() => "Pairing response"),
-      },
-    },
-    media: {
-      detectMime: vi.fn(async () => "application/octet-stream"),
-    },
-  } as unknown as PluginRuntime;
+  return { broadcastClaim, susanClaim, mainClaim, retryClaim, retrySusanClaim };
+}
 
-  function createBroadcastConfig(): ClawdbotConfig {
-    return {
-      broadcast: { "oc-broadcast-group": ["susan", "main"] },
-      agents: { list: [{ id: "main" }, { id: "susan" }] },
-      channels: {
-        feishu: {
-          groups: {
-            "oc-broadcast-group": {
-              requireMention: true,
-            },
-          },
-        },
-      },
-    };
+describe("broadcast dispatch", () => {
+  const {
+    createBroadcastConfig,
+    createBroadcastEvent,
+    createReplyDispatcher,
+    handleFeishuMessage,
+    mockCreateFeishuReplyDispatcher,
+    mockDispatchReply,
+    mockGetChatInfo,
+    mockResolveStorePath,
+    resolvedTurnCalls,
+    runtimeStub,
+  } = setupFeishuBroadcastTestHarness();
+
+  function mockActiveDispatcher(ensureNoVisibleReplyFallback = vi.fn()) {
+    const dispatcher = { ...createReplyDispatcher(), ensureNoVisibleReplyFallback };
+    mockCreateFeishuReplyDispatcher.mockReturnValueOnce(dispatcher);
+    return { ...dispatcher.delivery, ensureNoVisibleReplyFallback };
   }
 
-  function createBroadcastEvent(options: {
-    messageId: string;
-    text: string;
-    botMentioned?: boolean;
-  }): FeishuMessageEvent {
-    return {
-      sender: { sender_id: { open_id: "ou-sender" } },
-      message: {
-        message_id: options.messageId,
-        chat_id: "oc-broadcast-group",
-        chat_type: "group",
-        message_type: "text",
-        content: JSON.stringify({ text: options.text }),
-        ...(options.botMentioned
-          ? {
-              mentions: [
-                {
-                  key: "@_user_1",
-                  id: { open_id: "bot-open-id" },
-                  name: "Bot",
-                  tenant_key: "",
-                },
-              ],
-            }
-          : {}),
-      },
-    };
+  function mockAgentReply(agent: "main" | "susan", result: unknown) {
+    mockDispatchReply.mockImplementation(async ({ ctx }) =>
+      String(ctx.SessionKey).startsWith(`agent:${agent}:`)
+        ? result
+        : { queuedFinal: false, counts: { final: 1 } },
+    );
   }
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    finalizeInboundContextCalls.length = 0;
-    mockResolveAgentRoute.mockReturnValue({
-      agentId: "main",
-      channel: "feishu",
-      accountId: "default",
-      sessionKey: "agent:main:feishu:group:oc-broadcast-group",
-      mainSessionKey: "agent:main:main",
-      lastRoutePolicy: "session",
-      matchedBy: "default",
-    });
-    mockCreateFeishuClient.mockReturnValue({
-      contact: {
-        user: {
-          get: vi.fn().mockResolvedValue({ data: { user: { name: "Sender" } } }),
-        },
-      },
-    });
-    setFeishuRuntime(runtimeStub);
-  });
-
-  it("dispatches to all broadcast agents when bot is mentioned", async () => {
-    const cfg = createBroadcastConfig();
-    const event = createBroadcastEvent({
-      messageId: "msg-broadcast-mentioned",
-      text: "hello @bot",
-      botMentioned: true,
-    });
-
-    await handleFeishuMessage({
-      cfg,
-      event,
+  function dispatchBroadcast(
+    messageId: string,
+    options: Partial<Parameters<typeof handleFeishuMessage>[0]> = {},
+  ) {
+    return handleFeishuMessage({
+      cfg: createBroadcastConfig(),
+      event: createBroadcastEvent({ messageId, text: "hello @bot", botMentioned: true }),
       botOpenId: "bot-open-id",
       runtime: createRuntimeEnv(),
+      ...options,
     });
+  }
 
-    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(2);
-    const sessionKeys = finalizeInboundContextCalls.map((call) => call.SessionKey);
-    expect(sessionKeys).toContain("agent:susan:feishu:group:oc-broadcast-group");
-    expect(sessionKeys).toContain("agent:main:feishu:group:oc-broadcast-group");
-    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledTimes(1);
-    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledWith(
-      expect.objectContaining({ agentId: "main" }),
-    );
-  });
-
-  it("skips broadcast dispatch when bot is NOT mentioned (requireMention=true)", async () => {
+  it("settles observer commands without dispatching or replaying them", async () => {
+    const { broadcastClaim, susanClaim, mainClaim } = mockBroadcastClaims("broadcast-command");
+    const turnAdoptionLifecycle = createIngressLifecycle();
+    vi.spyOn(runtimeStub.channel.commands, "shouldComputeCommandAuthorized").mockReturnValue(true);
     const cfg = createBroadcastConfig();
+    cfg.channels = {
+      ...cfg.channels,
+      feishu: { ...cfg.channels?.feishu, allowFrom: ["ou_sender"] },
+    };
     const event = createBroadcastEvent({
-      messageId: "msg-broadcast-not-mentioned",
-      text: "hello everyone",
+      messageId: "broadcast-command",
+      text: "/followup next task",
+      botMentioned: true,
     });
-
-    await handleFeishuMessage({
-      cfg,
-      event,
-      botOpenId: "ou_known_bot",
-      runtime: createRuntimeEnv(),
-    });
-
-    expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
-    expect(mockCreateFeishuReplyDispatcher).not.toHaveBeenCalled();
+    event.sender.sender_id.open_id = "ou_sender";
+    await dispatchBroadcast("broadcast-command", { cfg, event, turnAdoptionLifecycle });
+    expect(mockDispatchReply).toHaveBeenCalledTimes(1);
+    expectClaim(susanClaim, true);
+    expectClaim(mainClaim, true);
+    expectClaim(broadcastClaim, true);
+    await dispatchBroadcast("broadcast-command", { cfg, event, turnAdoptionLifecycle });
+    expect(mockDispatchReply).toHaveBeenCalledTimes(1);
+    expect(turnAdoptionLifecycle.onAdopted).toHaveBeenCalledTimes(1);
+    expect(turnAdoptionLifecycle.onAbandoned).not.toHaveBeenCalled();
   });
 
-  it("skips broadcast dispatch when bot identity is unknown (requireMention=true)", async () => {
-    const cfg = createBroadcastConfig();
-    const event = createBroadcastEvent({
-      messageId: "msg-broadcast-unknown-bot-id",
-      text: "hello everyone",
+  it("sends no-visible-reply fallback for active broadcast failed final delivery", async () => {
+    mockAgentReply("main", {
+      queuedFinal: true,
+      counts: { final: 1 },
+      settledReceipt: failedFinalReceipt,
     });
+    const { deliver: activeDeliver, ensureNoVisibleReplyFallback } = mockActiveDispatcher();
+    await dispatchBroadcast("msg-broadcast-final-failed");
 
-    await handleFeishuMessage({
-      cfg,
-      event,
-      runtime: createRuntimeEnv(),
-    });
-
-    expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
-    expect(mockCreateFeishuReplyDispatcher).not.toHaveBeenCalled();
-  });
-
-  it("preserves single-agent dispatch when no broadcast config", async () => {
-    const cfg: ClawdbotConfig = {
-      channels: {
-        feishu: {
-          groups: {
-            "oc-broadcast-group": {
-              requireMention: false,
-            },
-          },
-        },
-      },
-    };
-
-    const event: FeishuMessageEvent = {
-      sender: { sender_id: { open_id: "ou-sender" } },
-      message: {
-        message_id: "msg-no-broadcast",
-        chat_id: "oc-broadcast-group",
-        chat_type: "group",
-        message_type: "text",
-        content: JSON.stringify({ text: "hello" }),
-      },
-    };
-
-    await handleFeishuMessage({
-      cfg,
-      event,
-      runtime: createRuntimeEnv(),
-    });
-
-    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
-    expect(mockCreateFeishuReplyDispatcher).toHaveBeenCalledTimes(1);
-    expect(finalizeInboundContextCalls).toContainEqual(
-      expect.objectContaining({
-        SessionKey: "agent:main:feishu:group:oc-broadcast-group",
-      }),
+    expect(ensureNoVisibleReplyFallback).toHaveBeenCalledWith(
+      "broadcast-dispatch-complete-no-visible-reply",
     );
+    const observerDelivery = resolvedTurnCalls.find(
+      (turn) => turn.admission?.kind === "observeOnly",
+    )?.delivery;
+    expect(observerDelivery?.deliver).not.toBe(activeDeliver);
+    await expect(observerDelivery?.deliver({}, { kind: "final" })).resolves.toEqual({
+      visibleReplySent: false,
+    });
+    expect(activeDeliver).not.toHaveBeenCalled();
+  });
+
+  it("skips no-visible-reply fallback for source-suppressed active broadcast dispatch", async () => {
+    mockAgentReply("main", {
+      queuedFinal: false,
+      counts: { final: 0 },
+      sourceReplyDeliveryMode: "message_tool_only",
+      noVisibleReplyFallbackEligible: true,
+    });
+    const { ensureNoVisibleReplyFallback } = mockActiveDispatcher();
+    await dispatchBroadcast("msg-broadcast-source-suppressed");
+
+    expect(ensureNoVisibleReplyFallback).not.toHaveBeenCalled();
   });
 
   it("cross-account broadcast dedup: second account skips dispatch", async () => {
-    const cfg: ClawdbotConfig = {
-      broadcast: { "oc-broadcast-group": ["susan", "main"] },
-      agents: { list: [{ id: "main" }, { id: "susan" }] },
-      channels: {
-        feishu: {
-          groups: {
-            "oc-broadcast-group": {
-              requireMention: false,
-            },
-          },
-        },
-      },
-    };
+    const cfg = createBroadcastConfig(false);
+    const event = createBroadcastEvent({ messageId: "msg-multi-account-dedup", text: "hello" });
 
-    const event: FeishuMessageEvent = {
-      sender: { sender_id: { open_id: "ou-sender" } },
-      message: {
-        message_id: "msg-multi-account-dedup",
-        chat_id: "oc-broadcast-group",
-        chat_type: "group",
-        message_type: "text",
-        content: JSON.stringify({ text: "hello" }),
-      },
-    };
+    const params = { cfg, event, botOpenId: undefined };
+    await dispatchBroadcast("msg-multi-account-dedup", { ...params, accountId: "account-A" });
+    expect(mockDispatchReply).toHaveBeenCalledTimes(2);
 
-    await handleFeishuMessage({
-      cfg,
-      event,
-      runtime: createRuntimeEnv(),
-      accountId: "account-A",
-    });
-    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(2);
+    mockDispatchReply.mockClear();
+    mockGetChatInfo.mockClear();
 
-    mockDispatchReplyFromConfig.mockClear();
-    finalizeInboundContextCalls.length = 0;
-
-    await handleFeishuMessage({
-      cfg,
-      event,
-      runtime: createRuntimeEnv(),
-      accountId: "account-B",
-    });
-    expect(mockDispatchReplyFromConfig).not.toHaveBeenCalled();
+    await dispatchBroadcast("msg-multi-account-dedup", { ...params, accountId: "account-B" });
+    expect(mockDispatchReply).not.toHaveBeenCalled();
+    expect(mockGetChatInfo).not.toHaveBeenCalled();
   });
 
-  it("skips unknown agents not in agents.list", async () => {
-    const cfg: ClawdbotConfig = {
-      broadcast: { "oc-broadcast-group": ["susan", "unknown-agent"] },
-      agents: { list: [{ id: "main" }, { id: "susan" }] },
-      channels: {
-        feishu: {
-          groups: {
-            "oc-broadcast-group": {
-              requireMention: false,
-            },
-          },
-        },
-      },
-    };
+  it("abandons a failed broadcast claim and re-dispatches it on redelivery", async () => {
+    const {
+      broadcastClaim: firstClaim,
+      susanClaim: firstSusanClaim,
+      mainClaim,
+      retryClaim,
+      retrySusanClaim,
+    } = mockBroadcastClaims("redelivery", true);
+    mockDispatchReply
+      .mockRejectedValueOnce(new Error("observer dispatch failed"))
+      .mockResolvedValue({ queuedFinal: false, counts: { final: 1 } });
+    const firstTransport = createIngressLifecycle();
+    const cfg = createBroadcastConfig();
+    cfg.broadcast = { ...cfg.broadcast, strategy: "sequential" };
 
-    const event: FeishuMessageEvent = {
-      sender: { sender_id: { open_id: "ou-sender" } },
-      message: {
-        message_id: "msg-broadcast-unknown-agent",
-        chat_id: "oc-broadcast-group",
-        chat_type: "group",
-        message_type: "text",
-        content: JSON.stringify({ text: "hello" }),
-      },
-    };
+    await expect(
+      dispatchBroadcast("redelivery", { cfg, turnAdoptionLifecycle: firstTransport }),
+    ).rejects.toThrow("observer dispatch failed");
 
-    await handleFeishuMessage({
-      cfg,
-      event,
-      runtime: createRuntimeEnv(),
+    expect(mockDispatchReply).toHaveBeenCalledTimes(2);
+    expectClaim(firstClaim, false);
+    expectClaim(firstSusanClaim, false);
+    expectClaim(mainClaim, true);
+    expect(firstTransport.onAdopted).not.toHaveBeenCalled();
+    expect(firstTransport.onAbandoned).toHaveBeenCalledTimes(1);
+
+    mockDispatchReply.mockClear();
+    const retryTransport = createIngressLifecycle();
+    await dispatchBroadcast("redelivery", { cfg, turnAdoptionLifecycle: retryTransport });
+
+    // The adopted main lane stays committed; only failed Susan re-dispatches.
+    expect(mockDispatchReply).toHaveBeenCalledTimes(1);
+    expect(retryTransport.onAdopted).toHaveBeenCalledTimes(1);
+    expect(retryTransport.onAbandoned).not.toHaveBeenCalled();
+    expectClaim(retryClaim, true);
+    expectClaim(retrySusanClaim, true);
+  });
+
+  it.each([
+    ["fallback-failure", "fallback send failed"],
+    ["setup-failure", "session path failed"],
+    ["undispatched", undefined],
+  ] as const)("settles each lane independently after %s", async (failure, error) => {
+    const { broadcastClaim, susanClaim, mainClaim } = mockBroadcastClaims(failure);
+    const cfg = createBroadcastConfig();
+    if (failure === "fallback-failure") {
+      mockAgentReply("main", {
+        queuedFinal: false,
+        counts: { final: 0 },
+        noVisibleReplyFallbackEligible: true,
+      });
+      mockActiveDispatcher(vi.fn().mockRejectedValue(new Error(error)));
+    } else if (failure === "setup-failure") {
+      cfg.broadcast = { ...cfg.broadcast, strategy: "sequential" };
+      mockResolveStorePath.mockImplementation((_store, options?: { agentId?: string }) => {
+        if (options?.agentId === "susan") {
+          throw new Error(error);
+        }
+        return "/tmp/feishu-session-store.json";
+      });
+    } else {
+      mockAgentReply("susan", { queuedFinal: false, counts: { final: 0 }, undispatched: true });
+    }
+    const transport = createIngressLifecycle();
+    const handling = dispatchBroadcast(failure, { cfg, turnAdoptionLifecycle: transport });
+    if (error) {
+      await expect(handling).rejects.toThrow(error);
+    } else {
+      await handling;
+    }
+    expectClaim(susanClaim, failure === "fallback-failure");
+    expectClaim(mainClaim, true);
+    expectClaim(broadcastClaim, false);
+    if (failure === "undispatched") {
+      expect(transport.onAdopted).not.toHaveBeenCalled();
+    }
+    expect(transport.onAbandoned).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits the shared broadcast claim only after transport adoption", async () => {
+    const { broadcastClaim, susanClaim, mainClaim } = mockBroadcastClaims("adoption-order");
+    const transport = createIngressLifecycle();
+    const adoptionStarted = createDeferred<void>();
+    const adoptionGate = createDeferred<void>();
+    transport.onAdopted.mockImplementationOnce(async () => {
+      adoptionStarted.resolve();
+      await adoptionGate.promise;
     });
 
-    expect(mockDispatchReplyFromConfig).toHaveBeenCalledTimes(1);
-    const sessionKey =
-      typeof finalizeInboundContextCalls[0]?.SessionKey === "string"
-        ? finalizeInboundContextCalls[0].SessionKey
-        : "";
-    expect(sessionKey).toBe("agent:susan:feishu:group:oc-broadcast-group");
+    const handling = dispatchBroadcast("adoption-order", { turnAdoptionLifecycle: transport });
+
+    await adoptionStarted.promise;
+    expect(transport.onAdopted).toHaveBeenCalledTimes(1);
+    expect(transport.onAdoptionFinalizing).toHaveBeenCalledTimes(1);
+    expect(broadcastClaim.commit).not.toHaveBeenCalled();
+    expect(susanClaim.commit).toHaveBeenCalledTimes(1);
+    expect(mainClaim.commit).toHaveBeenCalledTimes(1);
+
+    adoptionGate.resolve();
+    await handling;
+
+    expect(broadcastClaim.commit).toHaveBeenCalledTimes(1);
+    expect(transport.onAdopted.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(broadcastClaim.commit).mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(broadcastClaim.release).not.toHaveBeenCalled();
   });
+
+  it.each(["adopted", "queue-cap-old", "queue-cap-new", "drop-failed"] as const)(
+    "settles independently deferred broadcast lanes after %s",
+    async (outcome) => {
+      const { broadcastClaim, susanClaim, mainClaim } = mockBroadcastClaims("deferred");
+      const chatHistories = new Map([
+        ["oc-broadcast-group", [{ sender: "peer", body: "earlier chat", timestamp: 1 }]],
+      ]);
+      let deferredLifecycle: NonNullable<
+        (typeof resolvedTurnCalls)[number]["replyOptions"]
+      >["turnAdoptionLifecycle"];
+      mockDispatchReply.mockImplementation(async ({ ctx, replyOptions }) => {
+        if (String(ctx.SessionKey).startsWith("agent:susan:")) {
+          deferredLifecycle = replyOptions?.turnAdoptionLifecycle;
+          deferredLifecycle?.onDeferred?.();
+          return { queuedFinal: false, counts: { final: 1 }, deferAdoption: true };
+        }
+        return { queuedFinal: false, counts: { final: 1 } };
+      });
+      const transport = {
+        ...createIngressLifecycle(),
+        onDropped: vi.fn(async () => {
+          if (outcome === "drop-failed") {
+            throw new Error("drop settlement failed");
+          }
+        }),
+      };
+
+      await dispatchBroadcast("deferred", { turnAdoptionLifecycle: transport, chatHistories });
+
+      expect(transport.onDeferred).toHaveBeenCalledTimes(1);
+      expect(transport.onAdopted).not.toHaveBeenCalled();
+      deferredLifecycle?.onDeferredHeartbeat?.();
+      expect(transport.onDeferredHeartbeat).toHaveBeenCalledOnce();
+      expect(broadcastClaim.commit).not.toHaveBeenCalled();
+      expect(mainClaim.commit).toHaveBeenCalledTimes(1);
+      expect(susanClaim.commit).not.toHaveBeenCalled();
+
+      const completion =
+        outcome === "adopted"
+          ? deferredLifecycle?.onAdopted()
+          : deferredLifecycle?.onDropped?.(outcome === "drop-failed" ? "queue-cap-new" : outcome);
+      if (outcome === "drop-failed") {
+        await expect(completion).rejects.toThrow("drop settlement failed");
+        expect(transport.onAbandoned).toHaveBeenCalledOnce();
+      } else {
+        await completion;
+        expect(transport.onAbandoned).not.toHaveBeenCalled();
+      }
+      if (outcome !== "adopted") {
+        expect(transport.onDropped).toHaveBeenCalledExactlyOnceWith(
+          outcome === "drop-failed" ? "queue-cap-new" : outcome,
+        );
+      }
+      expect(transport.onAdopted).toHaveBeenCalledTimes(outcome === "adopted" ? 1 : 0);
+      expectClaim(susanClaim, outcome !== "drop-failed");
+      expectClaim(broadcastClaim, outcome !== "drop-failed");
+      if (outcome !== "drop-failed") {
+        expect(chatHistories.get("oc-broadcast-group")).toEqual([]);
+      }
+    },
+  );
 });

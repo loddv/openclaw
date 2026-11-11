@@ -1,131 +1,186 @@
-import { describeAccountSnapshot } from "openclaw/plugin-sdk/account-helpers";
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import {
   adaptScopedAccountAccessor,
   createScopedDmSecurityResolver,
 } from "openclaw/plugin-sdk/channel-config-helpers";
-import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-primitives";
+import type {
+  ChannelDoctorAdapter,
+  ChannelGroupContext,
+  ChannelThreadingToolContext,
+} from "openclaw/plugin-sdk/channel-contract";
 import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
+  createChannelMessageAdapterFromOutbound,
+  createRuntimeOutboundDelegates,
+} from "openclaw/plugin-sdk/channel-outbound";
+import { createPairingPrefixStripper } from "openclaw/plugin-sdk/channel-pairing";
+import {
   createAllowlistProviderOpenWarningCollector,
-  projectAccountConfigWarningCollector,
+  createConditionalWarningCollector,
+  resolveScopeRequireMention,
+  resolveScopeToolsPolicy,
 } from "openclaw/plugin-sdk/channel-policy";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
+import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
 import { createScopedAccountReplyToModeResolver } from "openclaw/plugin-sdk/conversation-runtime";
 import {
   createChannelDirectoryAdapter,
   createResolvedDirectoryEntriesLister,
   createRuntimeDirectoryLiveAdapter,
 } from "openclaw/plugin-sdk/directory-runtime";
-import { buildTrafficStatusSummary } from "openclaw/plugin-sdk/extension-shared";
-import { createLazyRuntimeNamedExport } from "openclaw/plugin-sdk/lazy-runtime";
-import { createRuntimeOutboundDelegates } from "openclaw/plugin-sdk/outbound-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import {
+  createLazyRuntimeNamedExport,
+  createLazyRuntimeModule,
+} from "openclaw/plugin-sdk/lazy-runtime";
+import { chunkMarkdownTextWithMode } from "openclaw/plugin-sdk/reply-chunking";
 import {
   buildProbeChannelStatusSummary,
   collectStatusIssuesFromLastError,
   createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
 } from "openclaw/plugin-sdk/status-helpers";
-import { chunkTextForOutbound } from "openclaw/plugin-sdk/text-chunking";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "openclaw/plugin-sdk/text-runtime";
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { sanitizeAssistantVisibleText } from "openclaw/plugin-sdk/text-chunking";
 import { matrixMessageActions } from "./actions.js";
 import { matrixApprovalCapability } from "./approval-native.js";
-import { createMatrixPairingText, createMatrixProbeAccount } from "./channel-account-paths.js";
-import { DEFAULT_ACCOUNT_ID, matrixConfigAdapter } from "./config-adapter.js";
-import { MatrixConfigSchema } from "./config-schema.js";
-import { matrixDoctor } from "./doctor.js";
+import { matrixPluginBase } from "./channel.setup.js";
+import {
+  legacyConfigRules as MATRIX_LEGACY_CONFIG_RULES,
+  normalizeCompatibilityConfig as normalizeMatrixCompatibilityConfig,
+} from "./doctor-contract.js";
 import { shouldSuppressLocalMatrixExecApprovalPrompt } from "./exec-approvals.js";
 import {
-  resolveMatrixGroupRequireMention,
-  resolveMatrixGroupToolPolicy,
-} from "./group-mentions.js";
-import {
-  resolveMatrixAccount,
+  resolveDefaultMatrixAccountId,
   resolveMatrixAccountConfig,
   type ResolvedMatrixAccount,
 } from "./matrix/accounts.js";
+import { prepareMatrixConversationRouteOwnersAsync } from "./matrix/conversation-route-owner.js";
 import { normalizeMatrixUserId } from "./matrix/monitor/allowlist.js";
+import { buildMatrixRoomScopeTree, resolveMatrixRoomScopePath } from "./matrix/monitor/rooms.js";
 import type { MatrixProbe } from "./matrix/probe.js";
 import {
   normalizeMatrixMessagingTarget,
+  normalizeMatrixResolvableTarget,
   resolveMatrixDirectUserId,
   resolveMatrixTargetIdentity,
 } from "./matrix/target-ids.js";
 import {
   setMatrixThreadBindingIdleTimeoutBySessionKey,
+  setMatrixThreadBindingIdleTimeoutBySessionKeyAsync,
   setMatrixThreadBindingMaxAgeBySessionKey,
+  setMatrixThreadBindingMaxAgeBySessionKeyAsync,
 } from "./matrix/thread-bindings-shared.js";
-import { matrixResolverAdapter } from "./resolver.js";
+import { matrixPresentationCapabilities } from "./presentation-capabilities.js";
 import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import { resolveMatrixOutboundSessionRoute } from "./session-route.js";
 import {
-  namedAccountPromotionKeys,
-  resolveSingleAccountPromotionTarget,
-  singleAccountKeysToMove,
-} from "./setup-contract.js";
-import { matrixSetupAdapter } from "./setup-core.js";
-import { matrixSetupWizard } from "./setup-surface.js";
-import { runMatrixStartupMaintenance } from "./startup-maintenance.js";
-import type { CoreConfig } from "./types.js";
-// Mutex for serializing account startup (workaround for concurrent dynamic import race condition)
-let matrixStartupLock: Promise<void> = Promise.resolve();
+  defaultTopLevelPlacement,
+  resolveMatrixInboundConversation,
+} from "./thread-binding-api.js";
+import type { CoreConfig, MatrixConfig } from "./types.js";
 
 const loadMatrixChannelRuntime = createLazyRuntimeNamedExport(
   () => import("./channel.runtime.js"),
   "matrixChannelRuntime",
 );
 
-const meta = {
-  id: "matrix",
-  label: "Matrix",
-  selectionLabel: "Matrix (plugin)",
-  docsPath: "/channels/matrix",
-  docsLabel: "matrix",
-  blurb: "open protocol; configure a homeserver + access token.",
-  order: 70,
-  quickstartAllowFrom: true,
+// Share the import across account starts; the monitor pulls in the reply pipeline.
+const loadMatrixMonitorModule = createLazyRuntimeModule(() =>
+  import("./matrix/monitor/index.js").catch((error: unknown) => {
+    loadMatrixMonitorModule.clear();
+    throw error;
+  }),
+);
+
+const loadMatrixResolver = createLazyRuntimeNamedExport(
+  () => import("./resolve-targets.js"),
+  "resolveMatrixTargets",
+);
+
+const matrixDoctor: ChannelDoctorAdapter = {
+  dmAllowFromMode: "nestedOnly",
+  groupModel: "sender",
+  groupAllowFromFallbackToAllowFrom: false,
+  warnOnEmptyGroupSenderAllowlist: true,
+  legacyConfigRules: MATRIX_LEGACY_CONFIG_RULES,
+  normalizeCompatibilityConfig: normalizeMatrixCompatibilityConfig,
 };
 
-const listMatrixDirectoryPeersFromConfig =
-  createResolvedDirectoryEntriesLister<ResolvedMatrixAccount>({
-    kind: "user",
-    resolveAccount: adaptScopedAccountAccessor(resolveMatrixAccount),
-    resolveSources: (account) => [
-      account.config.dm?.allowFrom ?? [],
-      account.config.groupAllowFrom ?? [],
-      ...Object.values(account.config.groups ?? account.config.rooms ?? {}).map(
-        (room) => room.users ?? [],
-      ),
-    ],
-    normalizeId: (entry) => {
-      const raw = entry.replace(/^matrix:/i, "").trim();
-      if (!raw || raw === "*") {
-        return null;
-      }
-      const lowered = normalizeLowercaseStringOrEmpty(raw);
-      const cleaned = lowered.startsWith("user:") ? raw.slice("user:".length).trim() : raw;
-      return cleaned.startsWith("@") ? `user:${cleaned}` : cleaned;
-    },
+function resolveMatrixGroupScope(params: ChannelGroupContext) {
+  const matrixConfig = resolveMatrixAccountConfig({
+    cfg: params.cfg,
+    accountId: params.accountId,
   });
+  const tree = buildMatrixRoomScopeTree(matrixConfig.groups ?? matrixConfig.rooms);
+  const roomId = normalizeMatrixResolvableTarget(params.groupId ?? "");
+  const groupChannel = normalizeMatrixResolvableTarget(params.groupChannel ?? "");
+  // Core may fall back to the display name; only recover the same room ID's casing.
+  const aliases =
+    roomId && groupChannel.toLowerCase() === roomId.toLowerCase() ? [groupChannel] : [];
+  return {
+    tree,
+    path: resolveMatrixRoomScopePath({ tree, roomId, aliases }),
+  };
+}
 
-const listMatrixDirectoryGroupsFromConfig =
-  createResolvedDirectoryEntriesLister<ResolvedMatrixAccount>({
-    kind: "group",
-    resolveAccount: adaptScopedAccountAccessor(resolveMatrixAccount),
-    resolveSources: (account) => [Object.keys(account.config.groups ?? account.config.rooms ?? {})],
-    normalizeId: (entry) => {
-      const raw = entry.replace(/^matrix:/i, "").trim();
-      if (!raw || raw === "*") {
-        return null;
-      }
-      const lowered = normalizeLowercaseStringOrEmpty(raw);
-      if (lowered.startsWith("room:") || lowered.startsWith("channel:")) {
-        return raw;
-      }
-      return raw.startsWith("!") ? `room:${raw}` : raw;
-    },
+function resolveMatrixDirectoryAccount(cfg: CoreConfig, accountId?: string | null) {
+  return resolveMatrixAccountConfig({
+    cfg,
+    accountId: accountId ?? resolveDefaultMatrixAccountId(cfg),
   });
+}
+
+function normalizeMatrixDirectoryId(entry: string, kind: "user" | "group") {
+  const raw = entry.replace(/^matrix:/i, "").trim();
+  if (!raw || raw === "*") {
+    return null;
+  }
+  const lowered = normalizeLowercaseStringOrEmpty(raw);
+  if (kind === "user") {
+    const cleaned = lowered.startsWith("user:") ? raw.slice("user:".length).trim() : raw;
+    return cleaned.startsWith("@") ? `user:${cleaned}` : cleaned;
+  }
+  if (lowered.startsWith("room:") || lowered.startsWith("channel:")) {
+    return raw;
+  }
+  return raw.startsWith("!") ? `room:${raw}` : raw;
+}
+
+const listMatrixDirectoryPeersFromConfig = createResolvedDirectoryEntriesLister<MatrixConfig>({
+  kind: "user",
+  resolveAccount: resolveMatrixDirectoryAccount,
+  resolveSources: (account) => [
+    account.dm?.allowFrom ?? [],
+    account.groupAllowFrom ?? [],
+    ...Object.values(account.groups ?? account.rooms ?? {}).map((room) => room.users ?? []),
+  ],
+  normalizeId: (entry) => normalizeMatrixDirectoryId(entry, "user"),
+});
+
+const listMatrixDirectoryGroupsFromConfig = createResolvedDirectoryEntriesLister<MatrixConfig>({
+  kind: "group",
+  resolveAccount: resolveMatrixDirectoryAccount,
+  resolveSources: (account) => [Object.keys(account.groups ?? account.rooms ?? {})],
+  normalizeId: (entry) => normalizeMatrixDirectoryId(entry, "group"),
+});
+
+async function sendMatrixHeartbeatTyping(
+  to: string,
+  isTyping: boolean,
+  cfg: CoreConfig,
+  accountId?: string | null,
+): Promise<void> {
+  await (
+    await loadMatrixChannelRuntime()
+  ).sendTypingMatrix(to, isTyping, {
+    cfg,
+    ...(accountId ? { accountId } : {}),
+  });
+}
 
 function projectMatrixConversationBinding(binding: {
   boundAt: number;
@@ -158,7 +213,7 @@ const resolveMatrixDmPolicy = createScopedDmSecurityResolver<ResolvedMatrixAccou
   normalizeEntry: (raw) => normalizeMatrixUserId(raw),
 });
 
-const collectMatrixSecurityWarnings =
+const collectMatrixGroupPolicyWarnings =
   createAllowlistProviderOpenWarningCollector<ResolvedMatrixAccount>({
     providerConfigPresent: (cfg) => (cfg as CoreConfig).channels?.matrix !== undefined,
     resolveGroupPolicy: (account) => account.config.groupPolicy,
@@ -176,38 +231,32 @@ function resolveMatrixAccountConfigPath(accountId: string, field: string): strin
     : `channels.matrix.accounts.${accountId}.${field}`;
 }
 
-function collectMatrixSecurityWarningsForAccount(params: {
-  account: ResolvedMatrixAccount;
-  cfg: CoreConfig;
-}): string[] {
-  const warnings = collectMatrixSecurityWarnings(params);
-  if (params.account.accountId !== DEFAULT_ACCOUNT_ID) {
-    const groupPolicyPath = resolveMatrixAccountConfigPath(params.account.accountId, "groupPolicy");
-    const groupsPath = resolveMatrixAccountConfigPath(params.account.accountId, "groups");
-    const groupAllowFromPath = resolveMatrixAccountConfigPath(
-      params.account.accountId,
-      "groupAllowFrom",
-    );
-    return warnings.map((warning) =>
-      warning
-        .replace("channels.matrix.groupPolicy", groupPolicyPath)
-        .replace("channels.matrix.groups", groupsPath)
-        .replace("channels.matrix.groupAllowFrom", groupAllowFromPath),
-    );
-  }
-  if (params.account.config.autoJoin !== "always") {
+const collectMatrixOpenGroupFindings = createConditionalWarningCollector.findings({
+  collectWarnings: (params: { account: ResolvedMatrixAccount; cfg: CoreConfig }): string[] => {
+    const warnings = collectMatrixGroupPolicyWarnings(params);
+    if (params.account.accountId !== DEFAULT_ACCOUNT_ID) {
+      const groupPolicyPath = resolveMatrixAccountConfigPath(
+        params.account.accountId,
+        "groupPolicy",
+      );
+      const groupsPath = resolveMatrixAccountConfigPath(params.account.accountId, "groups");
+      const groupAllowFromPath = resolveMatrixAccountConfigPath(
+        params.account.accountId,
+        "groupAllowFrom",
+      );
+      return warnings.map((warning) =>
+        warning
+          .replace("channels.matrix.groupPolicy", groupPolicyPath)
+          .replace("channels.matrix.groups", groupsPath)
+          .replace("channels.matrix.groupAllowFrom", groupAllowFromPath),
+      );
+    }
     return warnings;
-  }
-  const autoJoinPath = resolveMatrixAccountConfigPath(params.account.accountId, "autoJoin");
-  const autoJoinAllowlistPath = resolveMatrixAccountConfigPath(
-    params.account.accountId,
-    "autoJoinAllowlist",
-  );
-  return [
-    ...warnings,
-    `- Matrix invites: autoJoin="always" joins any invited room before message policy applies. Set ${autoJoinPath}="allowlist" + ${autoJoinAllowlistPath} (or ${autoJoinPath}="off") to restrict joins.`,
-  ];
-}
+  },
+  checkId: "channels.matrix.groups.open",
+  severity: "warn",
+  title: "Matrix security warning",
+});
 
 function normalizeMatrixAcpConversationId(conversationId: string) {
   const target = resolveMatrixTargetIdentity(conversationId);
@@ -217,131 +266,146 @@ function normalizeMatrixAcpConversationId(conversationId: string) {
   return { conversationId: target.id };
 }
 
-function matchMatrixAcpConversation(params: {
-  bindingConversationId: string;
-  conversationId: string;
-  parentConversationId?: string;
-}) {
-  const binding = normalizeMatrixAcpConversationId(params.bindingConversationId);
-  if (!binding) {
-    return null;
+function matchesMatrixToolContextRoom(params: {
+  target: string;
+  toolContext: ChannelThreadingToolContext;
+}): boolean {
+  const { toolContext } = params;
+  if (toolContext.currentChannelProvider && toolContext.currentChannelProvider !== "matrix") {
+    return false;
   }
-  if (binding.conversationId === params.conversationId) {
-    return { conversationId: params.conversationId, matchPriority: 2 };
-  }
-  if (
-    params.parentConversationId &&
-    params.parentConversationId !== params.conversationId &&
-    binding.conversationId === params.parentConversationId
-  ) {
-    return {
-      conversationId: params.parentConversationId,
-      matchPriority: 1,
-    };
-  }
-  return null;
+  const currentTarget = toolContext.currentChannelId
+    ? resolveMatrixTargetIdentity(toolContext.currentChannelId)
+    : null;
+  const target = resolveMatrixTargetIdentity(params.target);
+  // A Matrix user target can select a different DM room; only verified room IDs may share threads.
+  return (
+    currentTarget?.kind === "room" && target?.kind === "room" && currentTarget.id === target.id
+  );
 }
 
-function resolveMatrixCommandConversation(params: {
-  threadId?: string;
-  originatingTo?: string;
-  commandTo?: string;
-  fallbackTo?: string;
-}) {
-  const parentConversationId = [params.originatingTo, params.commandTo, params.fallbackTo]
-    .map((candidate) => {
-      const trimmed = candidate?.trim();
-      if (!trimmed) {
-        return undefined;
-      }
-      const target = resolveMatrixTargetIdentity(trimmed);
-      return target?.kind === "room" ? target.id : undefined;
-    })
-    .find((candidate): candidate is string => Boolean(candidate));
-  if (params.threadId) {
-    return {
-      conversationId: params.threadId,
-      ...(parentConversationId ? { parentConversationId } : {}),
-    };
-  }
-  return parentConversationId ? { conversationId: parentConversationId } : null;
-}
+const matrixChannelOutbound: ChannelOutboundAdapter = {
+  deliveryMode: "direct",
+  chunker: (text, limit) => chunkMarkdownTextWithMode(text, limit, "length"),
+  chunkerMode: "markdown",
+  textChunkLimit: 4000,
+  sanitizeText: ({ text }) => sanitizeAssistantVisibleText(text),
+  deliveryCapabilities: {
+    durableFinal: {
+      text: true,
+      media: true,
+      replyTo: true,
+      thread: true,
+      messageSendingHooks: true,
+      afterCommit: true,
+      reconcileUnknownSend: true,
+    },
+  },
+  presentationCapabilities: matrixPresentationCapabilities,
+  shouldSuppressLocalPayloadPromptAsync: shouldSuppressLocalMatrixExecApprovalPrompt,
+  ...createRuntimeOutboundDelegates({
+    getRuntime: loadMatrixChannelRuntime,
+    renderPresentation: {
+      resolve: (runtime) => runtime.matrixOutbound.renderPresentation,
+      unavailableMessage: "Matrix outbound presentation rendering is unavailable",
+    },
+    sendPayload: {
+      resolve: (runtime) => runtime.matrixOutbound.sendPayload,
+      unavailableMessage: "Matrix outbound payload delivery is unavailable",
+    },
+    sendText: {
+      resolve: (runtime) => runtime.matrixOutbound.sendText,
+      unavailableMessage: "Matrix outbound text delivery is unavailable",
+    },
+    sendMedia: {
+      resolve: (runtime) => runtime.matrixOutbound.sendMedia,
+      unavailableMessage: "Matrix outbound media delivery is unavailable",
+    },
+    sendPoll: {
+      resolve: (runtime) => runtime.matrixOutbound.sendPoll,
+      unavailableMessage: "Matrix outbound poll delivery is unavailable",
+    },
+  }),
+};
 
-function resolveMatrixInboundConversation(params: {
-  to?: string;
-  conversationId?: string;
-  threadId?: string | number;
-}) {
-  const rawTarget = params.to?.trim() || params.conversationId?.trim() || "";
-  const target = rawTarget ? resolveMatrixTargetIdentity(rawTarget) : null;
-  const parentConversationId = target?.kind === "room" ? target.id : undefined;
-  const threadId =
-    params.threadId != null ? normalizeOptionalString(String(params.threadId)) : undefined;
-  if (threadId) {
-    return {
-      conversationId: threadId,
-      ...(parentConversationId ? { parentConversationId } : {}),
-    };
-  }
-  return parentConversationId ? { conversationId: parentConversationId } : null;
-}
+const matrixMessageAdapterBase = createChannelMessageAdapterFromOutbound({
+  id: "matrix",
+  outbound: matrixChannelOutbound,
+  live: {
+    capabilities: {
+      draftPreview: true,
+      previewFinalization: true,
+      progressUpdates: true,
+      quietFinalization: true,
+    },
+    finalizer: {
+      capabilities: {
+        finalEdit: true,
+        normalFallback: true,
+        discardPending: true,
+        previewReceipt: true,
+      },
+    },
+  },
+});
 
-function resolveMatrixDeliveryTarget(params: {
-  conversationId: string;
-  parentConversationId?: string;
-}) {
-  const parentConversationId = params.parentConversationId?.trim();
-  if (parentConversationId && parentConversationId !== params.conversationId.trim()) {
-    const parentTarget = resolveMatrixTargetIdentity(parentConversationId);
-    if (parentTarget?.kind === "room") {
-      return {
-        to: `room:${parentTarget.id}`,
-        threadId: params.conversationId.trim(),
-      };
-    }
-  }
-  const conversationTarget = resolveMatrixTargetIdentity(params.conversationId);
-  if (conversationTarget?.kind === "room") {
-    return { to: `room:${conversationTarget.id}` };
-  }
-  return null;
-}
+const matrixMessageAdapter = {
+  ...matrixMessageAdapterBase,
+  durableFinal: {
+    ...matrixMessageAdapterBase.durableFinal,
+    automaticUnknownSendReconciliation: true,
+    capabilities: {
+      ...matrixMessageAdapterBase.durableFinal?.capabilities,
+      afterCommit: true,
+      reconcileUnknownSend: true,
+    },
+    reconcileUnknownSendKinds: { text: true, media: true },
+    reconcileUnknownSend: async (ctx) =>
+      await (await loadMatrixChannelRuntime()).reconcileMatrixUnknownSend(ctx),
+    afterUnknownSendTerminal: async (ctx) =>
+      await (await loadMatrixChannelRuntime()).cleanupMatrixDeliveryPlans({ queueId: ctx.queueId }),
+  },
+  send: {
+    ...matrixMessageAdapterBase.send,
+    lifecycle: {
+      afterCommit: async (ctx) => {
+        if (!ctx.deliveryQueueId) {
+          return;
+        }
+        await (
+          await loadMatrixChannelRuntime()
+        ).cleanupMatrixDeliveryPlans({
+          queueId: ctx.deliveryQueueId,
+        });
+      },
+    },
+  },
+} satisfies typeof matrixMessageAdapterBase;
 
 export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
   createChatChannelPlugin<ResolvedMatrixAccount, MatrixProbe>({
     base: {
-      id: "matrix",
-      meta,
-      setupWizard: matrixSetupWizard,
+      ...matrixPluginBase,
+      meta: { ...matrixPluginBase.meta, markdownCapable: true },
       capabilities: {
-        chatTypes: ["direct", "group", "thread"],
-        polls: true,
-        reactions: true,
-        threads: true,
-        media: true,
-      },
-      reload: { configPrefixes: ["channels.matrix"] },
-      configSchema: buildChannelConfigSchema(MatrixConfigSchema),
-      config: {
-        ...matrixConfigAdapter,
-        isConfigured: (account) => account.configured,
-        describeAccount: (account) =>
-          describeAccountSnapshot({
-            account,
-            configured: account.configured,
-            extra: {
-              baseUrl: account.homeserver,
-            },
-          }),
+        ...matrixPluginBase.capabilities,
+        tts: {
+          voice: {
+            synthesisTarget: "voice-note",
+          },
+        },
       },
       approvalCapability: matrixApprovalCapability,
       groups: {
-        resolveRequireMention: resolveMatrixGroupRequireMention,
-        resolveToolPolicy: resolveMatrixGroupToolPolicy,
+        resolveRequireMention: (params) =>
+          resolveScopeRequireMention(resolveMatrixGroupScope(params)),
+        resolveToolPolicy: (params) => resolveScopeToolsPolicy(resolveMatrixGroupScope(params)),
       },
       conversationBindings: {
         supportsCurrentConversationBinding: true,
-        defaultTopLevelPlacement: "child",
+        bindingStore: "adapter",
+        defaultTopLevelPlacement,
+        // Released synchronous runtime setters dispatch here through 2026-12-31.
         setIdleTimeoutBySessionKey: ({ targetSessionKey, accountId, idleTimeoutMs }) =>
           setMatrixThreadBindingIdleTimeoutBySessionKey({
             targetSessionKey,
@@ -354,14 +418,52 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
             accountId: accountId ?? "",
             maxAgeMs,
           }).map(projectMatrixConversationBinding),
+        setIdleTimeoutBySessionKeyAsync: async ({ targetSessionKey, accountId, idleTimeoutMs }) =>
+          (
+            await setMatrixThreadBindingIdleTimeoutBySessionKeyAsync({
+              targetSessionKey,
+              accountId: accountId ?? "",
+              idleTimeoutMs,
+            })
+          ).map(projectMatrixConversationBinding),
+        setMaxAgeBySessionKeyAsync: async ({ targetSessionKey, accountId, maxAgeMs }) =>
+          (
+            await setMatrixThreadBindingMaxAgeBySessionKeyAsync({
+              targetSessionKey,
+              accountId: accountId ?? "",
+              maxAgeMs,
+            })
+          ).map(projectMatrixConversationBinding),
       },
       messaging: {
+        defaultMarkdownTableMode: "block",
+        targetPrefixes: ["matrix"],
+        targetIdComparison: "case-sensitive",
         normalizeTarget: normalizeMatrixMessagingTarget,
-        resolveInboundConversation: ({ to, conversationId, threadId }) =>
-          resolveMatrixInboundConversation({ to, conversationId, threadId }),
-        resolveDeliveryTarget: ({ conversationId, parentConversationId }) =>
-          resolveMatrixDeliveryTarget({ conversationId, parentConversationId }),
-        resolveOutboundSessionRoute: (params) => resolveMatrixOutboundSessionRoute(params),
+        inferTargetChatType: ({ to }) => {
+          const target = resolveMatrixTargetIdentity(to);
+          return target ? (target.kind === "user" ? "direct" : "channel") : undefined;
+        },
+        resolveInboundConversation: resolveMatrixInboundConversation,
+        resolveDeliveryTarget: (params) => {
+          const parentConversationId = params.parentConversationId?.trim();
+          if (parentConversationId && parentConversationId !== params.conversationId.trim()) {
+            const parentTarget = resolveMatrixTargetIdentity(parentConversationId);
+            if (parentTarget?.kind === "room") {
+              return {
+                to: `room:${parentTarget.id}`,
+                threadId: params.conversationId.trim(),
+              };
+            }
+          }
+          const conversationTarget = resolveMatrixTargetIdentity(params.conversationId);
+          if (conversationTarget?.kind === "room") {
+            return { to: `room:${conversationTarget.id}` };
+          }
+          return null;
+        },
+        resolveOutboundSessionRoute: resolveMatrixOutboundSessionRoute,
+        prepareConversationRouteOwnersAsync: prepareMatrixConversationRouteOwnersAsync,
         targetResolver: {
           looksLikeId: (raw) => {
             const trimmed = raw.trim();
@@ -382,7 +484,9 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
           return entries.map((entry) => {
             const raw = entry.id.startsWith("user:") ? entry.id.slice("user:".length) : entry.id;
             const incomplete = !raw.startsWith("@") || !raw.includes(":");
-            return incomplete ? { ...entry, name: "incomplete id; expected @user:server" } : entry;
+            return incomplete
+              ? Object.assign({}, entry, { name: `incomplete id; expected @user:server` })
+              : entry;
           });
         },
         listGroups: async (params) => await listMatrixDirectoryGroupsFromConfig(params),
@@ -392,54 +496,85 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
           listGroupsLive: (runtime) => runtime.listMatrixDirectoryGroupsLive,
         }),
       }),
-      resolver: matrixResolverAdapter,
+      resolver: {
+        resolveTargets: async (params) => (await loadMatrixResolver())(params),
+      },
       actions: matrixMessageActions,
+      message: matrixMessageAdapter,
       secrets: {
         secretTargetRegistryEntries,
         collectRuntimeConfigAssignments,
       },
-      setup: {
-        ...matrixSetupAdapter,
-        singleAccountKeysToMove,
-        namedAccountPromotionKeys,
-        resolveSingleAccountPromotionTarget,
-      },
       bindings: {
         compileConfiguredBinding: ({ conversationId }) =>
           normalizeMatrixAcpConversationId(conversationId),
-        matchInboundConversation: ({ compiledBinding, conversationId, parentConversationId }) =>
-          matchMatrixAcpConversation({
-            bindingConversationId: compiledBinding.conversationId,
-            conversationId,
-            parentConversationId,
-          }),
-        resolveCommandConversation: ({ threadId, originatingTo, commandTo, fallbackTo }) =>
-          resolveMatrixCommandConversation({
-            threadId,
-            originatingTo,
-            commandTo,
-            fallbackTo,
-          }),
+        matchInboundConversation: ({ compiledBinding, conversationId, parentConversationId }) => {
+          const binding = normalizeMatrixAcpConversationId(compiledBinding.conversationId);
+          if (!binding) {
+            return null;
+          }
+          if (binding.conversationId === conversationId) {
+            return { conversationId, matchPriority: 2 };
+          }
+          if (
+            parentConversationId &&
+            parentConversationId !== conversationId &&
+            binding.conversationId === parentConversationId
+          ) {
+            return {
+              conversationId: parentConversationId,
+              matchPriority: 1,
+            };
+          }
+          return null;
+        },
+        resolveCommandConversation: (params) => {
+          const parentConversationId = [params.originatingTo, params.commandTo, params.fallbackTo]
+            .map((candidate) => {
+              const trimmed = candidate?.trim();
+              if (!trimmed) {
+                return undefined;
+              }
+              const target = resolveMatrixTargetIdentity(trimmed);
+              return target?.kind === "room" ? target.id : undefined;
+            })
+            .find((candidate): candidate is string => Boolean(candidate));
+          if (params.threadId) {
+            return {
+              conversationId: params.threadId,
+              ...(parentConversationId ? { parentConversationId } : {}),
+            };
+          }
+          return parentConversationId ? { conversationId: parentConversationId } : null;
+        },
       },
       status: createComputedAccountStatusAdapter<ResolvedMatrixAccount, MatrixProbe>({
         defaultRuntime: createDefaultChannelRuntimeState(DEFAULT_ACCOUNT_ID),
         collectStatusIssues: (accounts) => collectStatusIssuesFromLastError("matrix", accounts),
         buildChannelSummary: ({ snapshot }) =>
           buildProbeChannelStatusSummary(snapshot, { baseUrl: snapshot.baseUrl ?? null }),
-        probeAccount: async ({ account, timeoutMs, cfg }) =>
-          await createMatrixProbeAccount({
-            resolveMatrixAuth: async ({ cfg, accountId }) =>
-              (await loadMatrixChannelRuntime()).resolveMatrixAuth({
-                cfg,
-                accountId,
-              }),
-            probeMatrix: async (params) =>
-              await (await loadMatrixChannelRuntime()).probeMatrix(params),
-          })({
-            account,
-            timeoutMs,
-            cfg,
-          }),
+        probeAccount: async ({ account, timeoutMs, cfg }) => {
+          try {
+            const runtime = await loadMatrixChannelRuntime();
+            const auth = await runtime.resolveMatrixAuth({
+              cfg,
+              accountId: account.accountId,
+            });
+            return await runtime.probeMatrix({
+              homeserver: auth.homeserver,
+              accessToken: auth.accessToken,
+              userId: auth.userId,
+              deviceId: auth.deviceId,
+              timeoutMs: timeoutMs ?? 5_000,
+              accountId: account.accountId,
+              allowPrivateNetwork: auth.allowPrivateNetwork,
+              ssrfPolicy: auth.ssrfPolicy,
+              dispatcherPolicy: auth.dispatcherPolicy,
+            });
+          } catch (err) {
+            return { ok: false, error: formatErrorMessage(err), elapsedMs: 0 };
+          }
+        },
         resolveAccountSnapshot: ({ account, runtime }) => ({
           accountId: account.accountId,
           name: account.name,
@@ -448,7 +583,8 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
           extra: {
             baseUrl: account.homeserver,
             lastProbeAt: runtime?.lastProbeAt ?? null,
-            ...buildTrafficStatusSummary(runtime),
+            lastInboundAt: runtime?.lastInboundAt ?? null,
+            lastOutboundAt: runtime?.lastOutboundAt ?? null,
           },
         }),
       }),
@@ -463,31 +599,7 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
             `[${account.accountId}] starting provider (${account.homeserver ?? "matrix"})`,
           );
 
-          // Serialize startup: wait for any previous startup to complete import phase.
-          // This works around a race condition with concurrent dynamic imports.
-          //
-          // INVARIANT: The import() below cannot hang because:
-          // 1. It only loads local ESM modules with no circular awaits
-          // 2. Module initialization is synchronous (no top-level await in ./matrix/monitor/index.js)
-          // 3. The lock only serializes the import phase, not the provider startup
-          const previousLock = matrixStartupLock;
-          let releaseLock: () => void = () => {};
-          matrixStartupLock = new Promise<void>((resolve) => {
-            releaseLock = resolve;
-          });
-          await previousLock;
-
-          // Lazy import: the monitor pulls the reply pipeline; avoid ESM init cycles.
-          // Wrap in try/finally to ensure lock is released even if import fails.
-          let monitorMatrixProvider: typeof import("./matrix/monitor/index.js").monitorMatrixProvider;
-          try {
-            const module = await import("./matrix/monitor/index.js");
-            monitorMatrixProvider = module.monitorMatrixProvider;
-          } finally {
-            // Release lock after import completes or fails
-            releaseLock();
-          }
-
+          const { monitorMatrixProvider } = await loadMatrixMonitorModule();
           return monitorMatrixProvider({
             runtime: ctx.runtime,
             channelRuntime: ctx.channelRuntime,
@@ -501,24 +613,59 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
         },
       },
       doctor: matrixDoctor,
-      lifecycle: {
-        runStartupMaintenance: runMatrixStartupMaintenance,
+      heartbeat: {
+        sendTyping: ({ cfg, to, accountId }) =>
+          sendMatrixHeartbeatTyping(to, true, cfg as CoreConfig, accountId),
+        clearTyping: ({ cfg, to, accountId }) =>
+          sendMatrixHeartbeatTyping(to, false, cfg as CoreConfig, accountId),
       },
     },
     security: {
       resolveDmPolicy: resolveMatrixDmPolicy,
-      collectWarnings: projectAccountConfigWarningCollector(
-        (cfg) => cfg as CoreConfig,
-        collectMatrixSecurityWarningsForAccount,
-      ),
+      collectWarnings: ({ account, cfg }) => {
+        const params = { account, cfg: cfg as CoreConfig };
+        const findings = collectMatrixOpenGroupFindings(params);
+        if (
+          params.account.accountId !== DEFAULT_ACCOUNT_ID ||
+          params.account.config.autoJoin !== "always"
+        ) {
+          return findings;
+        }
+        const autoJoinPath = resolveMatrixAccountConfigPath(params.account.accountId, "autoJoin");
+        const autoJoinAllowlistPath = resolveMatrixAccountConfigPath(
+          params.account.accountId,
+          "autoJoinAllowlist",
+        );
+        return [
+          ...findings,
+          `- Matrix invites: autoJoin="always" joins any invited room before message policy applies. Set ${autoJoinPath}="allowlist" + ${autoJoinAllowlistPath} (or ${autoJoinPath}="off") to restrict joins.`,
+        ];
+      },
     },
     pairing: {
-      text: createMatrixPairingText(
-        async (to, message, options) =>
-          await (await loadMatrixChannelRuntime()).sendMessageMatrix(to, message, options),
-      ),
+      text: {
+        idLabel: "matrixUserId",
+        message: PAIRING_APPROVED_MESSAGE,
+        normalizeAllowEntry: createPairingPrefixStripper(/^matrix:/i),
+        notify: async ({ id, message, cfg, accountId }) => {
+          await (
+            await loadMatrixChannelRuntime()
+          ).sendMessageMatrix(`user:${id}`, message, {
+            cfg,
+            ...(accountId ? { accountId } : {}),
+          });
+        },
+      },
     },
     threading: {
+      matchesToolContextTarget: matchesMatrixToolContextRoom,
+      resolveAutoThreadId: ({ to, toolContext }) => {
+        const threadId = normalizeOptionalString(toolContext?.currentThreadTs);
+        if (!threadId || !toolContext) {
+          return undefined;
+        }
+        return matchesMatrixToolContextRoom({ target: to, toolContext }) ? threadId : undefined;
+      },
       resolveReplyToMode: createScopedAccountReplyToModeResolver<
         ReturnType<typeof resolveMatrixAccountConfig>
       >({
@@ -540,31 +687,5 @@ export const matrixPlugin: ChannelPlugin<ResolvedMatrixAccount, MatrixProbe> =
         };
       },
     },
-    outbound: {
-      deliveryMode: "direct",
-      chunker: chunkTextForOutbound,
-      chunkerMode: "markdown",
-      textChunkLimit: 4000,
-      shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload }) =>
-        shouldSuppressLocalMatrixExecApprovalPrompt({
-          cfg,
-          accountId,
-          payload,
-        }),
-      ...createRuntimeOutboundDelegates({
-        getRuntime: loadMatrixChannelRuntime,
-        sendText: {
-          resolve: (runtime) => runtime.matrixOutbound.sendText,
-          unavailableMessage: "Matrix outbound text delivery is unavailable",
-        },
-        sendMedia: {
-          resolve: (runtime) => runtime.matrixOutbound.sendMedia,
-          unavailableMessage: "Matrix outbound media delivery is unavailable",
-        },
-        sendPoll: {
-          resolve: (runtime) => runtime.matrixOutbound.sendPoll,
-          unavailableMessage: "Matrix outbound poll delivery is unavailable",
-        },
-      }),
-    },
+    outbound: matrixChannelOutbound,
   });

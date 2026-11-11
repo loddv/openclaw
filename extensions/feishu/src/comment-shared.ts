@@ -1,11 +1,46 @@
+import { isTransientNetworkError, retryAsync } from "openclaw/plugin-sdk/retry-runtime";
 import {
-  asOptionalRecord,
-  hasNonEmptyString as sharedHasNonEmptyString,
-  isRecord as sharedIsRecord,
-  normalizeOptionalString,
-  readStringValue,
-} from "openclaw/plugin-sdk/text-runtime";
-import { FEISHU_COMMENT_FILE_TYPES, type CommentFileType } from "./comment-target.js";
+  isRecord,
+  normalizeOptionalString as normalizeString,
+  normalizeStringEntries,
+  normalizeTrimmedStringList,
+  readStringValue as readString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeCommentFileType, type CommentFileType } from "./comment-target.js";
+import { captureFeishuSendAuthority } from "./send-context.js";
+
+export type FeishuDriveCommentReply = {
+  reply_id?: string;
+  user_id?: string;
+  create_time?: number;
+  update_time?: number;
+  content?: { elements?: unknown[] };
+};
+
+export type FeishuDriveCommentCard = {
+  comment_id?: string;
+  user_id?: string;
+  create_time?: number;
+  update_time?: number;
+  is_solved?: boolean;
+  is_whole?: boolean;
+  has_more?: boolean;
+  page_token?: string;
+  quote?: string;
+  reply_list?: { replies?: FeishuDriveCommentReply[] };
+};
+
+export class FeishuReplyCommentError extends Error {
+  feishuCode?: number | string;
+  feishuLogId?: string;
+
+  constructor(params: { message: string; feishuCode?: number | string; feishuLogId?: string }) {
+    super(params.message);
+    this.name = "FeishuReplyCommentError";
+    this.feishuCode = params.feishuCode;
+    this.feishuLogId = params.feishuLogId;
+  }
+}
 
 export function encodeQuery(params: Record<string, string | undefined>): string {
   const query = new URLSearchParams();
@@ -19,28 +54,122 @@ export function encodeQuery(params: Record<string, string | undefined>): string 
   return queryString ? `?${queryString}` : "";
 }
 
-export const readString = readStringValue;
+export function extractFeishuApiErrorMeta(error: unknown) {
+  if (!isRecord(error)) {
+    return { message: typeof error === "string" ? error : JSON.stringify(error) };
+  }
+  const response = isRecord(error.response) ? error.response : undefined;
+  const responseData = isRecord(response?.data) ? response?.data : undefined;
+  const nestedError = isRecord(responseData?.error) ? responseData.error : undefined;
+  return {
+    message: typeof error.message === "string" ? error.message : JSON.stringify(error),
+    code: readString(error.code),
+    config: isRecord(error.config) ? error.config : undefined,
+    httpStatus: typeof response?.status === "number" ? response.status : undefined,
+    feishuCode:
+      typeof responseData?.code === "number" ? responseData.code : readString(responseData?.code),
+    feishuMsg: readString(responseData?.msg),
+    feishuLogId: readString(responseData?.log_id),
+    nestedErrorLogId: readString(nestedError?.log_id),
+    troubleshooter:
+      readString(responseData?.troubleshooter) || readString(nestedError?.troubleshooter),
+  };
+}
 
-export const normalizeString = normalizeOptionalString;
+export function formatFeishuApiError(
+  error: unknown,
+  options: {
+    includeConfigParams?: boolean;
+    includeNestedErrorLogId?: boolean;
+  } = {},
+): string {
+  if (!isRecord(error)) {
+    return typeof error === "string" ? error : JSON.stringify(error);
+  }
+  const meta = extractFeishuApiErrorMeta(error);
+  return JSON.stringify({
+    message: meta.message,
+    code: meta.code,
+    method: readString(meta.config?.method),
+    url: readString(meta.config?.url),
+    ...(options.includeConfigParams ? { params: meta.config?.params } : {}),
+    http_status: meta.httpStatus,
+    feishu_code: meta.feishuCode,
+    feishu_msg: meta.feishuMsg,
+    feishu_log_id:
+      meta.feishuLogId || (options.includeNestedErrorLogId ? meta.nestedErrorLogId : undefined),
+    feishu_troubleshooter: meta.troubleshooter,
+  });
+}
 
-export const isRecord = sharedIsRecord;
+const FEISHU_SEND_RATE_LIMIT_CODES = new Set([230020, 11232]);
 
-export const asRecord = asOptionalRecord;
+function isRetryableFeishuResponse(response: unknown, retryTransient = false): boolean {
+  return (
+    isRecord(response) &&
+    typeof response.code === "number" &&
+    (FEISHU_SEND_RATE_LIMIT_CODES.has(response.code) ||
+      (retryTransient && response.code === 230049))
+  );
+}
 
-export const hasNonEmptyString = sharedHasNonEmptyString;
+export async function requestFeishuApi<T>(
+  request: () => Promise<T>,
+  errorPrefix: string,
+  options: {
+    includeNestedErrorLogId?: boolean;
+    /** Only message requests carrying a stable UUID may replay ambiguous failures. */
+    retryTransient?: boolean;
+  } = {},
+): Promise<T> {
+  const assertSendAuthority = captureFeishuSendAuthority();
+  try {
+    return await retryAsync(
+      async () => {
+        assertSendAuthority?.();
+        const result = await request();
+        // The SDK fulfills business errors; normalize retryable bodies to its rejection shape.
+        if (isRetryableFeishuResponse(result, options.retryTransient)) {
+          throw Object.assign(new Error("Request fulfilled with a retryable Feishu error"), {
+            response: { status: 200, data: result },
+          });
+        }
+        return result;
+      },
+      {
+        // Preserve the existing two retries at 500ms and 1000ms.
+        attempts: 3,
+        minDelayMs: 500,
+        shouldRetry: (error) => {
+          if (!isRecord(error) || error.retryable === false) {
+            return false;
+          }
+          const response = isRecord(error.response) ? error.response : undefined;
+          const status = response?.status;
+          return (
+            status === 429 ||
+            isRetryableFeishuResponse(response?.data, options.retryTransient) ||
+            (options.retryTransient === true &&
+              (isTransientNetworkError(error) ||
+                error.code === "ERR_NETWORK" ||
+                (typeof status === "number" &&
+                  (status === 408 || status === 425 || (status >= 500 && status <= 599)))))
+          );
+        },
+      },
+    );
+  } catch (error) {
+    const details = formatFeishuApiError(error, options);
+    throw new Error(`${errorPrefix}: ${details || "unknown error"}`, { cause: error });
+  }
+}
 
-export type ParsedCommentDocumentRef = {
+type ParsedCommentDocumentRef = {
   fileType?: CommentFileType;
   fileToken?: string;
 };
 
-export type ParsedCommentMention = {
-  userId: string;
-  displayText: string;
-  isBotMention: boolean;
-};
-
-export type ParsedCommentLinkedDocumentKind =
+type ParsedCommentLinkedDocumentKind =
   | CommentFileType
   | "wiki"
   | "mindnote"
@@ -48,7 +177,7 @@ export type ParsedCommentLinkedDocumentKind =
   | "base"
   | "unknown";
 
-export type ParsedCommentResolvedDocumentType = Exclude<
+type ParsedCommentResolvedDocumentType = Exclude<
   ParsedCommentLinkedDocumentKind,
   "wiki" | "unknown"
 >;
@@ -62,13 +191,7 @@ export type ParsedCommentLinkedDocument = {
   isCurrentDocument?: boolean;
 };
 
-export type ParsedCommentContent = {
-  plainText?: string;
-  semanticText?: string;
-  mentions: ParsedCommentMention[];
-  linkedDocuments: ParsedCommentLinkedDocument[];
-  botMentioned: boolean;
-};
+export type ParsedCommentContent = ReturnType<typeof parseCommentContentElements>;
 
 function readDocsLinkUrl(element: Record<string, unknown>): string | undefined {
   const docsLink = isRecord(element.docs_link) ? element.docs_link : undefined;
@@ -76,8 +199,7 @@ function readDocsLinkUrl(element: Record<string, unknown>): string | undefined {
     normalizeString(docsLink?.url) ||
     normalizeString(docsLink?.link) ||
     normalizeString(element.url) ||
-    normalizeString(element.link) ||
-    undefined
+    normalizeString(element.link)
   );
 }
 
@@ -89,8 +211,7 @@ function readMentionUserId(element: Record<string, unknown>): string | undefined
     normalizeString(mention?.user_id) ||
     normalizeString(mention?.open_id) ||
     normalizeString(element.mention_user) ||
-    normalizeString(element.user_id) ||
-    undefined
+    normalizeString(element.user_id)
   );
 }
 
@@ -101,16 +222,6 @@ function readMentionDisplayText(element: Record<string, unknown>, userId: string
     normalizeString(mention?.display_name) ||
     normalizeString(element.name);
   return mentionName ? `@${mentionName}` : `@${userId}`;
-}
-
-function normalizeCommentText(parts: string[]): string | undefined {
-  const text = parts.join("").trim();
-  return text || undefined;
-}
-
-function normalizeCommentSemanticText(parts: string[]): string | undefined {
-  const text = parts.join("").replace(/\s+/g, " ").trim();
-  return text || undefined;
 }
 
 function readElementTextPreservingWhitespace(element: Record<string, unknown>): string | undefined {
@@ -144,14 +255,6 @@ const COMMENT_LINK_KIND_ALIASES = new Map<string, ParsedCommentResolvedDocumentT
   ["base", "base"],
 ]);
 
-function isCommentFileType(
-  value: ParsedCommentResolvedDocumentType | "wiki" | undefined,
-): value is CommentFileType {
-  return (
-    typeof value === "string" && (FEISHU_COMMENT_FILE_TYPES as readonly string[]).includes(value)
-  );
-}
-
 function isReasonableFeishuLinkToken(token: string | undefined): token is string {
   return (
     typeof token === "string" &&
@@ -164,65 +267,41 @@ function parseCommentLinkedDocumentPath(pathname: string): {
   urlKind: ParsedCommentResolvedDocumentType | "wiki";
   token: string;
 } | null {
-  const segments = pathname
-    .split("/")
-    .map((segment) => segment.trim())
-    .filter(Boolean);
+  const segments = normalizeStringEntries(pathname.split("/"));
   const offset = segments[0]?.toLowerCase() === "space" ? 1 : 0;
   const kind = COMMENT_LINK_KIND_ALIASES.get(segments[offset]?.toLowerCase() ?? "");
-  const token = normalizeString(segments[offset + 1]);
+  const token = segments[offset + 1];
   if (!kind || !isReasonableFeishuLinkToken(token)) {
     return null;
   }
   return { urlKind: kind, token };
 }
 
-function hasResolvedLinkedDocumentReference(link: ParsedCommentLinkedDocument): boolean {
-  return (
-    link.urlKind !== "unknown" && (Boolean(link.resolvedObjToken) || Boolean(link.wikiNodeToken))
-  );
-}
-
-export function resolveCommentLinkedDocumentFromUrl(params: {
+function resolveCommentLinkedDocumentFromUrl(params: {
   rawUrl: string;
   currentDocument?: ParsedCommentDocumentRef;
-}): ParsedCommentLinkedDocument {
-  const link: ParsedCommentLinkedDocument = {
-    rawUrl: params.rawUrl,
-    urlKind: "unknown",
-  };
-  try {
-    const parsed = new URL(params.rawUrl);
-    const parsedPath = parseCommentLinkedDocumentPath(parsed.pathname);
-    if (!parsedPath) {
-      return link;
-    }
-    const { urlKind, token } = parsedPath;
-    link.urlKind = urlKind;
-    if (urlKind === "wiki") {
-      link.urlKind = "wiki";
-      link.wikiNodeToken = token;
-    } else {
-      link.resolvedObjType = urlKind;
-      link.resolvedObjToken = token;
-    }
-    if (
-      link.resolvedObjType &&
-      link.resolvedObjToken &&
-      isCommentFileType(link.resolvedObjType) &&
+}): ParsedCommentLinkedDocument | undefined {
+  const parsed = URL.parse(params.rawUrl);
+  const parsedPath = parsed && parseCommentLinkedDocumentPath(parsed.pathname);
+  if (!parsedPath) {
+    return undefined;
+  }
+  const { urlKind, token } = parsedPath;
+  const link: ParsedCommentLinkedDocument = { rawUrl: params.rawUrl, urlKind };
+  if (urlKind === "wiki") {
+    link.wikiNodeToken = token;
+  } else {
+    link.resolvedObjType = urlKind;
+    link.resolvedObjToken = token;
+  }
+  if (
+    link.resolvedObjType &&
+    link.resolvedObjToken &&
+    normalizeCommentFileType(link.resolvedObjType)
+  ) {
+    link.isCurrentDocument =
       params.currentDocument?.fileType === link.resolvedObjType &&
-      params.currentDocument.fileToken === link.resolvedObjToken
-    ) {
-      link.isCurrentDocument = true;
-    } else if (
-      link.resolvedObjType &&
-      link.resolvedObjToken &&
-      isCommentFileType(link.resolvedObjType)
-    ) {
-      link.isCurrentDocument = false;
-    }
-  } catch {
-    return link;
+      params.currentDocument.fileToken === link.resolvedObjToken;
   }
   return link;
 }
@@ -231,17 +310,17 @@ export function parseCommentContentElements(params: {
   elements?: unknown[];
   botOpenIds?: Iterable<string | undefined>;
   currentDocument?: ParsedCommentDocumentRef;
-}): ParsedCommentContent {
+}) {
   const elements = Array.isArray(params.elements) ? params.elements : [];
   const plainTextParts: string[] = [];
   const semanticTextParts: string[] = [];
-  const mentions: ParsedCommentMention[] = [];
+  const mentions: {
+    userId: string;
+    displayText: string;
+    isBotMention: boolean;
+  }[] = [];
   const linkedDocuments: ParsedCommentLinkedDocument[] = [];
-  const botIds = new Set(
-    Array.from(params.botOpenIds ?? [])
-      .map((value) => normalizeString(value))
-      .filter((value): value is string => Boolean(value)),
-  );
+  const botIds = new Set(normalizeTrimmedStringList(Array.from(params.botOpenIds ?? [])));
   const linkedDocumentKeys = new Set<string>();
   let botMentioned = false;
 
@@ -251,19 +330,6 @@ export function parseCommentContentElements(params: {
     }
     const element = rawElement;
     const type = normalizeString(element.type);
-    const text =
-      (type === "text_run" ? readElementTextPreservingWhitespace(element) : undefined) ||
-      (type === "text" ? readElementTextPreservingWhitespace(element) : undefined) ||
-      (type === "docs_link" || type === "link" ? readDocsLinkUrl(element) : undefined) ||
-      (type === "mention" || type === "mention_user" || type === "person"
-        ? (() => {
-            const userId = readMentionUserId(element);
-            return userId ? readMentionDisplayText(element, userId) : undefined;
-          })()
-        : undefined) ||
-      readElementTextPreservingWhitespace(element) ||
-      undefined;
-
     if (type === "mention" || type === "mention_user" || type === "person") {
       const userId = readMentionUserId(element);
       if (userId) {
@@ -289,7 +355,7 @@ export function parseCommentContentElements(params: {
           rawUrl,
           currentDocument: params.currentDocument,
         });
-        if (hasResolvedLinkedDocumentReference(linkedDocument)) {
+        if (linkedDocument) {
           const key = [
             linkedDocument.rawUrl,
             linkedDocument.urlKind,
@@ -306,6 +372,7 @@ export function parseCommentContentElements(params: {
       }
     }
 
+    const text = readElementTextPreservingWhitespace(element);
     if (text) {
       plainTextParts.push(text);
       semanticTextParts.push(text);
@@ -313,16 +380,12 @@ export function parseCommentContentElements(params: {
   }
 
   return {
-    plainText: normalizeCommentText(plainTextParts),
-    semanticText: normalizeCommentSemanticText(semanticTextParts),
+    plainText: normalizeString(plainTextParts.join("")),
+    semanticText: normalizeString(semanticTextParts.join("").replace(/\s+/g, " ")),
     mentions,
     linkedDocuments,
     botMentioned,
   };
-}
-
-export function extractCommentElementText(element: unknown): string | undefined {
-  return parseCommentContentElements({ elements: [element] }).plainText;
 }
 
 export function extractReplyText(

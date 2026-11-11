@@ -1,18 +1,17 @@
-import type { SlackSlashCommandConfig } from "openclaw/plugin-sdk/config-runtime";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import type { SlackSlashCommandConfig } from "openclaw/plugin-sdk/config-contracts";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 /**
  * Strip Slack mentions (<@U123>, <@U123|name>) so command detection works on
  * normalized text. Use in both prepare and debounce gate for consistency.
  */
 export function stripSlackMentionsForCommandDetection(text: string): string {
-  return (text ?? "")
-    .replace(/<@[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const body = text.replace(/<@[^>]+>/g, " ").trim();
+  // Multiline command arguments must survive mention removal before core dispatch.
+  return body.startsWith("/") && /[\r\n]/.test(body) ? body : body.replace(/\s+/g, " ");
 }
 
-export function normalizeSlackSlashCommandName(raw: string) {
+function normalizeSlackSlashCommandName(raw: string) {
   return raw.replace(/^\/+/, "");
 }
 

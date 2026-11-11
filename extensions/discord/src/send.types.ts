@@ -1,18 +1,17 @@
-import type { RequestClient } from "@buape/carbon";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { APIAllowedMentions } from "discord-api-types/v10";
+import type { MessageReceipt } from "openclaw/plugin-sdk/channel-outbound";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { OutboundMediaAccess, OutboundMediaReadFile } from "openclaw/plugin-sdk/media-runtime";
 import type { RetryConfig } from "openclaw/plugin-sdk/retry-runtime";
+import type { RequestClient } from "./internal/rest.js";
 
 export class DiscordSendError extends Error {
-  kind?: "missing-permissions" | "dm-blocked";
-  channelId?: string;
-  missingPermissions?: string[];
+  status?: number;
 
   constructor(message: string, opts?: Partial<DiscordSendError>) {
     super(message);
     this.name = "DiscordSendError";
-    if (opts) {
-      Object.assign(this, opts);
-    }
+    Object.assign(this, opts);
   }
 
   override toString() {
@@ -27,6 +26,7 @@ export const DISCORD_MAX_EVENT_COVER_BYTES = 8 * 1024 * 1024;
 export type DiscordSendResult = {
   messageId: string;
   channelId: string;
+  receipt: MessageReceipt;
 };
 
 export type DiscordRuntimeAccountContext = {
@@ -34,14 +34,34 @@ export type DiscordRuntimeAccountContext = {
   accountId: string;
 };
 
+/**
+ * Sender-scoped media read policy. Guild media actions must carry it end to end so the sender's
+ * allowed roots and host read capability still bound the file the loader opens.
+ */
+export type DiscordOutboundMediaOpts = {
+  mediaAccess?: OutboundMediaAccess;
+  mediaLocalRoots?: readonly string[];
+  mediaReadFile?: OutboundMediaReadFile;
+};
+
 export type DiscordReactOpts = {
-  cfg?: OpenClawConfig;
+  cfg: OpenClawConfig;
   accountId?: string;
   token?: string;
   rest?: RequestClient;
   verbose?: boolean;
   retry?: RetryConfig;
+  /** Client/account lifetime; aborting it also stops an issued request's transport. */
+  signal?: AbortSignal;
+  /**
+   * Originating invocation cancellation. Drops queued REST work that was never
+   * issued and stops retry waits; already-dispatched requests settle normally.
+   */
+  callerSignal?: AbortSignal;
+  timeoutMs?: number;
 };
+
+export type DiscordAssetUploadOpts = DiscordReactOpts & DiscordOutboundMediaOpts;
 
 export type DiscordReactionRuntimeContext = DiscordRuntimeAccountContext & {
   rest: RequestClient;
@@ -77,6 +97,9 @@ export type DiscordMessageQuery = {
 
 export type DiscordMessageEdit = {
   content?: string;
+  flags?: number;
+  /** Maps to Discord's allowed_mentions; omission sends no field and preserves existing edit behavior. */
+  allowedMentions?: APIAllowedMentions;
 };
 
 export type DiscordThreadCreate = {
@@ -148,7 +171,7 @@ export type DiscordChannelCreate = {
   nsfw?: boolean;
 };
 
-export type DiscordForumTag = {
+type DiscordForumTag = {
   id?: string;
   name: string;
   moderated?: boolean;
@@ -168,6 +191,8 @@ export type DiscordChannelEdit = {
   locked?: boolean;
   autoArchiveDuration?: number;
   availableTags?: DiscordForumTag[];
+  /** Tag IDs to apply to a forum/media thread (Discord `applied_tags`). */
+  appliedTags?: string[];
 };
 
 export type DiscordChannelMove = {

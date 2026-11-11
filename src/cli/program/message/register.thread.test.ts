@@ -1,27 +1,14 @@
-import { Command } from "commander";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { setActivePluginRegistry } from "../../../plugins/runtime.js";
 import {
   createChannelTestPluginBase,
   createTestRegistry,
 } from "../../../test-utils/channel-plugins.js";
-import type { MessageCliHelpers } from "./helpers.js";
-import { registerMessageThreadCommands } from "./register.thread.js";
+import { createMessageCliProgram, messageCliMocks } from "./command.test-support.js";
 
-function createHelpers(runMessageAction: MessageCliHelpers["runMessageAction"]): MessageCliHelpers {
-  return {
-    withMessageBase: (command) => command.option("--channel <channel>", "Channel"),
-    withMessageTarget: (command) => command.option("-t, --target <dest>", "Target"),
-    withRequiredMessageTarget: (command) => command.requiredOption("-t, --target <dest>", "Target"),
-    runMessageAction,
-  };
-}
+type ActionRequest = { action: string; args: Record<string, unknown> };
 
 describe("registerMessageThreadCommands", () => {
-  const runMessageAction = vi.fn(
-    async (_action: string, _opts: Record<string, unknown>) => undefined,
-  );
-
   beforeEach(() => {
     setActivePluginRegistry(
       createTestRegistry([
@@ -31,24 +18,11 @@ describe("registerMessageThreadCommands", () => {
           plugin: {
             ...createChannelTestPluginBase({ id: "topic-chat", label: "Topic chat" }),
             actions: {
-              resolveCliActionRequest: ({
-                action,
-                args,
-              }: {
-                action: string;
-                args: Record<string, unknown>;
-              }) => {
-                if (action !== "thread-create") {
-                  return null;
-                }
+              resolveCliActionRequest: ({ action, args }: ActionRequest) => {
                 const { threadName, ...rest } = args;
-                return {
-                  action: "topic-create",
-                  args: {
-                    ...rest,
-                    name: threadName,
-                  },
-                };
+                return action === "thread-create"
+                  ? { action: "topic-create", args: { ...rest, name: threadName } }
+                  : null;
               },
             },
           },
@@ -60,72 +34,45 @@ describe("registerMessageThreadCommands", () => {
         },
       ]),
     );
-    runMessageAction.mockClear();
+    messageCliMocks.command.mockClear();
   });
 
-  it("routes plugin-remapped thread create actions through channel hooks", async () => {
-    const message = new Command().exitOverride();
-    registerMessageThreadCommands(message, createHelpers(runMessageAction));
-
-    await message.parseAsync(
-      [
-        "thread",
-        "create",
-        "--channel",
-        " topic-chat ",
-        "-t",
-        "room-1",
-        "--thread-name",
-        "Build Updates",
-        "-m",
-        "hello",
-      ],
-      { from: "user" },
-    );
-
-    expect(runMessageAction).toHaveBeenCalledWith(
-      "topic-create",
-      expect.objectContaining({
-        channel: " topic-chat ",
-        target: "room-1",
-        name: "Build Updates",
-        message: "hello",
-      }),
-    );
-    const remappedCall = runMessageAction.mock.calls.at(0);
-    expect(remappedCall?.[1]).not.toHaveProperty("threadName");
-  });
-
-  it("keeps default thread create params when the channel does not remap the action", async () => {
-    const message = new Command().exitOverride();
-    registerMessageThreadCommands(message, createHelpers(runMessageAction));
-
-    await message.parseAsync(
-      [
-        "thread",
-        "create",
-        "--channel",
-        "plain-chat",
-        "-t",
-        "channel:123",
-        "--thread-name",
-        "Build Updates",
-        "-m",
-        "hello",
-      ],
-      { from: "user" },
-    );
-
-    expect(runMessageAction).toHaveBeenCalledWith(
-      "thread-create",
-      expect.objectContaining({
-        channel: "plain-chat",
-        target: "channel:123",
-        threadName: "Build Updates",
-        message: "hello",
-      }),
-    );
-    const defaultCall = runMessageAction.mock.calls.at(0);
-    expect(defaultCall?.[1]).not.toHaveProperty("name");
-  });
+  it.each([
+    [" topic-chat ", "room-1", "topic-create", true],
+    [undefined, "topic-chat:room-1", "topic-create", false],
+    ["plain-chat", "topic-chat:room-1", "thread-create", false],
+    [undefined, "plain-chat:room-1", "thread-create", false],
+    ["topic-chat", "plain-chat:room-1", "topic-create", false],
+    ["plain-chat", "channel:123", "thread-create", true],
+  ])(
+    "routes channel %s and target %s to %s (message: %s)",
+    async (channel, target, action, withMessage) => {
+      await createMessageCliProgram("topic-chat|plain-chat").parseAsync(
+        [
+          "message",
+          "thread",
+          "create",
+          ...(channel ? ["--channel", channel] : []),
+          withMessage ? "-t" : "--target",
+          target,
+          "--thread-name",
+          "Build Updates",
+          ...(withMessage ? ["-m", "hello"] : []),
+        ],
+        { from: "user" },
+      );
+      const call = messageCliMocks.command.mock.calls[0]?.[0];
+      const remapped = action === "topic-create";
+      expect(call).toMatchObject({
+        action,
+        target,
+        [remapped ? "name" : "threadName"]: "Build Updates",
+      });
+      expect(call?.channel).toBe(channel);
+      expect(call).not.toHaveProperty(remapped ? "threadName" : "name");
+      if (withMessage) {
+        expect(call?.message).toBe("hello");
+      }
+    },
+  );
 });

@@ -1,11 +1,14 @@
+import { ChannelType } from "discord-api-types/v10";
 import type {
   DiscordGuildChannelConfig,
   DiscordGuildEntry,
-} from "openclaw/plugin-sdk/config-runtime";
+  OpenClawConfig,
+} from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { isRecord, normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isDiscordThreadChannelType } from "./channel-type.js";
 
-export type DiscordChannelPermissionsAuditEntry = {
+type DiscordChannelPermissionsAuditEntry = {
   channelId: string;
   ok: boolean;
   missing?: string[];
@@ -14,34 +17,36 @@ export type DiscordChannelPermissionsAuditEntry = {
   matchSource?: "id";
 };
 
-export type DiscordChannelPermissionsAudit = {
-  ok: boolean;
-  checkedChannels: number;
-  unresolvedChannels: number;
-  channels: DiscordChannelPermissionsAuditEntry[];
-  elapsedMs: number;
-};
+export type DiscordChannelPermissionsAudit = Awaited<
+  ReturnType<typeof auditDiscordChannelPermissionsWithFetcher>
+>;
 
-const REQUIRED_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessages"] as const;
+const REQUIRED_TEXT_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessages"] as const;
+const REQUIRED_THREAD_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessagesInThreads"] as const;
+const REQUIRED_VOICE_CHANNEL_PERMISSIONS = [
+  "ViewChannel",
+  "Connect",
+  "Speak",
+  "SendMessages",
+  "ReadMessageHistory",
+] as const;
 
-function shouldAuditChannelConfig(config: DiscordGuildChannelConfig | undefined) {
-  if (!config) {
-    return true;
+export function resolveRequiredDiscordChannelPermissions(channelType?: number): string[] {
+  if (isDiscordThreadChannelType(channelType)) {
+    return [...REQUIRED_THREAD_CHANNEL_PERMISSIONS];
   }
-  if (config.enabled === false) {
-    return false;
+  if (channelType === ChannelType.GuildVoice || channelType === ChannelType.GuildStageVoice) {
+    return [...REQUIRED_VOICE_CHANNEL_PERMISSIONS];
   }
-  return true;
+  return [...REQUIRED_TEXT_CHANNEL_PERMISSIONS];
 }
 
-export function listConfiguredGuildChannelKeys(
-  guilds: Record<string, DiscordGuildEntry> | undefined,
-): string[] {
-  if (!guilds) {
-    return [];
-  }
+export function collectDiscordAuditChannelIdsForAccount(config: {
+  guilds?: Record<string, DiscordGuildEntry>;
+  voice?: { autoJoin?: Array<{ guildId?: string; channelId?: string }> };
+}) {
   const ids = new Set<string>();
-  for (const entry of Object.values(guilds)) {
+  for (const entry of Object.values(config.guilds ?? {})) {
     if (!entry || typeof entry !== "object") {
       continue;
     }
@@ -51,63 +56,58 @@ export function listConfiguredGuildChannelKeys(
     }
     for (const [key, value] of Object.entries(channelsRaw)) {
       const channelId = normalizeOptionalString(key) ?? "";
-      if (!channelId) {
-        continue;
-      }
-      if (channelId === "*") {
-        continue;
-      }
-      if (!shouldAuditChannelConfig(value as DiscordGuildChannelConfig | undefined)) {
+      if (
+        !channelId ||
+        channelId === "*" ||
+        (value as DiscordGuildChannelConfig | undefined)?.enabled === false
+      ) {
         continue;
       }
       ids.add(channelId);
     }
   }
-  return [...ids].toSorted((a, b) => a.localeCompare(b));
-}
-
-export function collectDiscordAuditChannelIdsForGuilds(
-  guilds: Record<string, DiscordGuildEntry> | undefined,
-) {
-  const keys = listConfiguredGuildChannelKeys(guilds);
-  const channelIds = keys.filter((key) => /^\d+$/.test(key));
-  const unresolvedChannels = keys.length - channelIds.length;
-  return { channelIds, unresolvedChannels };
+  const channelIds = new Set([...ids].filter((key) => /^\d+$/.test(key)));
+  let unresolvedChannels = ids.size - channelIds.size;
+  for (const entry of config.voice?.autoJoin ?? []) {
+    const channelId = normalizeOptionalString(entry?.channelId) ?? "";
+    if (/^\d+$/.test(channelId)) {
+      channelIds.add(channelId);
+    } else if (channelId) {
+      unresolvedChannels++;
+    }
+  }
+  return {
+    channelIds: [...channelIds].toSorted((a, b) => a.localeCompare(b)),
+    unresolvedChannels,
+  };
 }
 
 export async function auditDiscordChannelPermissionsWithFetcher(params: {
+  cfg: OpenClawConfig;
   token: string;
   accountId?: string | null;
   channelIds: string[];
   timeoutMs: number;
   fetchChannelPermissions: (
     channelId: string,
-    params: { token: string; accountId?: string },
+    params: { cfg: OpenClawConfig; token: string; accountId?: string },
   ) => Promise<{
     permissions: string[];
+    channelType?: number;
   }>;
-}): Promise<DiscordChannelPermissionsAudit> {
+}) {
   const started = Date.now();
   const token = normalizeOptionalString(params.token) ?? "";
-  if (!token || params.channelIds.length === 0) {
-    return {
-      ok: true,
-      checkedChannels: 0,
-      unresolvedChannels: 0,
-      channels: [],
-      elapsedMs: Date.now() - started,
-    };
-  }
-
-  const required = [...REQUIRED_CHANNEL_PERMISSIONS];
   const channels: DiscordChannelPermissionsAuditEntry[] = [];
 
-  for (const channelId of params.channelIds) {
+  for (const channelId of token ? params.channelIds : []) {
     try {
       const perms = await params.fetchChannelPermissions(channelId, {
+        cfg: params.cfg,
         token,
         accountId: params.accountId ?? undefined,
       });
+      const required = resolveRequiredDiscordChannelPermissions(perms.channelType);
       const missing = required.filter((p) => !perms.permissions.includes(p));
       channels.push({
         channelId,

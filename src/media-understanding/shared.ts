@@ -1,24 +1,348 @@
+import path from "node:path";
+import {
+  resolveDateTimestampMs,
+  resolveExpiresAtMsFromDurationMs,
+  resolveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
+import { omitNullRequestHeaders } from "../../packages/llm-core/src/utils/request-headers.js";
 import type {
   ProviderRequestCapability,
   ProviderRequestTransport,
 } from "../agents/provider-attribution.js";
 import {
+  assertOkOrThrowHttpError,
+  createProviderHttpError,
+  readProviderJsonObjectResponse,
+} from "../agents/provider-http-errors.js";
+import {
   buildProviderRequestDispatcherPolicy,
-  normalizeBaseUrl,
   resolveProviderRequestPolicyConfig,
-  type ProviderRequestTransportOverrides,
-  type ResolvedProviderRequestConfig,
 } from "../agents/provider-request-config.js";
-import type { GuardedFetchResult } from "../infra/net/fetch-guard.js";
-import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
+import type { ModelProviderRequestTransportOverrides } from "../agents/provider-request-config.types.js";
+import { sleepWithAbort } from "../infra/backoff.js";
+import type { GuardedFetchMode, GuardedFetchResult } from "../infra/net/fetch-guard.js";
+import { fetchWithSsrFGuard, GUARDED_FETCH_MODE } from "../infra/net/fetch-guard.js";
+import { shouldUseEnvHttpProxyForUrl } from "../infra/net/proxy-env.js";
 import type { LookupFn, PinnedDispatcherPolicy, SsrFPolicy } from "../infra/net/ssrf.js";
-export { fetchWithTimeout } from "../utils/fetch-timeout.js";
+import type { ModelRequestHeaders } from "../llm/types.js";
+import { bufferToBlobPart } from "../plugin-sdk/blob-runtime.js";
+import {
+  executeProviderOperationWithRetry,
+  isTransientProviderHttpStatus,
+  type ProviderOperationRetryStage,
+  type TransientProviderRetryConfig,
+} from "../provider-runtime/operation-retry.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { monotonicDeadlineAfter, remainingMonotonicMs } from "../shared/monotonic-time.js";
+import { truncateOptionalText } from "../shared/text-truncate.js";
+import { fetchWithTimeout } from "../utils/fetch-timeout.js";
+import type { AudioTranscriptionRequest } from "./types.js";
+export {
+  assertOkOrThrowHttpError,
+  readProviderJsonObjectResponse,
+  readProviderJsonResponse,
+} from "../agents/provider-http-errors.js";
+export { fetchWithTimeout };
 export { normalizeBaseUrl } from "../agents/provider-request-config.js";
+export { sanitizeConfiguredModelProviderRequest } from "../agents/provider-request-config.js";
 
-const MAX_ERROR_CHARS = 300;
-const MAX_ERROR_RESPONSE_BYTES = 4096;
 const DEFAULT_GUARDED_HTTP_TIMEOUT_MS = 60_000;
 const MAX_AUDIT_CONTEXT_CHARS = 80;
+
+export function buildOpenAiCompatibleAuthHeaders(
+  params: Pick<AudioTranscriptionRequest, "apiKey" | "auth">,
+) {
+  const apiKey = params.auth?.kind === "api-key" ? params.auth.apiKey : params.apiKey;
+  // Explicit no-auth suppresses legacy markers; configured headers still override these defaults.
+  return params.auth?.kind === "none" || !apiKey
+    ? undefined
+    : { authorization: `Bearer ${apiKey}` };
+}
+
+/** Resolves the multipart upload filename, mapping AAC inputs to provider-friendly `.m4a`. */
+export function resolveAudioTranscriptionUploadFileName(fileName?: string, mime?: string): string {
+  // Some providers reject raw `.aac` names even when the bytes are AAC; `.m4a`
+  // preserves intent while matching their accepted upload extensions.
+  const trimmed = fileName?.trim();
+  const baseName = trimmed ? path.basename(trimmed) : "audio";
+  const lowerMime = mime?.trim().toLowerCase();
+
+  if (/\.aac$/i.test(baseName)) {
+    return `${baseName.slice(0, -4) || "audio"}.m4a`;
+  }
+  if (!path.extname(baseName) && lowerMime === "audio/aac") {
+    return `${baseName || "audio"}.m4a`;
+  }
+  return baseName;
+}
+
+/** Places options before the audio file so streaming multipart parsers can apply them. */
+export function buildAudioTranscriptionFormData(params: {
+  buffer: Buffer;
+  fileName?: string;
+  mime?: string;
+  fields?: Record<string, string | number | boolean | undefined>;
+}): FormData {
+  const form = new FormData();
+  const blob = new Blob([bufferToBlobPart(params.buffer)], {
+    type: params.mime ?? "application/octet-stream",
+  });
+  for (const [name, value] of Object.entries(params.fields ?? {})) {
+    const text = typeof value === "string" ? value.trim() : value == null ? "" : String(value);
+    if (text) {
+      form.append(name, text);
+    }
+  }
+  form.append("file", blob, resolveAudioTranscriptionUploadFileName(params.fileName, params.mime));
+  return form;
+}
+
+/** Serializable epoch deadline; the owner anchors local enforcement to monotonic time. */
+export type ProviderOperationDeadline = {
+  deadlineAtMs?: number;
+  label: string;
+  timeoutMs?: number;
+};
+
+type ProviderOperationClock = { epochAtMs: number; monotonicAtMs: number };
+const providerOperationClocksKey = Symbol.for("openclaw.providerOperationDeadlineClocks");
+let providerOperationClocks: WeakMap<ProviderOperationDeadline, ProviderOperationClock> | undefined;
+
+function resolveProviderOperationClocks() {
+  return (providerOperationClocks ??= resolveGlobalSingleton(
+    providerOperationClocksKey,
+    () => new WeakMap<ProviderOperationDeadline, ProviderOperationClock>(),
+  ));
+}
+
+/** Static or per-call timeout resolver used by provider HTTP helpers. */
+export type ProviderOperationTimeoutMs = number | (() => number);
+
+type GuardedProviderRequestParams = {
+  beforeRequest?: () => void;
+  pinDns?: boolean;
+  allowPrivateNetwork?: boolean;
+  ssrfPolicy?: SsrFPolicy;
+  dispatcherPolicy?: PinnedDispatcherPolicy;
+  auditContext?: string;
+  /**
+   * Override the guarded-fetch mode. Defaults to an auto-upgrade to
+   * `TRUSTED_ENV_PROXY` when `HTTP_PROXY`/`HTTPS_PROXY` is configured in the
+   * environment; pass `"strict"` to force pinned-DNS even inside a proxy.
+   */
+  mode?: GuardedFetchMode;
+};
+
+/** Creates a timer-safe absolute deadline, resolving a lazy total timeout exactly once. */
+export function createProviderOperationDeadline(params: {
+  timeoutMs?: ProviderOperationTimeoutMs;
+  label: string;
+}): ProviderOperationDeadline {
+  const timeoutMs = typeof params.timeoutMs === "function" ? params.timeoutMs() : params.timeoutMs;
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { label: params.label };
+  }
+  const resolvedTimeoutMs = resolveTimerTimeoutMs(timeoutMs, 1);
+  const deadlineAtMs =
+    resolveExpiresAtMsFromDurationMs(resolvedTimeoutMs) ?? resolveDateTimestampMs(Date.now());
+  const deadline = {
+    deadlineAtMs,
+    label: params.label,
+    timeoutMs: resolvedTimeoutMs,
+  };
+  resolveProviderOperationClocks().set(deadline, {
+    epochAtMs: deadlineAtMs,
+    monotonicAtMs: monotonicDeadlineAfter(resolvedTimeoutMs),
+  });
+  return deadline;
+}
+
+/** Resolves a per-request timeout without exceeding the remaining operation deadline. */
+export function resolveProviderOperationTimeoutMs(params: {
+  deadline: ProviderOperationDeadline;
+  defaultTimeoutMs: number;
+}): number {
+  const defaultTimeoutMs = resolveTimerTimeoutMs(params.defaultTimeoutMs, 1);
+  const deadlineAtMs = params.deadline.deadlineAtMs;
+  if (typeof deadlineAtMs !== "number") {
+    return defaultTimeoutMs;
+  }
+  let clock = resolveProviderOperationClocks().get(params.deadline);
+  if (!clock || clock.epochAtMs !== deadlineAtMs) {
+    clock = {
+      epochAtMs: deadlineAtMs,
+      monotonicAtMs: monotonicDeadlineAfter(deadlineAtMs - Date.now()),
+    };
+    resolveProviderOperationClocks().set(params.deadline, clock);
+  }
+  const remainingMs = remainingMonotonicMs(clock.monotonicAtMs);
+  if (remainingMs <= 0) {
+    throw createProviderOperationTimeoutError(params.deadline);
+  }
+  return resolveTimerTimeoutMs(Math.min(defaultTimeoutMs, remainingMs), 1);
+}
+
+/** Builds the canonical error for an exhausted provider operation deadline. */
+export function createProviderOperationTimeoutError(deadline: ProviderOperationDeadline): Error {
+  const timeoutLabel =
+    typeof deadline.timeoutMs === "number" ? ` after ${deadline.timeoutMs}ms` : "";
+  return new Error(`${deadline.label} timed out${timeoutLabel}`);
+}
+
+/** Resolves a static or lazy request timeout with a validated fallback. */
+function resolveProviderRequestTimeoutMs(
+  timeoutMs: ProviderOperationTimeoutMs | undefined,
+): number {
+  const resolved = typeof timeoutMs === "function" ? timeoutMs() : timeoutMs;
+  if (typeof resolved !== "number" || !Number.isFinite(resolved) || resolved <= 0) {
+    return DEFAULT_GUARDED_HTTP_TIMEOUT_MS;
+  }
+  return resolveTimerTimeoutMs(resolved, DEFAULT_GUARDED_HTTP_TIMEOUT_MS);
+}
+
+/** Returns a lazy timeout resolver for code paths that retry or poll multiple HTTP calls. */
+export function createProviderOperationTimeoutResolver(
+  params: Parameters<typeof resolveProviderOperationTimeoutMs>[0],
+): () => number {
+  return () => resolveProviderOperationTimeoutMs(params);
+}
+
+/** Waits for the next poll interval while respecting the total provider operation deadline. */
+export async function waitProviderOperationPollInterval(params: {
+  deadline: ProviderOperationDeadline;
+  pollIntervalMs: number;
+}): Promise<void> {
+  await sleepWithAbort(
+    resolveProviderOperationTimeoutMs({
+      deadline: params.deadline,
+      defaultTimeoutMs: resolveTimerTimeoutMs(params.pollIntervalMs, 1),
+    }),
+  );
+}
+
+/** Poll a provider-owned request without changing its transport or response contract. */
+export async function pollProviderOperation<TPayload>(params: {
+  read: () => Promise<TPayload>;
+  isComplete: (payload: TPayload) => boolean;
+  getFailureMessage?: (payload: TPayload) => string | undefined;
+  wait: () => Promise<void>;
+  maxAttempts: number;
+  timeoutMessage: string;
+}): Promise<TPayload> {
+  for (let attempt = 0; attempt < params.maxAttempts; attempt += 1) {
+    const payload = await params.read();
+    if (params.isComplete(payload)) {
+      return payload;
+    }
+    const failureMessage = params.getFailureMessage?.(payload);
+    if (failureMessage) {
+      throw new Error(failureMessage);
+    }
+    await params.wait();
+  }
+  throw new Error(params.timeoutMessage);
+}
+
+export async function pollProviderOperationJson<TPayload>(
+  params: {
+    url: string;
+    headers: Headers | (() => Headers);
+    deadline: ProviderOperationDeadline;
+    defaultTimeoutMs: number;
+    fetchFn: typeof fetch;
+    maxAttempts: number;
+    pollIntervalMs: number;
+    requestFailedMessage: string;
+    timeoutMessage: string;
+    isComplete: (payload: TPayload) => boolean;
+    getFailureMessage?: (payload: TPayload) => string | undefined;
+  } & GuardedProviderRequestParams,
+): Promise<TPayload> {
+  const { deadline } = params;
+  const bodyReadOptions = {
+    timeoutMs: createProviderOperationTimeoutResolver({
+      deadline,
+      defaultTimeoutMs: params.defaultTimeoutMs,
+    }),
+    onTimeout: () => createProviderOperationTimeoutError(deadline),
+  };
+  return await pollProviderOperation({
+    ...params,
+    wait: () => waitProviderOperationPollInterval(params),
+    read: async () => {
+      const init = {
+        method: "GET",
+        headers: typeof params.headers === "function" ? params.headers() : params.headers,
+      };
+      const timeoutMs = createProviderOperationTimeoutResolver({
+        deadline: params.deadline,
+        defaultTimeoutMs: params.defaultTimeoutMs,
+      });
+      const result = await fetchProviderOperation({
+        stage: "poll",
+        url: params.url,
+        init,
+        timeoutMs,
+        fetchFn: params.fetchFn,
+        requestFailedMessage: params.requestFailedMessage,
+        guardedOptions: resolveGuardedRequestOptions(params),
+      });
+      try {
+        return (await readProviderJsonObjectResponse(
+          result.response,
+          params.requestFailedMessage,
+          bodyReadOptions,
+        )) as TPayload;
+      } finally {
+        await result.release?.();
+      }
+    },
+  });
+}
+
+export async function fetchProviderOperationResponse(
+  params: Omit<Parameters<typeof fetchProviderOperation>[0], "guardedOptions">,
+): Promise<Response> {
+  return (await fetchProviderOperation(params)).response;
+}
+
+/**
+ * Fetches generated-asset response headers and bounded error details under an absolute deadline.
+ * Successful-body readers must reuse the same deadline so header time cannot reset the budget.
+ */
+export async function fetchProviderDownloadResponse(
+  params: Omit<
+    Parameters<typeof fetchProviderOperationResponse>[0],
+    "stage" | "requestFailedMessage" | "timeoutMs"
+  > & {
+    deadline?: ProviderOperationDeadline;
+    /** @deprecated Pass `deadline` so successful-body reads can reuse the same total budget. */
+    timeoutMs?: ProviderOperationTimeoutMs;
+    requestFailedMessage: string;
+  },
+): Promise<Response> {
+  // timeoutMs is a shipped Plugin SDK contract. Normalize it at this boundary;
+  // new callers pass the deadline through to their successful-body reader.
+  const deadline =
+    params.deadline ??
+    createProviderOperationDeadline({
+      timeoutMs: params.timeoutMs,
+      label: params.requestFailedMessage,
+    });
+  return await fetchProviderOperationResponse({
+    stage: "download",
+    url: params.url,
+    init: params.init,
+    timeoutMs: createProviderOperationTimeoutResolver({
+      deadline,
+      defaultTimeoutMs: deadline.timeoutMs ?? DEFAULT_GUARDED_HTTP_TIMEOUT_MS,
+    }),
+    fetchFn: params.fetchFn,
+    provider: params.provider,
+    requestFailedMessage: params.requestFailedMessage,
+    retry: params.retry,
+  });
+}
 
 function resolveGuardedHttpTimeoutMs(timeoutMs: number | undefined): number {
   if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -28,50 +352,61 @@ function resolveGuardedHttpTimeoutMs(timeoutMs: number | undefined): number {
 }
 
 function sanitizeAuditContext(auditContext: string | undefined): string | undefined {
-  const cleaned = auditContext
-    ?.replace(/\p{Cc}+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!cleaned) {
-    return undefined;
-  }
-  return cleaned.slice(0, MAX_AUDIT_CONTEXT_CHARS);
+  return truncateOptionalText(
+    auditContext?.replace(/\p{Cc}+/gu, " ").replace(/\s+/g, " "),
+    MAX_AUDIT_CONTEXT_CHARS,
+  );
 }
 
-export function resolveProviderHttpRequestConfig(params: {
-  baseUrl?: string;
-  defaultBaseUrl: string;
-  allowPrivateNetwork?: boolean;
-  headers?: HeadersInit;
-  defaultHeaders?: Record<string, string>;
-  request?: ProviderRequestTransportOverrides;
-  provider?: string;
-  api?: string;
-  capability?: ProviderRequestCapability;
-  transport?: ProviderRequestTransport;
-}): {
+type ResolvedProviderHttpRequestConfig = {
   baseUrl: string;
   allowPrivateNetwork: boolean;
   headers: Headers;
   dispatcherPolicy?: PinnedDispatcherPolicy;
-  requestConfig: ResolvedProviderRequestConfig;
-} {
+};
+
+type ResolvedProviderHttpRequestConfigWithOriginTrust = ResolvedProviderHttpRequestConfig & {
+  trustConfiguredBaseUrlOrigin: boolean;
+};
+
+export function resolveProviderHttpRequestConfigWithOriginTrust(params: {
+  baseUrl?: string;
+  defaultBaseUrl: string;
+  allowPrivateNetwork?: boolean;
+  headers?: HeadersInit | ModelRequestHeaders;
+  defaultHeaders?: ModelRequestHeaders;
+  request?: ModelProviderRequestTransportOverrides;
+  provider?: string;
+  api?: string;
+  capability?: ProviderRequestCapability;
+  transport?: ProviderRequestTransport;
+}): ResolvedProviderHttpRequestConfigWithOriginTrust {
+  const callerHeaders: ModelRequestHeaders | undefined = params.headers ? {} : undefined;
+  if (callerHeaders && params.headers) {
+    const entries =
+      params.headers instanceof Headers || Array.isArray(params.headers)
+        ? new Headers(params.headers).entries()
+        : Object.entries(params.headers);
+    for (const [name, value] of entries) {
+      if (value !== undefined) {
+        callerHeaders[name] = value;
+      }
+    }
+  }
   const requestConfig = resolveProviderRequestPolicyConfig({
     provider: params.provider ?? "",
     baseUrl: params.baseUrl,
     defaultBaseUrl: params.defaultBaseUrl,
     capability: params.capability ?? "other",
     transport: params.transport ?? "http",
-    callerHeaders: params.headers
-      ? Object.fromEntries(new Headers(params.headers).entries())
-      : undefined,
+    callerHeaders,
     providerHeaders: params.defaultHeaders,
     precedence: "caller-wins",
     allowPrivateNetwork: params.allowPrivateNetwork,
     api: params.api,
     request: params.request,
   });
-  const headers = new Headers(requestConfig.headers);
+  const headers = new Headers(omitNullRequestHeaders(requestConfig.headers));
   if (!requestConfig.baseUrl) {
     throw new Error("Missing baseUrl: provide baseUrl or defaultBaseUrl");
   }
@@ -81,7 +416,19 @@ export function resolveProviderHttpRequestConfig(params: {
     allowPrivateNetwork: requestConfig.allowPrivateNetwork,
     headers,
     dispatcherPolicy: buildProviderRequestDispatcherPolicy(requestConfig),
-    requestConfig,
+    trustConfiguredBaseUrlOrigin: requestConfig.trustConfiguredBaseUrlOrigin,
+  };
+}
+
+export function resolveProviderHttpRequestConfig(
+  params: Parameters<typeof resolveProviderHttpRequestConfigWithOriginTrust>[0],
+): ResolvedProviderHttpRequestConfig {
+  const resolved = resolveProviderHttpRequestConfigWithOriginTrust(params);
+  return {
+    baseUrl: resolved.baseUrl,
+    allowPrivateNetwork: resolved.allowPrivateNetwork,
+    headers: resolved.headers,
+    dispatcherPolicy: resolved.dispatcherPolicy,
   };
 }
 
@@ -91,16 +438,27 @@ export async function fetchWithTimeoutGuarded(
   timeoutMs: number | undefined,
   fetchFn: typeof fetch,
   options?: {
+    beforeRequest?: () => void;
     ssrfPolicy?: SsrFPolicy;
     lookupFn?: LookupFn;
     pinDns?: boolean;
     dispatcherPolicy?: PinnedDispatcherPolicy;
     auditContext?: string;
+    mode?: GuardedFetchMode;
   },
 ): Promise<GuardedFetchResult> {
+  // Proxy-only networks cannot resolve targets locally. Preserve explicit transport
+  // policy; the proxy owner excludes ALL_PROXY-only and NO_PROXY direct routes so
+  // those requests retain DNS pinning (#64974).
+  const resolvedMode =
+    options?.mode ??
+    (!options?.dispatcherPolicy && shouldUseEnvHttpProxyForUrl(url)
+      ? GUARDED_FETCH_MODE.TRUSTED_ENV_PROXY
+      : undefined);
   return await fetchWithSsrFGuard({
     url,
     fetchImpl: fetchFn,
+    beforeRequest: options?.beforeRequest,
     init,
     timeoutMs: resolveGuardedHttpTimeoutMs(timeoutMs),
     policy: options?.ssrfPolicy,
@@ -108,153 +466,163 @@ export async function fetchWithTimeoutGuarded(
     pinDns: options?.pinDns,
     dispatcherPolicy: options?.dispatcherPolicy,
     auditContext: sanitizeAuditContext(options?.auditContext),
+    ...(resolvedMode ? { mode: resolvedMode } : {}),
   });
 }
 
-type GuardedPostRequestOptions = NonNullable<Parameters<typeof fetchWithTimeoutGuarded>[4]>;
+type GuardedProviderRequestOptions = NonNullable<Parameters<typeof fetchWithTimeoutGuarded>[4]>;
 
-function resolveGuardedPostRequestOptions(params: {
-  pinDns?: boolean;
-  allowPrivateNetwork?: boolean;
-  dispatcherPolicy?: PinnedDispatcherPolicy;
-  auditContext?: string;
-}): GuardedPostRequestOptions | undefined {
-  if (
-    !params.allowPrivateNetwork &&
-    !params.dispatcherPolicy &&
-    params.pinDns === undefined &&
-    !params.auditContext
-  ) {
-    return undefined;
-  }
-  return {
-    ...(params.allowPrivateNetwork ? { ssrfPolicy: { allowPrivateNetwork: true } } : {}),
+function resolveGuardedRequestOptions(
+  params: GuardedProviderRequestParams,
+): GuardedProviderRequestOptions | undefined {
+  const ssrfPolicy = params.allowPrivateNetwork
+    ? { ...params.ssrfPolicy, allowPrivateNetwork: true }
+    : params.ssrfPolicy;
+  const options = {
+    ...(params.beforeRequest ? { beforeRequest: params.beforeRequest } : {}),
+    ...(ssrfPolicy ? { ssrfPolicy } : {}),
     ...(params.pinDns !== undefined ? { pinDns: params.pinDns } : {}),
     ...(params.dispatcherPolicy ? { dispatcherPolicy: params.dispatcherPolicy } : {}),
     ...(params.auditContext ? { auditContext: params.auditContext } : {}),
+    ...(params.mode !== undefined ? { mode: params.mode } : {}),
   };
+  return Object.keys(options).length > 0 ? options : undefined;
 }
 
-export async function postTranscriptionRequest(params: {
+async function fetchProviderOperation(params: {
+  stage: ProviderOperationRetryStage;
   url: string;
-  headers: Headers;
-  body: BodyInit;
-  timeoutMs?: number;
+  init?: RequestInit;
+  timeoutMs?: ProviderOperationTimeoutMs;
   fetchFn: typeof fetch;
-  pinDns?: boolean;
-  allowPrivateNetwork?: boolean;
-  dispatcherPolicy?: PinnedDispatcherPolicy;
-  auditContext?: string;
-}) {
-  return fetchWithTimeoutGuarded(
-    params.url,
-    {
-      method: "POST",
-      headers: params.headers,
-      body: params.body,
+  provider?: string;
+  requestFailedMessage?: string;
+  retry?: TransientProviderRetryConfig;
+  guardedOptions?: GuardedProviderRequestOptions;
+}): Promise<{ response: Response; release?: () => Promise<void> }> {
+  return await executeProviderOperationWithRetry({
+    provider: params.provider ?? "provider-http",
+    stage: params.stage,
+    retry: params.retry,
+    operation: async () => {
+      const timeoutMs = resolveProviderRequestTimeoutMs(params.timeoutMs);
+      const requestDeadline = createProviderOperationDeadline({
+        timeoutMs,
+        label: params.requestFailedMessage ?? `${params.provider ?? "provider"} ${params.stage}`,
+      });
+      const result = params.guardedOptions
+        ? await fetchWithTimeoutGuarded(
+            params.url,
+            params.init ?? {},
+            timeoutMs,
+            params.fetchFn,
+            params.guardedOptions,
+          )
+        : {
+            response: await fetchWithTimeout(
+              params.url,
+              params.init ?? {},
+              timeoutMs,
+              params.fetchFn,
+            ),
+            release: undefined,
+          };
+      try {
+        if (params.requestFailedMessage) {
+          await assertOkOrThrowHttpError(result.response, params.requestFailedMessage, {
+            bodyTimeoutMs: createProviderOperationTimeoutResolver({
+              deadline: requestDeadline,
+              defaultTimeoutMs: timeoutMs,
+            }),
+            onBodyTimeout: () => createProviderOperationTimeoutError(requestDeadline),
+          });
+        }
+        return result;
+      } catch (error) {
+        await result.release?.();
+        throw error;
+      }
     },
-    params.timeoutMs,
-    params.fetchFn,
-    resolveGuardedPostRequestOptions(params),
-  );
+  });
 }
 
-export async function postJsonRequest(params: {
-  url: string;
-  headers: Headers;
-  body: unknown;
-  timeoutMs?: number;
-  fetchFn: typeof fetch;
-  pinDns?: boolean;
-  allowPrivateNetwork?: boolean;
-  dispatcherPolicy?: PinnedDispatcherPolicy;
-  auditContext?: string;
-}) {
-  return fetchWithTimeoutGuarded(
-    params.url,
-    {
-      method: "POST",
-      headers: params.headers,
-      body: JSON.stringify(params.body),
-    },
-    params.timeoutMs,
-    params.fetchFn,
-    resolveGuardedPostRequestOptions(params),
-  );
-}
+type GuardedPostRequestRetryOptions = {
+  /**
+   * POST requests default to no retry because many provider endpoints create
+   * billable jobs. Pass "read" only for read/analysis POST endpoints.
+   */
+  retryStage?: ProviderOperationRetryStage;
+  retry?: TransientProviderRetryConfig;
+};
 
-export async function readErrorResponse(res: Response): Promise<string | undefined> {
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  try {
-    if (!res.body) {
-      return undefined;
-    }
-    reader = res.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    let sawBytes = false;
-    while (total < MAX_ERROR_RESPONSE_BYTES) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+type GuardedPostRequestParams<TBody> = GuardedProviderRequestParams &
+  GuardedPostRequestRetryOptions & {
+    url: string;
+    headers: Headers;
+    body: TBody;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    fetchFn: typeof fetch;
+  };
+
+async function postGuardedRequest(params: GuardedPostRequestParams<BodyInit | undefined>) {
+  const init: RequestInit = {
+    method: "POST",
+    headers: params.headers,
+    body: params.body,
+    ...(params.signal ? { signal: params.signal } : {}),
+  };
+  const guardedOptions = resolveGuardedRequestOptions(params);
+  const operation = async () => {
+    params.signal?.throwIfAborted();
+    const result = await fetchWithTimeoutGuarded(
+      params.url,
+      init,
+      params.timeoutMs,
+      params.fetchFn,
+      guardedOptions,
+    );
+    if (params.retryStage && isTransientProviderHttpStatus(result.response.status)) {
+      try {
+        throw await createProviderHttpError(result.response, "provider POST request failed", {
+          statusPrefix: "HTTP ",
+        });
+      } finally {
+        await result.release();
       }
-      if (!value || value.length === 0) {
-        continue;
-      }
-      sawBytes = true;
-      const remaining = MAX_ERROR_RESPONSE_BYTES - total;
-      const chunk = value.length <= remaining ? value : value.subarray(0, remaining);
-      chunks.push(chunk);
-      total += chunk.length;
-      if (chunk.length < value.length) {
-        break;
-      }
     }
-    if (!sawBytes) {
-      return undefined;
-    }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.length;
-    }
-    const text = new TextDecoder().decode(bytes);
-    const collapsed = text.replace(/\s+/g, " ").trim();
-    if (!collapsed) {
-      return undefined;
-    }
-    if (collapsed.length <= MAX_ERROR_CHARS) {
-      return collapsed;
-    }
-    return `${collapsed.slice(0, MAX_ERROR_CHARS)}…`;
-  } catch {
-    return undefined;
-  } finally {
-    try {
-      await reader?.cancel();
-    } catch {
-      // Ignore stream-cancel failures while reporting the original HTTP error.
-    }
+    return result;
+  };
+  if (!params.retryStage) {
+    return await operation();
   }
+  return await executeProviderOperationWithRetry({
+    provider: "provider-http",
+    stage: params.retryStage,
+    retry: params.retry,
+    signal: params.signal,
+    operation,
+  });
 }
 
-export async function assertOkOrThrowHttpError(res: Response, label: string): Promise<void> {
-  if (res.ok) {
-    return;
-  }
-  const detail = await readErrorResponse(res);
-  const suffix = detail ? `: ${detail}` : "";
-  throw new Error(`${label} (HTTP ${res.status})${suffix}`);
+export async function postJsonRequest(params: GuardedPostRequestParams<unknown>) {
+  return await postGuardedRequest({
+    ...params,
+    body: JSON.stringify(params.body),
+  });
 }
 
-export function requireTranscriptionText(
-  value: string | undefined,
-  missingMessage: string,
-): string {
-  const text = value?.trim();
-  if (!text) {
+export async function postMultipartRequest(params: GuardedPostRequestParams<BodyInit>) {
+  return await postGuardedRequest(params);
+}
+
+// Keep the shipped transcription name on the canonical multipart transport.
+export { postMultipartRequest as postTranscriptionRequest };
+
+/** Empty strings represent silence; missing or non-string transcripts are malformed. */
+export function requireTranscriptionText(value: unknown, missingMessage: string): string {
+  if (typeof value !== "string") {
     throw new Error(missingMessage);
   }
-  return text;
+  return value.trim();
 }

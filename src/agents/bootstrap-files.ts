@@ -1,122 +1,415 @@
-import fs from "node:fs/promises";
+import path from "node:path";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { ChatType } from "../channels/chat-type.js";
+import { prepareSessionTranscriptHydration } from "../config/sessions/session-transcript-hydration.js";
 import type { AgentContextInjection } from "../config/types.agent-defaults.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
-import { resolveSessionAgentIds } from "./agent-scope.js";
-import { getOrLoadBootstrapFiles } from "./bootstrap-cache.js";
-import { applyBootstrapHookOverrides } from "./bootstrap-hooks.js";
-import { shouldIncludeHeartbeatGuidanceForSystemPrompt } from "./heartbeat-system-prompt.js";
-import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
 import {
-  buildBootstrapContextFiles,
-  resolveBootstrapMaxChars,
-  resolveBootstrapTotalMaxChars,
-} from "./pi-embedded-helpers.js";
+  createInternalHookEvent,
+  triggerInternalHook,
+  type AgentBootstrapHookContext,
+} from "../hooks/internal-hooks.js";
+import { rememberBoundedKey } from "../infra/dedupe.js";
+import { isMemoryOriginEligibleForAutomaticInjection } from "../memory-host-sdk/host/types.js";
+import { classifyActiveMemoryWorkspacePaths } from "../plugins/memory-runtime.js";
+import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
+import { settleCurrentReadPreparations } from "../shared/current-read-authority.js";
+import { resolveUserPath } from "../utils.js";
 import {
-  DEFAULT_HEARTBEAT_FILENAME,
+  resolveAgentConfig,
+  resolveAgentWorkspaceDir,
+  resolveDefaultAgentId,
+  resolveSessionAgentId,
+} from "./agent-scope.js";
+import type { BootstrapContextRunKind } from "./bootstrap-mode.js";
+import { buildBootstrapContextForFiles } from "./embedded-agent-helpers/bootstrap.js";
+import type { EmbeddedContextFile } from "./embedded-agent-helpers/context-file.js";
+import type { AgentRunSessionTarget } from "./run-session-target.types.js";
+import { getAgentWorkspaceAccess } from "./workspace-access.js";
+import { resolveWorkspaceBootstrapPath } from "./workspace-bootstrap-policy.js";
+import { loadPersonalUserBootstrapFile } from "./workspace-personal-bootstrap.js";
+import {
+  DEFAULT_AGENTS_FILENAME,
+  DEFAULT_BOOTSTRAP_FILENAME,
+  DEFAULT_MEMORY_FILENAME,
+  DEFAULT_USER_FILENAME,
   filterBootstrapFilesForSession,
+  getWorkspaceFileSourceRelativePath,
+  isWorkspaceSetupCompleted,
   loadWorkspaceBootstrapFiles,
   type WorkspaceBootstrapFile,
+  workspaceFilesShareSourceIdentity,
 } from "./workspace.js";
 
 export type BootstrapContextMode = "full" | "lightweight";
-export type BootstrapContextRunKind = "default" | "heartbeat" | "cron";
 
-const CONTINUATION_SCAN_MAX_TAIL_BYTES = 256 * 1024;
 const CONTINUATION_SCAN_MAX_RECORDS = 500;
 export const FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE = "openclaw:bootstrap-context:full";
+const BOOTSTRAP_WARNING_DEDUPE_LIMIT = 1024;
+const seenBootstrapWarnings = new Set<string>();
 
-export function resolveContextInjectionMode(config?: OpenClawConfig): AgentContextInjection {
+/** Resolves the effective bootstrap injection mode for a session agent. */
+export function resolveContextInjectionMode(
+  config?: OpenClawConfig,
+  agentId?: string | null,
+): AgentContextInjection {
+  const agentMode =
+    config && agentId ? resolveAgentConfig(config, agentId)?.contextInjection : undefined;
+  if (agentMode === "always" || agentMode === "continuation-skip" || agentMode === "never") {
+    return agentMode;
+  }
   return config?.agents?.defaults?.contextInjection ?? "always";
 }
 
-export async function hasCompletedBootstrapTurn(sessionFile: string): Promise<boolean> {
+/** Checks the active SQLite transcript branch for a valid full-bootstrap marker. */
+export async function hasCompletedBootstrapTurn(
+  sessionTarget?: AgentRunSessionTarget,
+): Promise<boolean> {
+  const { agentId, sessionId, sessionKey, storePath } = sessionTarget ?? {};
+  if (!agentId || !sessionId || !sessionKey || !storePath) {
+    return false;
+  }
   try {
-    const stat = await fs.lstat(sessionFile);
-    if (stat.isSymbolicLink()) {
-      return false;
-    }
-
-    const fh = await fs.open(sessionFile, "r");
-    try {
-      const bytesToRead = Math.min(stat.size, CONTINUATION_SCAN_MAX_TAIL_BYTES);
-      if (bytesToRead <= 0) {
+    const reader = prepareSessionTranscriptHydration({ agentId, sessionId, sessionKey, storePath });
+    const records = await reader.readRecentActiveEvents(CONTINUATION_SCAN_MAX_RECORDS);
+    reader.assertCurrent();
+    for (const entry of records.toReversed()) {
+      const record = entry as { type?: string; customType?: string } | null | undefined;
+      // Context before compaction/reset is not reusable on the active branch.
+      if (record?.type === "compaction" || record?.type === "reset") {
         return false;
       }
-      const start = stat.size - bytesToRead;
-      const buffer = Buffer.allocUnsafe(bytesToRead);
-      const { bytesRead } = await fh.read(buffer, 0, bytesToRead, start);
-      let text = buffer.toString("utf-8", 0, bytesRead);
-      if (start > 0) {
-        const firstNewline = text.indexOf("\n");
-        if (firstNewline === -1) {
-          return false;
-        }
-        text = text.slice(firstNewline + 1);
+      if (record?.type === "custom" && record.customType === FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE) {
+        return true;
       }
-
-      const records = text
-        .split(/\r?\n/u)
-        .filter((line) => line.trim().length > 0)
-        .slice(-CONTINUATION_SCAN_MAX_RECORDS);
-      let compactedAfterLatestAssistant = false;
-
-      for (let i = records.length - 1; i >= 0; i--) {
-        const line = records[i];
-        if (!line) {
-          continue;
-        }
-        let entry: unknown;
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        const record = entry as
-          | {
-              type?: string;
-              customType?: string;
-              message?: { role?: string };
-            }
-          | null
-          | undefined;
-        if (record?.type === "compaction") {
-          compactedAfterLatestAssistant = true;
-          continue;
-        }
-        if (
-          record?.type === "custom" &&
-          record.customType === FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE
-        ) {
-          return !compactedAfterLatestAssistant;
-        }
-      }
-
-      return false;
-    } finally {
-      await fh.close();
     }
+    return false;
   } catch {
     return false;
   }
 }
 
+/** Builds a session-scoped warning sink that dedupes repeated bootstrap warnings. */
 export function makeBootstrapWarn(params: {
   sessionLabel: string;
+  workspaceDir?: string;
   warn?: (message: string) => void;
-}): ((message: string) => void) | undefined {
-  if (!params.warn) {
+}): ((message: string, dedupeKey?: string) => void) | undefined {
+  const warn = params.warn;
+  if (!warn) {
     return undefined;
   }
-  return (message: string) => params.warn?.(`${message} (sessionKey=${params.sessionLabel})`);
+  const workspacePrefix = params.workspaceDir ?? "";
+  return (message: string, dedupeKey?: string) => {
+    // Keep distinct workspace/session/message problems independently visible.
+    const key = dedupeKey ?? `${workspacePrefix}\u0000${params.sessionLabel}\u0000${message}`;
+    if (!rememberBoundedKey(seenBootstrapWarnings, key, BOOTSTRAP_WARNING_DEDUPE_LIMIT)) {
+      return;
+    }
+    warn(`${message} (sessionKey=${params.sessionLabel})`);
+  };
 }
 
-function sanitizeBootstrapFiles(
+function filterCompletedWorkspaceBootstrapFile(
   files: WorkspaceBootstrapFile[],
-  warn?: (message: string) => void,
+  setupCompleted: boolean,
+  workspaceDir: string,
 ): WorkspaceBootstrapFile[] {
+  if (!setupCompleted) {
+    return files;
+  }
+  const workspaceRoot = resolveUserPath(workspaceDir);
+  const rootBootstrapPath = path.join(workspaceRoot, DEFAULT_BOOTSTRAP_FILENAME);
+  return files.filter((file) => {
+    if (file.name !== DEFAULT_BOOTSTRAP_FILENAME) {
+      return true;
+    }
+    const pathValue = normalizeOptionalString(file.path);
+    if (!pathValue) {
+      return true;
+    }
+    const resolvedPath = resolveWorkspaceBootstrapPath(workspaceRoot, pathValue);
+    return resolvedPath !== rootBootstrapPath;
+  });
+}
+
+async function isWorkspaceSetupCompletedForContext(
+  workspaceDir: string,
+  readOnlyState = false,
+): Promise<boolean> {
+  try {
+    return await isWorkspaceSetupCompleted(workspaceDir, readOnlyState ? { readOnly: true } : {});
+  } catch {
+    return false;
+  }
+}
+
+async function resolveIneligibleAutomaticMemoryFiles(params: {
+  files: WorkspaceBootstrapFile[];
+  workspaceDir: string;
+  config?: OpenClawConfig;
+  agentId?: string;
+  warn?: (message: string) => void;
+}): Promise<WorkspaceBootstrapFile[]> {
+  const candidates = params.files.filter(
+    (file) =>
+      !file.missing &&
+      (file.name === DEFAULT_MEMORY_FILENAME || file.name === DEFAULT_USER_FILENAME),
+  );
+  if (candidates.length === 0 || !params.config) {
+    return [];
+  }
+  let agentId: string;
+  try {
+    agentId = params.agentId ?? resolveDefaultAgentId(params.config);
+  } catch (error) {
+    params.warn?.(`excluding automatic memory context: ${String(error)}`);
+    return candidates;
+  }
+  const relativePaths = candidates.map((file) =>
+    path.relative(resolveUserPath(params.workspaceDir), file.path).replaceAll(path.sep, "/"),
+  );
+  let classificationResult: Awaited<ReturnType<typeof classifyActiveMemoryWorkspacePaths>>;
+  try {
+    const access = getAgentWorkspaceAccess(params.workspaceDir);
+    classificationResult = await classifyActiveMemoryWorkspacePaths({
+      cfg: params.config,
+      agentId,
+      workspaceDir: params.workspaceDir,
+      relativePaths,
+      ...(access
+        ? {
+            readSources: candidates.map((file, index) => ({
+              relativePath: relativePaths[index]!,
+              canonicalRelativePath: getWorkspaceFileSourceRelativePath(file),
+            })),
+          }
+        : {}),
+    });
+    if (access && getAgentWorkspaceAccess(params.workspaceDir) !== access) {
+      throw new Error("Workspace access changed during memory classification");
+    }
+  } catch (error) {
+    params.warn?.(`excluding automatic memory context: ${String(error)}`);
+    return candidates;
+  }
+  if (classificationResult.status === "unavailable") {
+    return [];
+  }
+  if (classificationResult.status === "unsupported") {
+    params.warn?.(
+      "excluding automatic memory context: selected memory runtime does not support provenance classification",
+    );
+    return candidates;
+  }
+  const origins = new Map(
+    classificationResult.classifications.map((entry) => [entry.relativePath, entry.originClass]),
+  );
+  return candidates.filter((_file, index) => {
+    const relativePath = relativePaths[index]!;
+    const originClass = origins.get(relativePath);
+    if (isMemoryOriginEligibleForAutomaticInjection(originClass)) {
+      return false;
+    }
+    // Quarantine persists across turns: report each excluded file once per process.
+    const warningKey = `memory-provenance-exclusion\u0000${resolveUserPath(params.workspaceDir)}\u0000${relativePath}\u0000${originClass ?? ""}`;
+    if (
+      params.warn &&
+      rememberBoundedKey(seenBootstrapWarnings, warningKey, BOOTSTRAP_WARNING_DEDUPE_LIMIT)
+    ) {
+      params.warn(
+        `excluding ${relativePath} from automatic memory context: memory provenance is ${originClass ?? "unclassified"}; run \`openclaw doctor\` for the last recorded write`,
+      );
+    }
+    return true;
+  });
+}
+
+/** Resolves hook-adjusted, session-filtered bootstrap files for a run. */
+type BootstrapFileResolutionParams = {
+  bootstrapUserProfileId?: string;
+  workspaceDir: string;
+  executionWorkspaceDir?: string;
+  config?: OpenClawConfig;
+  sessionKey?: string;
+  sessionId?: string;
+  chatType?: ChatType;
+  agentId?: string;
+  warn?: (message: string) => void;
+  contextMode?: BootstrapContextMode;
+  runKind?: BootstrapContextRunKind;
+  readOnlyState?: boolean;
+};
+
+// Diagnostics project declared files without executing registered hook handlers.
+type BootstrapHookApplication = "none" | "registered" | { projected: WorkspaceBootstrapFile[] };
+
+/** Prepare the same bounded workspace facts without invoking run-owned bootstrap hooks. */
+export async function resolveBootstrapFilesForPreparation(
+  params: BootstrapFileResolutionParams,
+): Promise<WorkspaceBootstrapFile[]> {
+  return resolveBootstrapFiles({ ...params, readOnlyState: true }, "none");
+}
+
+export async function resolveBootstrapFilesForRun(
+  params: BootstrapFileResolutionParams,
+): Promise<WorkspaceBootstrapFile[]> {
+  const bootstrapFiles = await resolveBootstrapFiles(params, "registered");
+  const executionWorkspaceDir =
+    params.executionWorkspaceDir && resolveUserPath(params.executionWorkspaceDir);
+  if (executionWorkspaceDir && executionWorkspaceDir !== resolveUserPath(params.workspaceDir)) {
+    const executionAgentsPath = path.join(executionWorkspaceDir, DEFAULT_AGENTS_FILENAME);
+    // Execution projects contribute instructions, never agent identity or memory.
+    // This pass keeps only the project's AGENTS.md, so it skips the personal file read.
+    for (const file of await resolveBootstrapFiles(
+      { ...params, workspaceDir: executionWorkspaceDir, bootstrapUserProfileId: undefined },
+      "registered",
+    )) {
+      if (
+        file.name === DEFAULT_AGENTS_FILENAME &&
+        !file.missing &&
+        path.resolve(file.path) === executionAgentsPath
+      ) {
+        file.origin = { kind: "execution-project", rootPath: executionWorkspaceDir };
+        bootstrapFiles.push(file);
+      }
+    }
+  }
+  return bootstrapFiles;
+}
+
+async function resolveBootstrapFiles(
+  params: BootstrapFileResolutionParams,
+  hooks: BootstrapHookApplication,
+): Promise<WorkspaceBootstrapFile[]> {
+  const access = getAgentWorkspaceAccess(params.workspaceDir);
+  // Personal instructions belong to the editor's configured agent workspace,
+  // independently of the worktree that owns project bootstrap files.
+  const personalWorkspaceDir = resolveUserPath(
+    params.bootstrapUserProfileId && params.config
+      ? resolveAgentWorkspaceDir(params.config, resolveSessionAgentId(params))
+      : params.workspaceDir,
+  );
+  const personalAccess = getAgentWorkspaceAccess(personalWorkspaceDir);
+  const sessionKey = params.sessionKey ?? params.sessionId;
+  const session = {
+    sessionKey,
+    chatType: params.chatType,
+    workspaceDir: params.workspaceDir,
+  };
+  const [workspaceSetupCompleted, rawFiles, personalFile] = await settleCurrentReadPreparations([
+    isWorkspaceSetupCompletedForContext(params.workspaceDir, params.readOnlyState),
+    loadWorkspaceBootstrapFiles(params.workspaceDir),
+    loadPersonalUserBootstrapFile(personalWorkspaceDir, params.bootstrapUserProfileId, params.warn),
+  ] as const);
+  for (const file of rawFiles) {
+    file.origin = { kind: "agent-workspace", rootPath: resolveUserPath(params.workspaceDir) };
+  }
+  const userIndex = rawFiles.findIndex((file) => file.name === DEFAULT_USER_FILENAME);
+  if (personalFile) {
+    rawFiles.splice(userIndex < 0 ? rawFiles.length : userIndex + 1, 0, personalFile);
+  }
+  const ineligibleAutomaticMemoryFiles = await resolveIneligibleAutomaticMemoryFiles({
+    files:
+      personalFile && personalWorkspaceDir !== resolveUserPath(params.workspaceDir)
+        ? rawFiles.filter((file) => file !== personalFile)
+        : rawFiles,
+    workspaceDir: params.workspaceDir,
+    config: params.config,
+    agentId: params.agentId,
+    warn: params.warn,
+  });
+  if (personalFile && personalWorkspaceDir !== resolveUserPath(params.workspaceDir)) {
+    ineligibleAutomaticMemoryFiles.push(
+      ...(await resolveIneligibleAutomaticMemoryFiles({
+        files: [personalFile],
+        workspaceDir: personalWorkspaceDir,
+        config: params.config,
+        agentId: params.agentId,
+        warn: params.warn,
+      })),
+    );
+  }
+  const rootMemoryFile = rawFiles.find(
+    (file) => file.name === DEFAULT_MEMORY_FILENAME && !file.missing,
+  );
+  const protectedRootMemoryFile =
+    rootMemoryFile && filterBootstrapFilesForSession([rootMemoryFile], session).length === 0
+      ? rootMemoryFile
+      : undefined;
+  const protectedFiles = [
+    ...(protectedRootMemoryFile ? [protectedRootMemoryFile] : []),
+    ...ineligibleAutomaticMemoryFiles,
+  ];
+  const sessionFiles = filterCompletedWorkspaceBootstrapFile(
+    filterBootstrapFilesForSession(rawFiles, session).filter(
+      (file) =>
+        !ineligibleAutomaticMemoryFiles.some((ineligible) =>
+          workspaceFilesShareSourceIdentity(file, ineligible),
+        ),
+    ),
+    workspaceSetupCompleted,
+    params.workspaceDir,
+  );
+  // Lightweight runs omit bootstrap context.
+  const bootstrapFiles = params.contextMode === "lightweight" ? [] : sessionFiles;
+
+  let hooked = bootstrapFiles;
+  if (hooks === "registered") {
+    const hookSessionKey = params.sessionKey ?? params.sessionId ?? "unknown";
+    const agentId =
+      params.agentId ??
+      (params.sessionKey ? resolveAgentIdFromSessionKey(params.sessionKey) : undefined);
+    const context: AgentBootstrapHookContext = {
+      workspaceDir: params.workspaceDir,
+      bootstrapFiles,
+      cfg: params.config,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+      agentId,
+    };
+    const event = createInternalHookEvent("agent", "bootstrap", hookSessionKey, context);
+    await triggerInternalHook(event);
+    // SAFETY: This agent:bootstrap event uses the context contract supplied above.
+    const updated = (event.context as AgentBootstrapHookContext).bootstrapFiles;
+    hooked = Array.isArray(updated) ? updated : bootstrapFiles;
+  }
+  const updated = typeof hooks === "object" ? [...hooked, ...hooks.projected] : hooked;
+  const sessionFiltered = filterBootstrapFilesForSession(updated, session);
+  // Hooks can relabel or alias loader-produced records. Reapply lexical/session
+  // policy first, then enforce protected sources captured by the pinned opens.
+  const afterHooks =
+    protectedFiles.length === 0
+      ? sessionFiltered
+      : sessionFiltered.filter(
+          (file) =>
+            !protectedFiles.some((protectedFile) => {
+              if (workspaceFilesShareSourceIdentity(file, protectedFile)) {
+                return true;
+              }
+              const filePath = normalizeOptionalString(file.path);
+              const protectedPath = normalizeOptionalString(protectedFile.path);
+              return Boolean(
+                filePath && protectedPath && path.resolve(filePath) === path.resolve(protectedPath),
+              );
+            }),
+        );
+  const filteredUpdated = filterCompletedWorkspaceBootstrapFile(
+    afterHooks,
+    workspaceSetupCompleted,
+    params.workspaceDir,
+  );
+  if (
+    getAgentWorkspaceAccess(params.workspaceDir) !== access ||
+    getAgentWorkspaceAccess(personalWorkspaceDir) !== personalAccess
+  ) {
+    throw new Error("Workspace access changed while preparing bootstrap context");
+  }
+  const { workspaceDir, warn } = params;
+  const workspaceRoot = resolveUserPath(workspaceDir);
+  const seenPaths = new Set<string>();
   const sanitized: WorkspaceBootstrapFile[] = [];
-  for (const file of files) {
+  for (const file of filteredUpdated) {
     const pathValue = normalizeOptionalString(file.path) ?? "";
     if (!pathValue) {
       warn?.(
@@ -124,119 +417,38 @@ function sanitizeBootstrapFiles(
       );
       continue;
     }
-    sanitized.push({ ...file, path: pathValue });
+    const resolvedPath = resolveWorkspaceBootstrapPath(workspaceRoot, pathValue);
+    const dedupeKey = path.normalize(path.relative(workspaceRoot, resolvedPath));
+    if (seenPaths.has(dedupeKey)) {
+      continue;
+    }
+    seenPaths.add(dedupeKey);
+    sanitized.push({ ...file, path: resolvedPath });
   }
   return sanitized;
 }
 
-function applyContextModeFilter(params: {
-  files: WorkspaceBootstrapFile[];
-  contextMode?: BootstrapContextMode;
-  runKind?: BootstrapContextRunKind;
-}): WorkspaceBootstrapFile[] {
-  const contextMode = params.contextMode ?? "full";
-  const runKind = params.runKind ?? "default";
-  if (contextMode !== "lightweight") {
-    return params.files;
-  }
-  if (runKind === "heartbeat") {
-    return params.files.filter((file) => file.name === "HEARTBEAT.md");
-  }
-  // cron/default lightweight mode keeps bootstrap context empty on purpose.
-  return [];
-}
-
-function shouldExcludeHeartbeatBootstrapFile(params: {
-  config?: OpenClawConfig;
-  sessionKey?: string;
-  sessionId?: string;
-  agentId?: string;
-  runKind?: BootstrapContextRunKind;
-}): boolean {
-  if (!params.config || params.runKind === "heartbeat") {
-    return false;
-  }
-  const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
-    sessionKey: params.sessionKey ?? params.sessionId,
-    config: params.config,
-    agentId: params.agentId,
-  });
-  if (sessionAgentId !== defaultAgentId) {
-    return false;
-  }
-  return !shouldIncludeHeartbeatGuidanceForSystemPrompt({
-    config: params.config,
-    agentId: sessionAgentId,
-    defaultAgentId,
-  });
-}
-
-function filterHeartbeatBootstrapFile(
-  files: WorkspaceBootstrapFile[],
-  excludeHeartbeatBootstrapFile: boolean,
-): WorkspaceBootstrapFile[] {
-  if (!excludeHeartbeatBootstrapFile) {
-    return files;
-  }
-  return files.filter((file) => file.name !== DEFAULT_HEARTBEAT_FILENAME);
-}
-
-export async function resolveBootstrapFilesForRun(params: {
-  workspaceDir: string;
-  config?: OpenClawConfig;
-  sessionKey?: string;
-  sessionId?: string;
-  agentId?: string;
-  warn?: (message: string) => void;
-  contextMode?: BootstrapContextMode;
-  runKind?: BootstrapContextRunKind;
-}): Promise<WorkspaceBootstrapFile[]> {
-  const excludeHeartbeatBootstrapFile = shouldExcludeHeartbeatBootstrapFile(params);
-  const sessionKey = params.sessionKey ?? params.sessionId;
-  const rawFiles = params.sessionKey
-    ? await getOrLoadBootstrapFiles({
-        workspaceDir: params.workspaceDir,
-        sessionKey: params.sessionKey,
-      })
-    : await loadWorkspaceBootstrapFiles(params.workspaceDir);
-  const bootstrapFiles = applyContextModeFilter({
-    files: filterBootstrapFilesForSession(rawFiles, sessionKey),
-    contextMode: params.contextMode,
-    runKind: params.runKind,
-  });
-
-  const updated = await applyBootstrapHookOverrides({
-    files: bootstrapFiles,
-    workspaceDir: params.workspaceDir,
-    config: params.config,
-    sessionKey: params.sessionKey,
-    sessionId: params.sessionId,
-    agentId: params.agentId,
-  });
-  return sanitizeBootstrapFiles(
-    filterHeartbeatBootstrapFile(updated, excludeHeartbeatBootstrapFile),
-    params.warn,
-  );
-}
-
-export async function resolveBootstrapContextForRun(params: {
-  workspaceDir: string;
-  config?: OpenClawConfig;
-  sessionKey?: string;
-  sessionId?: string;
-  agentId?: string;
-  warn?: (message: string) => void;
-  contextMode?: BootstrapContextMode;
-  runKind?: BootstrapContextRunKind;
-}): Promise<{
+/** Resolves both raw bootstrap metadata and bounded context files for a run. */
+export async function resolveBootstrapContextForRun(
+  params: BootstrapFileResolutionParams,
+): Promise<{
   bootstrapFiles: WorkspaceBootstrapFile[];
   contextFiles: EmbeddedContextFile[];
 }> {
   const bootstrapFiles = await resolveBootstrapFilesForRun(params);
-  const contextFiles = buildBootstrapContextFiles(bootstrapFiles, {
-    maxChars: resolveBootstrapMaxChars(params.config),
-    totalMaxChars: resolveBootstrapTotalMaxChars(params.config),
-    warn: params.warn,
-  });
+  const contextFiles = buildBootstrapContextForFiles(bootstrapFiles, params);
+  return { bootstrapFiles, contextFiles };
+}
+
+/** Applies declared additions through the normal bootstrap filters and budgets. */
+export async function resolveBootstrapContextWithProjectedHookFiles(
+  params: Pick<BootstrapFileResolutionParams, "workspaceDir" | "config" | "agentId">,
+  projected: WorkspaceBootstrapFile[],
+): ReturnType<typeof resolveBootstrapContextForRun> {
+  const bootstrapFiles = await resolveBootstrapFiles(
+    { ...params, readOnlyState: true },
+    { projected },
+  );
+  const contextFiles = buildBootstrapContextForFiles(bootstrapFiles, params);
   return { bootstrapFiles, contextFiles };
 }

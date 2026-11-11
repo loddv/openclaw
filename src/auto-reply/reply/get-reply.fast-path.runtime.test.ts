@@ -1,5 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../../config/config.js";
+import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
 import {
   createReplyRuntimeMocks,
   createTempHomeHarness,
@@ -8,57 +12,79 @@ import {
   makeReplyConfig,
   resetReplyRuntimeMocks,
 } from "../reply.test-harness.js";
-import { loadReplyModuleForTest } from "./get-reply.test-loader.js";
+import { loadGetReplyModuleForTest } from "./get-reply.test-loader.js";
+import { createModelSelectionStateFixture } from "./model-selection.test-support.js";
 
-let getReplyFromConfig: typeof import("../reply.js").getReplyFromConfig;
+vi.mock("./model-selection.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./model-selection.js")>()),
+  createModelSelectionState: vi.fn<typeof import("./model-selection.js").createModelSelectionState>(
+    async (params) => createModelSelectionStateFixture(params),
+  ),
+}));
+
+let getReplyFromConfig: typeof import("./get-reply.js").getReplyFromConfig;
 const agentMocks = createReplyRuntimeMocks();
 const { withTempHome } = createTempHomeHarness({ prefix: "openclaw-getreply-fast-" });
 
 installReplyRuntimeMocks(agentMocks);
 
-describe("getReplyFromConfig fast-path runtime", () => {
-  beforeEach(async () => {
-    vi.stubEnv("OPENCLAW_TEST_FAST", "1");
-    resetReplyRuntimeMocks(agentMocks);
-    ({ getReplyFromConfig } = await loadReplyModuleForTest({ cacheKey: import.meta.url }));
-  });
+function installRuntimeChannels() {
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: "telegram",
+        plugin: createChannelTestPluginBase({ id: "telegram" }),
+        source: "test",
+      },
+    ]),
+  );
+}
 
-  afterEach(() => {
-    vi.clearAllMocks();
-    vi.unstubAllEnvs();
-  });
+beforeAll(async () => {
+  installRuntimeChannels();
+  ({ getReplyFromConfig } = await loadGetReplyModuleForTest({ cacheKey: import.meta.url }));
+});
 
-  it("keeps old-style runtime tests fast with marked temp-home configs", async () => {
+beforeEach(() => {
+  vi.stubEnv("OPENCLAW_TEST_FAST", "1");
+  resetReplyRuntimeMocks(agentMocks);
+  agentMocks.runEmbeddedAgent.mockResolvedValue(makeEmbeddedTextResult("ok"));
+  installRuntimeChannels();
+});
+
+afterEach(() => {
+  setActivePluginRegistry(createTestRegistry([]));
+  vi.clearAllMocks();
+  vi.unstubAllEnvs();
+});
+
+it.each(["native", "normal"] as const)(
+  "routes structured %s turns before legacy sync",
+  async (kind) => {
     await withTempHome(async (home) => {
-      let seenPrompt: string | undefined;
-      agentMocks.runEmbeddedPiAgent.mockImplementation(async (params) => {
-        seenPrompt = params.prompt;
-        return makeEmbeddedTextResult("ok");
-      });
-
-      const res = await getReplyFromConfig(
+      const native = kind === "native";
+      const target = "agent:main:telegram:direct:target";
+      const source = native ? "telegram:slash:source" : "agent:main:telegram:direct:source";
+      await getReplyFromConfig(
         {
           Body: "hello",
-          BodyForAgent: "hello",
-          RawBody: "hello",
-          CommandBody: "hello",
-          From: "+1001",
-          To: "+2000",
-          MediaPaths: ["/tmp/a.png", "/tmp/b.png"],
-          MediaUrls: ["/tmp/a.png", "/tmp/b.png"],
-          SessionKey: "agent:main:whatsapp:+2000",
-          Provider: "whatsapp",
-          Surface: "whatsapp",
           ChatType: "direct",
+          ...(!native ? { CommandSource: "native" as const } : {}),
+          CommandTurn: native
+            ? { kind: "native", source: "native", authorized: true }
+            : { kind: "normal", source: "message", authorized: false },
+          CommandTargetSessionKey: target,
+          SessionKey: source,
+          Provider: "telegram",
+          Surface: "telegram",
         },
         {},
-        makeReplyConfig(home) as OpenClawConfig,
+        makeReplyConfig(home),
       );
 
-      const text = Array.isArray(res) ? res[0]?.text : res?.text;
-      expect(text).toBe("ok");
-      expect(seenPrompt).toContain("[media attached: 2 files]");
-      expect(seenPrompt).toContain("hello");
+      expect(agentMocks.runEmbeddedAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionKey: native ? target : source }),
+      );
     });
-  });
-});
+  },
+);

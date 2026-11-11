@@ -1,32 +1,40 @@
-import { normalizeProviderId } from "../agents/provider-id.js";
-import {
-  hasPotentialConfiguredChannels,
-  listPotentialConfiguredChannelIds,
-} from "../channels/config-presence.js";
-import { getChatChannelMeta, normalizeChatChannelId } from "../channels/registry.js";
-import {
-  loadPluginManifestRegistry,
-  resolveManifestContractOwnerPluginId,
-  type PluginManifestRecord,
-  type PluginManifestRegistry,
-} from "../plugins/manifest-registry.js";
+import { collectConfiguredModelRefs } from "@openclaw/model-catalog-core/configured-model-refs";
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
+import { asOptionalObjectRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { listAgentEntries } from "../agents/agent-scope-config.js";
+import { getConfiguredDecisionProviderIds } from "../agents/decision-model-setting.js";
+import { collectConfiguredAgentHarnessRuntimes } from "../agents/harness-runtimes.js";
+import type { AmbientEnvTriggerPolicy } from "../channels/config-presence.js";
+import { normalizePluginsConfig } from "../plugins/config-state.js";
+import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
+import type { PluginDiscoveryResult } from "../plugins/discovery.js";
+import { collectConfiguredSpeechProviderIds } from "../plugins/gateway-startup-speech-providers.js";
+import { resolveInstalledPluginIndexPolicyHash } from "../plugins/installed-plugin-index-policy.js";
+import type { PluginManifestRecord, PluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { isNativeSessionCatalogOptOutOnly } from "../plugins/native-session-catalog-config.js";
+import { loadPluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { resolveOwningPluginIdsForModelRef } from "../plugins/providers.js";
-import { resolvePluginSetupAutoEnableReasons } from "../plugins/setup-registry.js";
-import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
-import { isRecord } from "../utils.js";
-import { isChannelConfigured } from "./channel-configured.js";
-import { shouldSkipPreferredPluginAutoEnable } from "./plugin-auto-enable.prefer-over.js";
-import type {
-  PluginAutoEnableCandidate,
-  PluginAutoEnableResult,
-} from "./plugin-auto-enable.types.js";
-import { ensurePluginAllowlisted } from "./plugins-allowlist.js";
-import { isBlockedObjectKey } from "./prototype-keys.js";
+import {
+  resolvePluginSetupAutoEnableReasons,
+  resolvePluginSetupRegistryAsync,
+} from "../plugins/setup-registry.js";
+import {
+  collectConfiguredStorageProviderIds,
+  listBundledStorageProviderOwners,
+} from "../plugins/storage-provider-manifest.js";
+import { collectConfiguredWorkerProviderIds } from "../plugins/worker-provider-config.js";
+import { listBundledWorkerProviderOwners } from "../plugins/worker-provider-manifest.js";
+import { isKernelOwnedChannelConfigKey } from "./channel-config-keys.js";
+import {
+  collectAutoEnableChannelIds,
+  resolveConfiguredChannelAutoEnableCandidates,
+  type ConfiguredPluginAutoEnableParams,
+} from "./plugin-auto-enable.channels.js";
+import { hasMaterialPluginEntryConfig } from "./plugin-auto-enable.materialize.js";
+import type { PluginAutoEnableCandidate } from "./plugin-auto-enable.types.js";
+import { resolveConfiguredTalkRealtimeProviderId } from "./talk.js";
 import type { OpenClawConfig } from "./types.openclaw.js";
-export type {
-  PluginAutoEnableCandidate,
-  PluginAutoEnableResult,
-} from "./plugin-auto-enable.types.js";
 
 const EMPTY_PLUGIN_MANIFEST_REGISTRY: PluginManifestRegistry = {
   plugins: [],
@@ -47,212 +55,74 @@ function resolveAutoEnableProviderPluginIds(
   return Object.fromEntries(entries);
 }
 
-function collectModelRefs(cfg: OpenClawConfig): string[] {
-  const refs: string[] = [];
-  const pushModelRef = (value: unknown) => {
-    if (typeof value === "string" && value.trim()) {
-      refs.push(value.trim());
-    }
-  };
-  const collectFromAgent = (agent: Record<string, unknown> | null | undefined) => {
-    if (!agent) {
-      return;
-    }
-    const model = agent.model;
-    if (typeof model === "string") {
-      pushModelRef(model);
-    } else if (isRecord(model)) {
-      pushModelRef(model.primary);
-      const fallbacks = model.fallbacks;
-      if (Array.isArray(fallbacks)) {
-        for (const entry of fallbacks) {
-          pushModelRef(entry);
-        }
-      }
-    }
-    const models = agent.models;
-    if (isRecord(models)) {
-      for (const key of Object.keys(models)) {
-        pushModelRef(key);
-      }
-    }
-  };
-
-  collectFromAgent(cfg.agents?.defaults as Record<string, unknown> | undefined);
-  const list = cfg.agents?.list;
-  if (Array.isArray(list)) {
-    for (const entry of list) {
-      if (isRecord(entry)) {
-        collectFromAgent(entry);
-      }
-    }
-  }
-  return refs;
-}
-
-function extractProviderFromModelRef(value: string): string | null {
-  const trimmed = value.trim();
-  const slash = trimmed.indexOf("/");
-  if (slash <= 0) {
-    return null;
-  }
-  return normalizeProviderId(trimmed.slice(0, slash));
-}
-
 function isProviderConfigured(cfg: OpenClawConfig, providerId: string): boolean {
   const normalized = normalizeProviderId(providerId);
   const profiles = cfg.auth?.profiles;
-  if (profiles && typeof profiles === "object") {
-    for (const profile of Object.values(profiles)) {
-      if (!isRecord(profile)) {
-        continue;
-      }
-      const provider = normalizeProviderId(profile.provider ?? "");
-      if (provider === normalized) {
-        return true;
-      }
-    }
+  if (
+    profiles &&
+    typeof profiles === "object" &&
+    Object.values(profiles).some(
+      (profile) => isRecord(profile) && normalizeProviderId(profile.provider ?? "") === normalized,
+    )
+  ) {
+    return true;
   }
 
   const providerConfig = cfg.models?.providers;
-  if (providerConfig && typeof providerConfig === "object") {
-    for (const key of Object.keys(providerConfig)) {
-      if (normalizeProviderId(key) === normalized) {
-        return true;
-      }
-    }
+  if (
+    providerConfig &&
+    typeof providerConfig === "object" &&
+    Object.keys(providerConfig).some((key) => normalizeProviderId(key) === normalized)
+  ) {
+    return true;
   }
 
-  for (const ref of collectModelRefs(cfg)) {
-    const provider = extractProviderFromModelRef(ref);
-    if (provider && provider === normalized) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function hasPluginOwnedWebSearchConfig(cfg: OpenClawConfig, pluginId: string): boolean {
-  const pluginConfig = cfg.plugins?.entries?.[pluginId]?.config;
-  return isRecord(pluginConfig) && isRecord(pluginConfig.webSearch);
-}
-
-function hasPluginOwnedWebFetchConfig(cfg: OpenClawConfig, pluginId: string): boolean {
-  const pluginConfig = cfg.plugins?.entries?.[pluginId]?.config;
-  return isRecord(pluginConfig) && isRecord(pluginConfig.webFetch);
-}
-
-function resolvePluginOwnedToolConfigKeys(plugin: PluginManifestRecord): string[] {
-  if ((plugin.contracts?.tools?.length ?? 0) === 0) {
-    return [];
-  }
-  const properties = isRecord(plugin.configSchema) ? plugin.configSchema.properties : undefined;
-  if (!isRecord(properties)) {
-    return [];
-  }
-  return Object.keys(properties).filter((key) => key !== "webSearch" && key !== "webFetch");
+  return collectConfiguredModelRefs(cfg, { includeChannelModelOverrides: false }).some(
+    ({ value: ref }) => {
+      const trimmed = ref.trim();
+      const slash = trimmed.indexOf("/");
+      const provider = slash > 0 ? normalizeProviderId(trimmed.slice(0, slash)) : null;
+      return Boolean(provider) && provider === normalized;
+    },
+  );
 }
 
 function hasPluginOwnedToolConfig(cfg: OpenClawConfig, plugin: PluginManifestRecord): boolean {
-  const pluginConfig = cfg.plugins?.entries?.[plugin.id]?.config;
-  if (!isRecord(pluginConfig)) {
+  const entry = cfg.plugins?.entries?.[plugin.id];
+  const pluginConfig = entry?.config;
+  if (isNativeSessionCatalogOptOutOnly(plugin.id, entry) || !isRecord(pluginConfig)) {
     return false;
   }
-  return resolvePluginOwnedToolConfigKeys(plugin).some((key) => pluginConfig[key] !== undefined);
-}
-
-function resolveProviderPluginsWithOwnedWebSearch(
-  registry: PluginManifestRegistry,
-): PluginManifestRecord[] {
-  return registry.plugins
-    .filter((plugin) => (plugin.providers?.length ?? 0) > 0)
-    .filter((plugin) => (plugin.contracts?.webSearchProviders?.length ?? 0) > 0);
-}
-
-function resolveProviderPluginsWithOwnedWebFetch(
-  registry: PluginManifestRegistry,
-): PluginManifestRecord[] {
-  return registry.plugins.filter(
-    (plugin) => (plugin.contracts?.webFetchProviders?.length ?? 0) > 0,
+  const properties = isRecord(plugin.configSchema) ? plugin.configSchema.properties : undefined;
+  return (
+    isRecord(properties) &&
+    Object.keys(properties).some(
+      (key) => key !== "webSearch" && key !== "webFetch" && pluginConfig[key] !== undefined,
+    )
   );
 }
 
-function resolvePluginsWithOwnedToolConfig(
-  registry: PluginManifestRegistry,
-): PluginManifestRecord[] {
-  return registry.plugins.filter((plugin) => (plugin.contracts?.tools?.length ?? 0) > 0);
-}
-
-function resolvePluginIdForConfiguredWebFetchProvider(
+function resolvePluginIdForConfiguredWebProvider(
   providerId: string | undefined,
-  env: NodeJS.ProcessEnv,
+  registry: PluginManifestRegistry,
+  contract: "webSearchProviders" | "webFetchProviders",
 ): string | undefined {
-  return resolveManifestContractOwnerPluginId({
-    contract: "webFetchProviders",
-    value: normalizeOptionalLowercaseString(providerId) ?? "",
-    origin: "bundled",
-    env,
-  });
-}
-
-function buildChannelToPluginIdMap(registry: PluginManifestRegistry): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const record of registry.plugins) {
-    for (const channelId of record.channels ?? []) {
-      if (channelId && !map.has(channelId)) {
-        map.set(channelId, record.id);
-      }
-    }
+  const normalizedProviderId = normalizeOptionalLowercaseString(providerId);
+  if (!normalizedProviderId) {
+    return undefined;
   }
-  return map;
-}
-
-function resolvePluginIdForChannel(
-  channelId: string,
-  channelToPluginId: ReadonlyMap<string, string>,
-): string {
-  const builtInId = normalizeChatChannelId(channelId);
-  if (builtInId) {
-    return builtInId;
-  }
-  return channelToPluginId.get(channelId) ?? channelId;
-}
-
-function collectCandidateChannelIds(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): string[] {
-  return listPotentialConfiguredChannelIds(cfg, env).map(
-    (channelId) => normalizeChatChannelId(channelId) ?? channelId,
-  );
-}
-
-function hasConfiguredWebSearchPluginEntry(cfg: OpenClawConfig): boolean {
-  const entries = cfg.plugins?.entries;
-  return (
-    !!entries &&
-    typeof entries === "object" &&
-    Object.values(entries).some(
-      (entry) => isRecord(entry) && isRecord(entry.config) && isRecord(entry.config.webSearch),
-    )
-  );
-}
-
-function hasConfiguredWebFetchPluginEntry(cfg: OpenClawConfig): boolean {
-  const entries = cfg.plugins?.entries;
-  return (
-    !!entries &&
-    typeof entries === "object" &&
-    Object.values(entries).some(
-      (entry) => isRecord(entry) && isRecord(entry.config) && isRecord(entry.config.webFetch),
-    )
-  );
+  return registry.plugins.find(
+    (plugin) =>
+      (contract !== "webFetchProviders" || plugin.origin === "bundled") &&
+      (plugin.contracts?.[contract] ?? []).some(
+        (candidate) => normalizeOptionalLowercaseString(candidate) === normalizedProviderId,
+      ),
+  )?.id;
 }
 
 function hasConfiguredPluginConfigEntry(cfg: OpenClawConfig): boolean {
-  const entries = cfg.plugins?.entries;
-  return (
-    !!entries &&
-    typeof entries === "object" &&
-    Object.values(entries).some((entry) => isRecord(entry) && isRecord(entry.config))
+  return Object.values(asOptionalObjectRecord(cfg.plugins?.entries) ?? {}).some(
+    (entry) => isRecord(entry) && isRecord(entry.config),
   );
 }
 
@@ -271,143 +141,187 @@ function toolPolicyReferencesBrowser(value: unknown): boolean {
   );
 }
 
-function hasBrowserToolReference(cfg: OpenClawConfig): boolean {
-  if (toolPolicyReferencesBrowser(cfg.tools)) {
-    return true;
+function hasBrowserSetupAutoEnableRelevantConfig(cfg: OpenClawConfig): boolean {
+  if (cfg.browser?.enabled === false || cfg.plugins?.entries?.browser?.enabled === false) {
+    return false;
   }
-  const agentList = cfg.agents?.list;
-  return Array.isArray(agentList)
-    ? agentList.some((entry) => isRecord(entry) && toolPolicyReferencesBrowser(entry.tools))
-    : false;
+  const entries = asOptionalObjectRecord(cfg.plugins?.entries);
+  return (
+    isRecord(cfg.browser) ||
+    (entries !== undefined && Object.hasOwn(entries, "browser")) ||
+    toolPolicyReferencesBrowser(cfg.tools) ||
+    listAgentEntries(cfg).some((entry) => toolPolicyReferencesBrowser(entry.tools))
+  );
+}
+
+function hasAcpxSetupAutoEnableRelevantConfig(cfg: OpenClawConfig): boolean {
+  if (cfg.plugins?.entries?.acpx?.enabled === false || !isRecord(cfg.acp)) {
+    return false;
+  }
+  const backend = normalizeOptionalLowercaseString(cfg.acp.backend);
+  const configured =
+    cfg.acp.enabled === true ||
+    (isRecord(cfg.acp.dispatch) && cfg.acp.dispatch.enabled === true) ||
+    backend === "acpx";
+  return configured && (!backend || backend === "acpx");
+}
+
+function resolveRelevantSetupAutoEnablePluginIds(
+  cfg: OpenClawConfig,
+  registry: PluginManifestRegistry,
+): string[] {
+  const pluginIds = new Set(
+    Object.keys(asOptionalObjectRecord(cfg.plugins?.entries) ?? {})
+      .map((pluginId) => pluginId.trim())
+      .filter((pluginId) => pluginId && cfg.plugins?.entries?.[pluginId]?.enabled !== false),
+  );
+  if (hasBrowserSetupAutoEnableRelevantConfig(cfg)) {
+    pluginIds.add("browser");
+  }
+  if (hasAcpxSetupAutoEnableRelevantConfig(cfg)) {
+    pluginIds.add("acpx");
+  }
+  const policy = normalizePluginsConfig(cfg.plugins);
+  return [...pluginIds]
+    .filter((pluginId) => {
+      const plugin = registry.plugins.find((record) => record.id === pluginId);
+      // Enabled non-channel candidates are discarded unless they repair an allowlist
+      // or participate in prefer-over ordering. Avoid capturing their setup dependencies.
+      return (
+        policy.entries[pluginId]?.enabled !== true ||
+        (policy.allow.length > 0 && !policy.allow.includes(pluginId)) ||
+        !plugin ||
+        plugin.channels.length > 0 ||
+        (plugin.channelConfigs?.[pluginId]?.preferOver?.length ?? 0) > 0 ||
+        (plugin.channelCatalogMeta?.preferOver?.length ?? 0) > 0
+      );
+    })
+    .toSorted((left, right) => left.localeCompare(right));
 }
 
 function hasSetupAutoEnableRelevantConfig(cfg: OpenClawConfig): boolean {
-  const entries = cfg.plugins?.entries;
-  if (isRecord(cfg.browser) || isRecord(cfg.acp) || hasBrowserToolReference(cfg)) {
-    return true;
-  }
-  if (isRecord(entries?.browser) || isRecord(entries?.acpx) || isRecord(entries?.xai)) {
-    return true;
-  }
-  if (isRecord(cfg.tools?.web) && isRecord((cfg.tools.web as Record<string, unknown>).x_search)) {
-    return true;
-  }
-  return hasConfiguredPluginConfigEntry(cfg);
+  return (
+    hasConfiguredPluginConfigEntry(cfg) ||
+    hasBrowserSetupAutoEnableRelevantConfig(cfg) ||
+    hasAcpxSetupAutoEnableRelevantConfig(cfg)
+  );
 }
 
-function hasPluginEntries(cfg: OpenClawConfig): boolean {
-  const entries = cfg.plugins?.entries;
-  return !!entries && typeof entries === "object" && Object.keys(entries).length > 0;
+/** Prepare only the setup owners whose probes can affect auto-enable selection. */
+export async function preparePluginAutoEnableSetup(params: {
+  config: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+  manifestRegistry?: PluginManifestRegistry;
+  assertCurrent?: () => void;
+}): Promise<void> {
+  if (
+    params.config.plugins?.enabled === false ||
+    !hasSetupAutoEnableRelevantConfig(params.config)
+  ) {
+    return;
+  }
+  const registry = resolvePluginAutoEnableManifestRegistry({
+    ...params,
+    env: params.env ?? process.env,
+  });
+  await resolvePluginSetupRegistryAsync({
+    ...params,
+    manifestRegistry: registry,
+    pluginIds: resolveRelevantSetupAutoEnablePluginIds(params.config, registry),
+  });
+}
+
+function hasPluginAllowlistWithMaterialEntries(cfg: OpenClawConfig): boolean {
+  if (!Array.isArray(cfg.plugins?.allow) || cfg.plugins.allow.length === 0) {
+    return false;
+  }
+  const entries = asOptionalObjectRecord(cfg.plugins?.entries);
+  return entries !== undefined && Object.values(entries).some(hasMaterialPluginEntryConfig);
+}
+
+function hasConfiguredPluginProviders(cfg: OpenClawConfig): boolean {
+  const webSearch = cfg.tools?.web?.search;
+  return (
+    getConfiguredDecisionProviderIds(cfg).length > 0 ||
+    Object.keys(cfg.auth?.profiles ?? {}).length > 0 ||
+    Object.keys(cfg.models?.providers ?? {}).length > 0 ||
+    collectConfiguredModelRefs(cfg, { includeChannelModelOverrides: false }).length > 0 ||
+    collectConfiguredAgentHarnessRuntimes(cfg).length > 0 ||
+    collectConfiguredSpeechProviderIds(cfg).size > 0 ||
+    Boolean(resolveConfiguredTalkRealtimeProviderId(cfg)) ||
+    collectConfiguredWorkerProviderIds(cfg).length > 0 ||
+    collectConfiguredStorageProviderIds(cfg).length > 0 ||
+    (webSearch?.enabled !== false &&
+      typeof webSearch?.provider === "string" &&
+      Boolean(webSearch.provider.trim()))
+  );
 }
 
 function configMayNeedPluginManifestRegistry(cfg: OpenClawConfig): boolean {
-  const pluginEntries = cfg.plugins?.entries;
-  if (Array.isArray(cfg.plugins?.allow) && cfg.plugins.allow.length > 0 && hasPluginEntries(cfg)) {
-    return true;
+  if (cfg.plugins?.enabled === false) {
+    return false;
   }
   if (
-    pluginEntries &&
-    Object.values(pluginEntries).some((entry) => isRecord(entry) && isRecord(entry.config))
+    hasPluginAllowlistWithMaterialEntries(cfg) ||
+    hasSetupAutoEnableRelevantConfig(cfg) ||
+    hasConfiguredPluginProviders(cfg)
   ) {
-    return true;
-  }
-  if (cfg.auth?.profiles && Object.keys(cfg.auth.profiles).length > 0) {
-    return true;
-  }
-  if (cfg.models?.providers && Object.keys(cfg.models.providers).length > 0) {
-    return true;
-  }
-  if (collectModelRefs(cfg).length > 0) {
     return true;
   }
   const configuredChannels = cfg.channels as Record<string, unknown> | undefined;
   if (!configuredChannels || typeof configuredChannels !== "object") {
     return false;
   }
-  for (const key of Object.keys(configuredChannels)) {
-    if (key === "defaults" || key === "modelByChannel") {
-      continue;
-    }
-    if (!normalizeChatChannelId(key)) {
-      return true;
-    }
-  }
-  return false;
+  return Object.keys(configuredChannels).some((key) => !isKernelOwnedChannelConfigKey(key));
 }
 
 export function configMayNeedPluginAutoEnable(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv,
 ): boolean {
-  if (Array.isArray(cfg.plugins?.allow) && cfg.plugins.allow.length > 0 && hasPluginEntries(cfg)) {
-    return true;
-  }
-  if (hasConfiguredPluginConfigEntry(cfg)) {
-    return true;
-  }
-  if (hasPotentialConfiguredChannels(cfg, env)) {
-    return true;
-  }
-  if (cfg.auth?.profiles && Object.keys(cfg.auth.profiles).length > 0) {
-    return true;
-  }
-  if (cfg.models?.providers && Object.keys(cfg.models.providers).length > 0) {
-    return true;
-  }
-  if (collectModelRefs(cfg).length > 0) {
-    return true;
-  }
-  if (hasConfiguredWebSearchPluginEntry(cfg) || hasConfiguredWebFetchPluginEntry(cfg)) {
-    return true;
-  }
-  if (!hasSetupAutoEnableRelevantConfig(cfg)) {
-    return false;
-  }
-  return (
-    resolvePluginSetupAutoEnableReasons({
-      config: cfg,
-      env,
-    }).length > 0
-  );
+  return resolvePluginAutoEnableReadiness(cfg, env).mayNeedAutoEnable;
 }
 
-export function resolvePluginAutoEnableCandidateReason(
-  candidate: PluginAutoEnableCandidate,
-): string {
-  switch (candidate.kind) {
-    case "channel-configured":
-      return `${candidate.channelId} configured`;
-    case "provider-auth-configured":
-      return `${candidate.providerId} auth configured`;
-    case "provider-model-configured":
-      return `${candidate.modelRef} model configured`;
-    case "web-fetch-provider-selected":
-      return `${candidate.providerId} web fetch provider selected`;
-    case "plugin-web-search-configured":
-      return `${candidate.pluginId} web search configured`;
-    case "plugin-web-fetch-configured":
-      return `${candidate.pluginId} web fetch configured`;
-    case "plugin-tool-configured":
-      return `${candidate.pluginId} tool configured`;
-    case "setup-auto-enable":
-      return candidate.reason;
+export function resolvePluginAutoEnableReadiness(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv,
+  discovery?: PluginDiscoveryResult,
+  ambientEnvTriggers?: AmbientEnvTriggerPolicy,
+): { mayNeedAutoEnable: boolean; configuredChannelIds: string[] } {
+  if (cfg.plugins?.enabled === false) {
+    return { mayNeedAutoEnable: false, configuredChannelIds: [] };
   }
-  throw new Error("Unsupported plugin auto-enable candidate");
+  const configuredChannelIds = collectAutoEnableChannelIds(cfg, env, discovery, ambientEnvTriggers);
+  return {
+    mayNeedAutoEnable:
+      hasPluginAllowlistWithMaterialEntries(cfg) ||
+      hasSetupAutoEnableRelevantConfig(cfg) ||
+      configuredChannelIds.length > 0 ||
+      hasConfiguredPluginProviders(cfg),
+    configuredChannelIds,
+  };
 }
 
-export function resolveConfiguredPluginAutoEnableCandidates(params: {
-  config: OpenClawConfig;
-  env: NodeJS.ProcessEnv;
-  registry: PluginManifestRegistry;
-}): PluginAutoEnableCandidate[] {
-  const changes: PluginAutoEnableCandidate[] = [];
-  const channelToPluginId = buildChannelToPluginIdMap(params.registry);
-  for (const channelId of collectCandidateChannelIds(params.config, params.env)) {
-    const pluginId = resolvePluginIdForChannel(channelId, channelToPluginId);
-    if (isChannelConfigured(params.config, channelId, params.env)) {
-      changes.push({ pluginId, kind: "channel-configured", channelId });
-    }
-  }
+export function resolveConfiguredPluginAutoEnableCandidates(
+  params: ConfiguredPluginAutoEnableParams,
+): PluginAutoEnableCandidate[] {
+  const changes = resolveConfiguredChannelAutoEnableCandidates(params);
+  const findMatchingPluginIds = (
+    value: string,
+    selectValues: (plugin: PluginManifestRecord) => readonly string[],
+  ): string[] => {
+    const normalized = normalizeOptionalLowercaseString(value);
+    return normalized
+      ? params.registry.plugins
+          .filter((plugin) =>
+            selectValues(plugin).some(
+              (candidate) => normalizeOptionalLowercaseString(candidate) === normalized,
+            ),
+          )
+          .map((plugin) => plugin.id)
+          .toSorted((left, right) => left.localeCompare(right))
+      : [];
+  };
 
   for (const [providerId, pluginId] of Object.entries(
     resolveAutoEnableProviderPluginIds(params.registry),
@@ -417,63 +331,133 @@ export function resolveConfiguredPluginAutoEnableCandidates(params: {
     }
   }
 
-  for (const modelRef of collectModelRefs(params.config)) {
+  const configuredModelPluginIds = new Set<string>();
+  for (const modelRef of new Set(
+    collectConfiguredModelRefs(params.config, { includeChannelModelOverrides: false }).map(
+      ({ value }) => value,
+    ),
+  )) {
     const owningPluginIds = resolveOwningPluginIdsForModelRef({
       model: modelRef,
       config: params.config,
       env: params.env,
       manifestRegistry: params.registry,
     });
-    if (owningPluginIds?.length === 1) {
+    const pluginId = owningPluginIds?.length === 1 ? owningPluginIds[0] : undefined;
+    if (!pluginId || configuredModelPluginIds.has(pluginId)) {
+      continue;
+    }
+    configuredModelPluginIds.add(pluginId);
+    changes.push({ pluginId, kind: "provider-model-configured", modelRef });
+  }
+
+  for (const providerId of collectConfiguredSpeechProviderIds(params.config)) {
+    for (const pluginId of findMatchingPluginIds(
+      providerId,
+      (plugin) => plugin.contracts?.speechProviders ?? [],
+    )) {
+      changes.push({ pluginId, kind: "speech-provider-selected", providerId });
+    }
+  }
+
+  const realtimeProviderId = resolveConfiguredTalkRealtimeProviderId(params.config);
+  if (realtimeProviderId) {
+    for (const plugin of params.registry.plugins) {
+      if (!plugin.contracts?.realtimeVoiceProviders?.includes(realtimeProviderId.toLowerCase())) {
+        continue;
+      }
       changes.push({
-        pluginId: owningPluginIds[0],
-        kind: "provider-model-configured",
-        modelRef,
+        pluginId: plugin.id,
+        kind: "setup-auto-enable",
+        reason: `${realtimeProviderId} realtime voice provider selected`,
       });
     }
   }
 
-  const webFetchProvider =
-    typeof params.config.tools?.web?.fetch?.provider === "string"
-      ? params.config.tools.web.fetch.provider
-      : undefined;
-  const webFetchPluginId = resolvePluginIdForConfiguredWebFetchProvider(
-    webFetchProvider,
-    params.env,
-  );
-  if (webFetchPluginId) {
-    changes.push({
-      pluginId: webFetchPluginId,
-      kind: "web-fetch-provider-selected",
-      providerId: normalizeOptionalLowercaseString(webFetchProvider) ?? "",
-    });
+  for (const { pluginId, providerId } of listBundledWorkerProviderOwners(
+    params.registry,
+    collectConfiguredWorkerProviderIds(params.config),
+  )) {
+    changes.push({ pluginId, kind: "worker-provider-selected", providerId });
+  }
+  for (const { pluginId, providerId } of listBundledStorageProviderOwners(
+    params.registry,
+    collectConfiguredStorageProviderIds(params.config),
+  )) {
+    changes.push({ pluginId, kind: "storage-provider-selected", providerId });
   }
 
-  for (const plugin of resolveProviderPluginsWithOwnedWebSearch(params.registry)) {
-    const pluginId = plugin.id;
-    if (hasPluginOwnedWebSearchConfig(params.config, pluginId)) {
-      changes.push({ pluginId, kind: "plugin-web-search-configured" });
+  const decisionProviderIds = new Set(getConfiguredDecisionProviderIds(params.config));
+  for (const plugin of params.registry.plugins) {
+    for (const providerId of plugin.contracts?.decisionProviders ?? []) {
+      if (decisionProviderIds.has(providerId)) {
+        changes.push({ pluginId: plugin.id, kind: "decision-provider-selected", providerId });
+      }
     }
   }
 
-  for (const plugin of resolvePluginsWithOwnedToolConfig(params.registry)) {
-    const pluginId = plugin.id;
-    if (hasPluginOwnedToolConfig(params.config, plugin)) {
-      changes.push({ pluginId, kind: "plugin-tool-configured" });
+  for (const runtime of collectConfiguredAgentHarnessRuntimes(params.config)) {
+    for (const pluginId of findMatchingPluginIds(runtime, (plugin) => [
+      ...(plugin.activation?.onAgentHarnesses ?? []),
+      ...(plugin.cliBackends ?? []),
+    ])) {
+      changes.push({ pluginId, kind: "agent-harness-runtime-configured", runtime });
     }
   }
 
-  for (const plugin of resolveProviderPluginsWithOwnedWebFetch(params.registry)) {
-    const pluginId = plugin.id;
-    if (hasPluginOwnedWebFetchConfig(params.config, pluginId)) {
-      changes.push({ pluginId, kind: "plugin-web-fetch-configured" });
+  const webSearchConfig = params.config.tools?.web?.search;
+  for (const [contract, kind, provider] of [
+    [
+      "webSearchProviders",
+      "web-search-provider-selected",
+      webSearchConfig?.enabled !== false ? webSearchConfig?.provider : undefined,
+    ],
+    ["webFetchProviders", "web-fetch-provider-selected", params.config.tools?.web?.fetch?.provider],
+  ] as const) {
+    const providerId = typeof provider === "string" ? provider : undefined;
+    const pluginId = resolvePluginIdForConfiguredWebProvider(providerId, params.registry, contract);
+    if (pluginId) {
+      changes.push({
+        pluginId,
+        kind,
+        providerId: normalizeOptionalLowercaseString(providerId) ?? "",
+      });
+    }
+  }
+
+  for (const [contract, configKey, kind] of [
+    ["webSearchProviders", "webSearch", "plugin-web-search-configured"],
+    ["tools", null, "plugin-tool-configured"],
+    ["webFetchProviders", "webFetch", "plugin-web-fetch-configured"],
+  ] as const) {
+    for (const plugin of params.registry.plugins) {
+      if (
+        (plugin.contracts?.[contract]?.length ?? 0) === 0 ||
+        (contract === "webSearchProviders" && (plugin.providers?.length ?? 0) === 0)
+      ) {
+        continue;
+      }
+      const config = params.config.plugins?.entries?.[plugin.id]?.config;
+      const configured = configKey
+        ? isRecord(config) && isRecord(config[configKey])
+        : hasPluginOwnedToolConfig(params.config, plugin);
+      if (configured) {
+        changes.push({ pluginId: plugin.id, kind });
+      }
     }
   }
 
   if (hasSetupAutoEnableRelevantConfig(params.config)) {
+    const manifestMatchedPluginIds = new Set(changes.map((entry) => entry.pluginId));
+    const setupPluginIds = resolveRelevantSetupAutoEnablePluginIds(
+      params.config,
+      params.registry,
+    ).filter((pluginId) => !manifestMatchedPluginIds.has(pluginId));
     for (const entry of resolvePluginSetupAutoEnableReasons({
       config: params.config,
       env: params.env,
+      pluginIds: setupPluginIds,
+      manifestRegistry: params.registry,
     })) {
       changes.push({
         pluginId: entry.pluginId,
@@ -486,231 +470,37 @@ export function resolveConfiguredPluginAutoEnableCandidates(params: {
   return changes;
 }
 
-function isPluginExplicitlyDisabled(cfg: OpenClawConfig, pluginId: string): boolean {
-  const builtInChannelId = normalizeChatChannelId(pluginId);
-  if (builtInChannelId) {
-    const channels = cfg.channels as Record<string, unknown> | undefined;
-    const channelConfig = channels?.[builtInChannelId];
-    if (
-      channelConfig &&
-      typeof channelConfig === "object" &&
-      !Array.isArray(channelConfig) &&
-      (channelConfig as { enabled?: unknown }).enabled === false
-    ) {
-      return true;
-    }
-  }
-  return cfg.plugins?.entries?.[pluginId]?.enabled === false;
-}
-
-function isPluginDenied(cfg: OpenClawConfig, pluginId: string): boolean {
-  const deny = cfg.plugins?.deny;
-  return Array.isArray(deny) && deny.includes(pluginId);
-}
-
-function isBuiltInChannelAlreadyEnabled(cfg: OpenClawConfig, channelId: string): boolean {
-  const channels = cfg.channels as Record<string, unknown> | undefined;
-  const channelConfig = channels?.[channelId];
-  return (
-    !!channelConfig &&
-    typeof channelConfig === "object" &&
-    !Array.isArray(channelConfig) &&
-    (channelConfig as { enabled?: unknown }).enabled === true
-  );
-}
-
-function registerPluginEntry(cfg: OpenClawConfig, pluginId: string): OpenClawConfig {
-  const builtInChannelId = normalizeChatChannelId(pluginId);
-  if (builtInChannelId) {
-    const channels = cfg.channels as Record<string, unknown> | undefined;
-    const existing = channels?.[builtInChannelId];
-    const existingRecord =
-      existing && typeof existing === "object" && !Array.isArray(existing)
-        ? (existing as Record<string, unknown>)
-        : {};
-    return {
-      ...cfg,
-      channels: {
-        ...cfg.channels,
-        [builtInChannelId]: {
-          ...existingRecord,
-          enabled: true,
-        },
-      },
-    };
-  }
-
-  return {
-    ...cfg,
-    plugins: {
-      ...cfg.plugins,
-      entries: {
-        ...cfg.plugins?.entries,
-        [pluginId]: {
-          ...(cfg.plugins?.entries?.[pluginId] as Record<string, unknown> | undefined),
-          enabled: true,
-        },
-      },
-    },
-  };
-}
-
-function hasMaterialPluginEntryConfig(entry: unknown): boolean {
-  if (!isRecord(entry)) {
-    return false;
-  }
-  return (
-    entry.enabled === true ||
-    isRecord(entry.config) ||
-    isRecord(entry.hooks) ||
-    isRecord(entry.subagent) ||
-    entry.apiKey !== undefined ||
-    entry.env !== undefined
-  );
-}
-
-function isKnownPluginId(pluginId: string, manifestRegistry: PluginManifestRegistry): boolean {
-  if (normalizeChatChannelId(pluginId)) {
-    return true;
-  }
-  return manifestRegistry.plugins.some((plugin) => plugin.id === pluginId);
-}
-
-function materializeConfiguredPluginEntryAllowlist(params: {
-  config: OpenClawConfig;
-  changes: string[];
-  manifestRegistry: PluginManifestRegistry;
-}): OpenClawConfig {
-  let next = params.config;
-  const allow = next.plugins?.allow;
-  const entries = next.plugins?.entries;
-  if (!Array.isArray(allow) || allow.length === 0 || !entries || typeof entries !== "object") {
-    return next;
-  }
-
-  for (const pluginId of Object.keys(entries).toSorted((left, right) =>
-    left.localeCompare(right),
-  )) {
-    const entry = entries[pluginId];
-    if (
-      !hasMaterialPluginEntryConfig(entry) ||
-      isPluginDenied(next, pluginId) ||
-      isPluginExplicitlyDisabled(next, pluginId) ||
-      allow.includes(pluginId) ||
-      !isKnownPluginId(pluginId, params.manifestRegistry)
-    ) {
-      continue;
-    }
-    next = ensurePluginAllowlisted(next, pluginId);
-    params.changes.push(`${pluginId} plugin config present, added to plugin allowlist.`);
-  }
-
-  return next;
-}
-
-function resolveChannelAutoEnableDisplayLabel(
-  entry: Extract<PluginAutoEnableCandidate, { kind: "channel-configured" }>,
-  manifestRegistry: PluginManifestRegistry,
-): string | undefined {
-  const builtInChannelId = normalizeChatChannelId(entry.channelId);
-  if (builtInChannelId) {
-    return getChatChannelMeta(builtInChannelId).label;
-  }
-  const plugin = manifestRegistry.plugins.find((record) => record.id === entry.pluginId);
-  return plugin?.channelConfigs?.[entry.channelId]?.label ?? plugin?.channelCatalogMeta?.label;
-}
-
-function formatAutoEnableChange(
-  entry: PluginAutoEnableCandidate,
-  manifestRegistry: PluginManifestRegistry,
-): string {
-  if (entry.kind === "channel-configured") {
-    const label = resolveChannelAutoEnableDisplayLabel(entry, manifestRegistry);
-    if (label) {
-      return `${label} configured, enabled automatically.`;
-    }
-  }
-  return `${resolvePluginAutoEnableCandidateReason(entry).trim()}, enabled automatically.`;
-}
-
 export function resolvePluginAutoEnableManifestRegistry(params: {
   config: OpenClawConfig;
   env: NodeJS.ProcessEnv;
   manifestRegistry?: PluginManifestRegistry;
 }): PluginManifestRegistry {
-  return (
-    params.manifestRegistry ??
-    (configMayNeedPluginManifestRegistry(params.config)
-      ? loadPluginManifestRegistry({ config: params.config, env: params.env })
-      : EMPTY_PLUGIN_MANIFEST_REGISTRY)
-  );
-}
-
-export function materializePluginAutoEnableCandidatesInternal(params: {
-  config?: OpenClawConfig;
-  candidates: readonly PluginAutoEnableCandidate[];
-  env: NodeJS.ProcessEnv;
-  manifestRegistry: PluginManifestRegistry;
-}): PluginAutoEnableResult {
-  let next = params.config ?? {};
-  const changes: string[] = [];
-  const autoEnabledReasons = new Map<string, string[]>();
-
-  if (next.plugins?.enabled === false) {
-    return { config: next, changes, autoEnabledReasons: {} };
+  if (params.manifestRegistry) {
+    return params.manifestRegistry;
   }
-
-  for (const entry of params.candidates) {
-    const builtInChannelId = normalizeChatChannelId(entry.pluginId);
-    if (isPluginDenied(next, entry.pluginId) || isPluginExplicitlyDisabled(next, entry.pluginId)) {
-      continue;
-    }
-    if (
-      shouldSkipPreferredPluginAutoEnable({
-        config: next,
-        entry,
-        configured: params.candidates,
-        env: params.env,
-        registry: params.manifestRegistry,
-        isPluginDenied,
-        isPluginExplicitlyDisabled,
-      })
-    ) {
-      continue;
-    }
-
-    const allow = next.plugins?.allow;
-    const allowMissing = Array.isArray(allow) && !allow.includes(entry.pluginId);
-    const alreadyEnabled =
-      builtInChannelId != null
-        ? isBuiltInChannelAlreadyEnabled(next, builtInChannelId)
-        : next.plugins?.entries?.[entry.pluginId]?.enabled === true;
-    if (alreadyEnabled && !allowMissing) {
-      continue;
-    }
-
-    next = registerPluginEntry(next, entry.pluginId);
-    next = ensurePluginAllowlisted(next, entry.pluginId);
-    const reason = resolvePluginAutoEnableCandidateReason(entry);
-    autoEnabledReasons.set(entry.pluginId, [
-      ...(autoEnabledReasons.get(entry.pluginId) ?? []),
-      reason,
-    ]);
-    changes.push(formatAutoEnableChange(entry, params.manifestRegistry));
+  if (!configMayNeedPluginManifestRegistry(params.config)) {
+    return EMPTY_PLUGIN_MANIFEST_REGISTRY;
   }
-
-  next = materializeConfiguredPluginEntryAllowlist({
-    config: next,
-    changes,
-    manifestRegistry: params.manifestRegistry,
+  let snapshot = getCurrentPluginMetadataSnapshot({
+    config: params.config,
+    env: params.env,
+    allowWorkspaceScopedSnapshot: true,
   });
-
-  const autoEnabledReasonRecord: Record<string, string[]> = Object.create(null);
-  for (const [pluginId, reasons] of autoEnabledReasons) {
-    if (!isBlockedObjectKey(pluginId)) {
-      autoEnabledReasonRecord[pluginId] = [...reasons];
+  if (!snapshot && normalizePluginsConfig(params.config.plugins).loadPaths.length === 0) {
+    const candidate = getCurrentPluginMetadataSnapshot({
+      env: params.env,
+      allowWorkspaceScopedSnapshot: true,
+      requireDefaultDiscoveryContext: true,
+    });
+    if (candidate?.policyHash === resolveInstalledPluginIndexPolicyHash(params.config)) {
+      snapshot = candidate;
     }
   }
-
-  return { config: next, changes, autoEnabledReasons: autoEnabledReasonRecord };
+  return (
+    snapshot?.manifestRegistry ??
+    loadPluginMetadataSnapshot({
+      config: params.config,
+      env: params.env,
+    }).manifestRegistry
+  );
 }

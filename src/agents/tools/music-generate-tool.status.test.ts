@@ -1,106 +1,51 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as musicGenerationRuntime from "../../music-generation/runtime.js";
-import { MUSIC_GENERATION_TASK_KIND } from "../music-generation-task-status.js";
+vi.mock("../media-generation-activity.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../media-generation-activity.js")>()),
+  listMediaGenerationOperations: listOperations,
+}));
+import { expect, it, vi } from "vitest";
 import {
   createMusicGenerateDuplicateGuardResult,
   createMusicGenerateStatusActionResult,
 } from "./music-generate-tool.actions.js";
 
-const taskRuntimeInternalMocks = vi.hoisted(() => ({
-  listTasksForOwnerKey: vi.fn(),
-}));
+const { listOperations } = vi.hoisted(() => ({ listOperations: vi.fn() }));
 
-vi.mock("../../tasks/runtime-internal.js", () => taskRuntimeInternalMocks);
-
-describe("createMusicGenerateTool status actions", () => {
-  beforeEach(() => {
-    vi.restoreAllMocks();
-    vi.spyOn(musicGenerationRuntime, "listRuntimeMusicGenerationProviders").mockReturnValue([]);
-    taskRuntimeInternalMocks.listTasksForOwnerKey.mockReset();
-    taskRuntimeInternalMocks.listTasksForOwnerKey.mockReturnValue([]);
-  });
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it("returns active task status instead of starting a duplicate generation", async () => {
-    taskRuntimeInternalMocks.listTasksForOwnerKey.mockReturnValue([
-      {
-        taskId: "task-active",
-        runtime: "cli",
-        taskKind: MUSIC_GENERATION_TASK_KIND,
-        sourceId: "music_generate:google",
-        requesterSessionKey: "agent:main:discord:direct:123",
-        ownerKey: "agent:main:discord:direct:123",
-        scopeKind: "session",
-        runId: "tool:music_generate:active",
-        task: "night-drive synthwave",
-        status: "running",
-        deliveryStatus: "not_applicable",
-        notifyPolicy: "silent",
-        createdAt: Date.now(),
-        progressSummary: "Generating music",
-      },
-    ]);
-
-    const result = createMusicGenerateDuplicateGuardResult("agent:main:discord:direct:123");
-    const text = (result?.content?.[0] as { text: string } | undefined)?.text ?? "";
-
-    expect(result).not.toBeNull();
-    expect(text).toContain("Music generation task task-active is already running with google.");
-    expect(text).toContain("Do not call music_generate again for this request.");
-    expect(result?.details).toMatchObject({
-      action: "status",
-      duplicateGuard: true,
-      active: true,
-      existingTask: true,
-      status: "running",
-      taskKind: MUSIC_GENERATION_TASK_KIND,
-      provider: "google",
-      task: {
-        taskId: "task-active",
-        runId: "tool:music_generate:active",
-      },
-      progressSummary: "Generating music",
-    });
-  });
-
-  it("reports active task status when action=status is requested", async () => {
-    taskRuntimeInternalMocks.listTasksForOwnerKey.mockReturnValue([
-      {
-        taskId: "task-active",
-        runtime: "cli",
-        taskKind: MUSIC_GENERATION_TASK_KIND,
-        sourceId: "music_generate:minimax",
-        requesterSessionKey: "agent:main:discord:direct:123",
-        ownerKey: "agent:main:discord:direct:123",
-        scopeKind: "session",
-        runId: "tool:music_generate:active",
-        task: "night-drive synthwave",
-        status: "queued",
-        deliveryStatus: "not_applicable",
-        notifyPolicy: "silent",
-        createdAt: Date.now(),
-        progressSummary: "Queued music generation",
-      },
-    ]);
-
-    const result = createMusicGenerateStatusActionResult("agent:main:discord:direct:123");
-    const text = (result.content?.[0] as { text: string } | undefined)?.text ?? "";
-
-    expect(text).toContain("Music generation task task-active is already queued with minimax.");
-    expect(result.details).toMatchObject({
-      action: "status",
-      active: true,
-      existingTask: true,
+it("reports an active task and rejects a duplicate request without starting more work", async () => {
+  const sessionKey = "agent:main:discord:direct:123";
+  const progressSummary = "Queued music generation";
+  listOperations.mockReturnValue([
+    {
+      taskId: "task-active",
+      taskKind: "music_generation",
+      sourceId: "music_generate:minimax",
+      requesterSessionKey: sessionKey,
+      task: "night-drive synthwave",
       status: "queued",
-      taskKind: MUSIC_GENERATION_TASK_KIND,
-      provider: "minimax",
-      task: {
-        taskId: "task-active",
-      },
-      progressSummary: "Queued music generation",
-    });
+      progressSummary,
+    },
+  ]);
+  const status = await createMusicGenerateStatusActionResult(sessionKey);
+  const duplicate = await createMusicGenerateDuplicateGuardResult(sessionKey, {
+    prompt: "night-drive synthwave",
   });
+  for (const result of [status, duplicate]) {
+    expect(result?.details).toMatchObject({
+      active: true,
+      status: "queued",
+      provider: "minimax",
+      progressSummary,
+    });
+    expect(result?.content[0]).toMatchObject({
+      text: expect.stringContaining(
+        "Music generation task task-active is already queued with minimax.",
+      ),
+    });
+  }
+  expect(duplicate?.details).toHaveProperty("duplicateGuard", true);
+  expect(duplicate?.content).toStrictEqual([
+    {
+      type: "text",
+      text: "Music generation task task-active is already queued with minimax.\nProgress: Queued music generation.\nDo not call music_generate again for this request. Do not wait, poll, or yield for it: end this turn; the completion arrives as a later turn and sends the finished music here.",
+    },
+  ]);
 });

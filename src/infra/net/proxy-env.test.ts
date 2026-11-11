@@ -1,95 +1,68 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import {
   hasEnvHttpProxyConfigured,
+  hasEnvHttpProxyAgentConfigured,
   hasProxyEnvConfigured,
+  matchesNoProxy,
+  resolveEnvHttpProxyAgentOptions,
   resolveEnvHttpProxyUrl,
+  shouldUseEnvHttpProxyForUrl,
 } from "./proxy-env.js";
 
-describe("hasProxyEnvConfigured", () => {
-  it.each([
+it("ignores blank proxy values", () => {
+  expect(hasProxyEnvConfigured({ HTTP_PROXY: "   ", all_proxy: "" })).toBe(false);
+});
+it("treats empty lower-case https_proxy as authoritative over upper-case HTTPS_PROXY", () => {
+  const env = {
+    https_proxy: "",
+    HTTPS_PROXY: "http://upper.test:8080",
+  };
+  expect(resolveEnvHttpProxyUrl("https", env)).toBeUndefined();
+  expect(hasEnvHttpProxyConfigured("https", env)).toBe(false);
+});
+it.each([
+  [
+    { ALL_PROXY: "socks5://all-proxy.test:1080" },
     {
-      name: "detects upper-case HTTP proxy values",
-      env: { HTTP_PROXY: "http://upper-http.test:8080" } as NodeJS.ProcessEnv,
-      expected: true,
+      httpProxy: "socks5://all-proxy.test:1080",
+      httpsProxy: "socks5://all-proxy.test:1080",
     },
-    {
-      name: "detects lower-case all_proxy values",
-      env: { all_proxy: "socks5://proxy.test:1080" } as NodeJS.ProcessEnv,
-      expected: true,
-    },
-    {
-      name: "ignores blank proxy values",
-      env: { HTTP_PROXY: "   ", all_proxy: "" } as NodeJS.ProcessEnv,
-      expected: false,
-    },
-  ])("$name", ({ env, expected }) => {
-    expect(hasProxyEnvConfigured(env)).toBe(expected);
-  });
+  ],
+  [{ all_proxy: "", ALL_PROXY: "socks5://upper-all-proxy.test:1080" }, undefined],
+] as const)("resolves proxy-agent options for %j", (env, expected) => {
+  expect(resolveEnvHttpProxyAgentOptions(env)).toEqual(expected);
+  expect(hasEnvHttpProxyAgentConfigured(env)).toBe(expected !== undefined);
+});
+it.each([
+  ["https://api.openai.com/v1/chat", "*", true],
+  ["https://notopenai.com/v1", "openai.com", false],
+  ["https://api.openai.com", "localhost, 127.0.0.1\tapi.openai.com", true],
+  ["http://[::1]:8080/health", "[::1]:8080", true],
+  ["http://0.0.0.0/", "0.*", true],
+  ["http://255.128.64.32/", "255.*.64.32", true],
+  ["http://255.128.64.32/", "0.0.0.0/0", true],
+  ["http://255.128.64.32/", "255.128.64.32/32", true],
+  ["http://8.1.2.3:8990/v1/messages", "8.*.8.8", false],
+  ["not-a-url", "*", false],
+])("matchesNoProxy(%s, %s) = %s", (url, noProxy, expected) => {
+  expect(matchesNoProxy(url, { NO_PROXY: noProxy })).toBe(expected);
+});
+it.each([
+  ["https://api.example.:8443/v1", "*.example.:8443", false],
+  ["https://api.example.:8443/v1", "*.example.:443", true],
+  ["https://api.example./v1", ".", true],
+])("keeps NO_PROXY DNS-dot routing aligned for %s and %s", (url, noProxy, expected) => {
+  expect(
+    shouldUseEnvHttpProxyForUrl(url, {
+      HTTPS_PROXY: "http://proxy.test:8080",
+      NO_PROXY: noProxy,
+    }),
+  ).toBe(expected);
 });
 
-describe("resolveEnvHttpProxyUrl", () => {
-  it.each([
-    {
-      name: "uses lower-case https_proxy before upper-case HTTPS_PROXY",
-      protocol: "https" as const,
-      env: {
-        https_proxy: "http://lower.test:8080",
-        HTTPS_PROXY: "http://upper.test:8080",
-      } as NodeJS.ProcessEnv,
-      expectedUrl: "http://lower.test:8080",
-      expectedConfigured: true,
-    },
-    {
-      name: "treats empty lower-case https_proxy as authoritative over upper-case HTTPS_PROXY",
-      protocol: "https" as const,
-      env: {
-        https_proxy: "",
-        HTTPS_PROXY: "http://upper.test:8080",
-      } as NodeJS.ProcessEnv,
-      expectedUrl: undefined,
-      expectedConfigured: false,
-    },
-    {
-      name: "treats empty lower-case http_proxy as authoritative over upper-case HTTP_PROXY",
-      protocol: "http" as const,
-      env: {
-        http_proxy: "   ",
-        HTTP_PROXY: "http://upper-http.test:8080",
-      } as NodeJS.ProcessEnv,
-      expectedUrl: undefined,
-      expectedConfigured: false,
-    },
-    {
-      name: "falls back from HTTPS proxy vars to HTTP proxy vars for https requests",
-      protocol: "https" as const,
-      env: {
-        HTTP_PROXY: "http://upper-http.test:8080",
-      } as NodeJS.ProcessEnv,
-      expectedUrl: "http://upper-http.test:8080",
-      expectedConfigured: true,
-    },
-    {
-      name: "does not use ALL_PROXY for EnvHttpProxyAgent-style resolution",
-      protocol: "https" as const,
-      env: {
-        ALL_PROXY: "http://all-proxy.test:8080",
-        all_proxy: "http://lower-all-proxy.test:8080",
-      } as NodeJS.ProcessEnv,
-      expectedUrl: undefined,
-      expectedConfigured: false,
-    },
-    {
-      name: "returns only HTTP proxies for http requests",
-      protocol: "http" as const,
-      env: {
-        https_proxy: "http://lower-https.test:8080",
-        http_proxy: "http://lower-http.test:8080",
-      } as NodeJS.ProcessEnv,
-      expectedUrl: "http://lower-http.test:8080",
-      expectedConfigured: true,
-    },
-  ])("$name", ({ protocol, env, expectedUrl, expectedConfigured }) => {
-    expect(resolveEnvHttpProxyUrl(protocol, env)).toBe(expectedUrl);
-    expect(hasEnvHttpProxyConfigured(protocol, env)).toBe(expectedConfigured);
-  });
+it.each([
+  ["http://api.example.com/v1", { HTTP_PROXY: "http://proxy.test:8080" }, true],
+  ["file:///tmp/input.txt", { HTTPS_PROXY: "http://proxy.test:8080" }, false],
+] as const)("uses the env proxy for %s: %s → %s", (url, env, expected) => {
+  expect(shouldUseEnvHttpProxyForUrl(url, env)).toBe(expected);
 });

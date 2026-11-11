@@ -1,59 +1,55 @@
-import { resolvePersistedOverrideModelRef } from "../../agents/model-selection.js";
-import { resolveSessionParentSessionKey } from "../../channels/plugins/session-conversation.js";
+// Resolves stored model pins and their fallback probes against the current turn.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import {
+  hasLegacyAutoFallbackWithoutOrigin,
+  resolveAutoFallbackPrimaryProbe,
+} from "../../agents/agent-scope.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import { resolveStoredModelOverrideAsync } from "../../sessions/stored-model-overrides.js";
 
-export type StoredModelOverride = {
-  provider?: string;
-  model: string;
-  source: "session" | "parent";
-};
-
-function resolveParentSessionKeyCandidate(params: {
-  sessionKey?: string;
-  parentSessionKey?: string;
-}): string | null {
-  const explicit = normalizeOptionalString(params.parentSessionKey);
-  if (explicit && explicit !== params.sessionKey) {
-    return explicit;
-  }
-  const derived = resolveSessionParentSessionKey(params.sessionKey);
-  if (derived && derived !== params.sessionKey) {
-    return derived;
-  }
-  return null;
-}
-
-export function resolveStoredModelOverride(params: {
-  sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-  sessionKey?: string;
+/** Keep stored-pin selection and primary probing under the same turn-local precedence. */
+export async function resolveReplyStoredModelSelection(params: {
+  sessionEntry: SessionEntry;
+  sessionStore: Record<string, SessionEntry>;
+  sessionKey: string;
   parentSessionKey?: string;
   defaultProvider: string;
-}): StoredModelOverride | null {
-  const direct = resolvePersistedOverrideModelRef({
-    defaultProvider: params.defaultProvider,
-    overrideProvider: params.sessionEntry?.providerOverride,
-    overrideModel: params.sessionEntry?.modelOverride,
-  });
-  if (direct) {
-    return { ...direct, source: "session" };
-  }
-  const parentKey = resolveParentSessionKeyCandidate({
-    sessionKey: params.sessionKey,
-    parentSessionKey: params.parentSessionKey,
-  });
-  if (!parentKey || !params.sessionStore) {
-    return null;
-  }
-  const parentEntry = params.sessionStore[parentKey];
-  const parentOverride = resolvePersistedOverrideModelRef({
-    defaultProvider: params.defaultProvider,
-    overrideProvider: parentEntry?.providerOverride,
-    overrideModel: parentEntry?.modelOverride,
-  });
-  if (!parentOverride) {
-    return null;
-  }
-  return { ...parentOverride, source: "parent" };
+  defaultModel: string;
+  primaryProvider: string;
+  primaryModel: string;
+  sessionModelSelectionLocked: boolean;
+  hasResolvedTurnModelOverride: boolean;
+}) {
+  const { sessionEntry, sessionModelSelectionLocked, hasResolvedTurnModelOverride } = params;
+  const hasSessionModelOverride = Boolean(
+    normalizeOptionalString(sessionEntry.modelOverride) ||
+    normalizeOptionalString(sessionEntry.providerOverride),
+  );
+  const storedOverride = await resolveStoredModelOverrideAsync(params);
+  const staleLegacyAutoFallbackWithoutOrigin =
+    !sessionModelSelectionLocked &&
+    storedOverride?.source === "session" &&
+    hasLegacyAutoFallbackWithoutOrigin(sessionEntry);
+  const modelOverride =
+    storedOverride?.model && !hasResolvedTurnModelOverride && !staleLegacyAutoFallbackWithoutOrigin
+      ? {
+          provider: storedOverride.provider ?? params.defaultProvider,
+          model: storedOverride.model,
+        }
+      : undefined;
+  const autoFallbackPrimaryProbe =
+    !sessionModelSelectionLocked && !hasResolvedTurnModelOverride
+      ? resolveAutoFallbackPrimaryProbe({
+          entry: sessionEntry,
+          sessionKey: params.sessionKey,
+          primaryProvider: params.primaryProvider,
+          primaryModel: params.primaryModel,
+        })
+      : undefined;
+  return {
+    modelOverride,
+    autoFallbackPrimaryProbe,
+    hasEffectiveStoredModelOverride:
+      Boolean(storedOverride || hasSessionModelOverride) && !staleLegacyAutoFallbackWithoutOrigin,
+  };
 }

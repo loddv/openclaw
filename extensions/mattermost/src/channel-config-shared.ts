@@ -4,13 +4,16 @@ import {
   adaptScopedAccountAccessor,
   createScopedChannelConfigAdapter,
 } from "openclaw/plugin-sdk/channel-config-helpers";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
+  inspectMattermostAccount,
+  isMattermostConfigured,
   listMattermostAccountIds,
   resolveDefaultMattermostAccountId,
   resolveMattermostAccount,
   type ResolvedMattermostAccount,
 } from "./mattermost/accounts.js";
+export { resolveMattermostGatewayAuthBypassPaths } from "./gateway-auth-bypass.js";
 
 export const mattermostMeta = {
   id: "mattermost",
@@ -34,7 +37,7 @@ export function normalizeMattermostAllowEntry(entry: string): string {
   );
 }
 
-export function formatMattermostAllowEntry(entry: string): string {
+function formatMattermostAllowEntry(entry: string): string {
   const trimmed = entry.trim();
   if (!trimmed) {
     return "";
@@ -50,6 +53,7 @@ export const mattermostConfigAdapter = createScopedChannelConfigAdapter<Resolved
   sectionKey: "mattermost",
   listAccountIds: listMattermostAccountIds,
   resolveAccount: adaptScopedAccountAccessor(resolveMattermostAccount),
+  inspectAccount: adaptScopedAccountAccessor(inspectMattermostAccount),
   defaultAccountId: resolveDefaultMattermostAccountId,
   clearBaseFields: ["botToken", "baseUrl", "name"],
   resolveAllowFrom: (account) => account.config.allowFrom,
@@ -60,16 +64,13 @@ export const mattermostConfigAdapter = createScopedChannelConfigAdapter<Resolved
     }),
 });
 
-export function isMattermostConfigured(account: ResolvedMattermostAccount): boolean {
-  return Boolean(account.botToken && account.baseUrl);
-}
-
 export function describeMattermostAccount(account: ResolvedMattermostAccount) {
   return describeAccountSnapshot({
     account,
     configured: isMattermostConfigured(account),
     extra: {
       botTokenSource: account.botTokenSource,
+      botTokenStatus: account.botTokenStatus,
       baseUrl: account.baseUrl,
     },
   });

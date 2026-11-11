@@ -1,180 +1,152 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+/** Tests configured ACP binding lifecycle behavior. */
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { buildConfiguredAcpSessionKey } from "./persistent-bindings.types.js";
+import type { AcpSessionResolution } from "./control-plane/manager.types.js";
+import {
+  buildConfiguredAcpSessionKey,
+  type ConfiguredAcpBindingSpec,
+} from "./persistent-bindings.types.js";
 
 const managerMocks = vi.hoisted(() => ({
-  resolveSession: vi.fn(),
+  resolveSessionAsync: vi.fn<(params: { sessionKey: string }) => Promise<AcpSessionResolution>>(),
   closeSession: vi.fn(),
   initializeSession: vi.fn(),
-  updateSessionRuntimeOptions: vi.fn(),
+  setSessionConfigOption: vi.fn(),
 }));
 
-const sessionMetaMocks = vi.hoisted(() => ({
-  readAcpSessionEntry: vi.fn(),
-}));
-
-const resolveMocks = vi.hoisted(() => ({
-  resolveConfiguredAcpBindingSpecBySessionKey: vi.fn(),
-}));
-
+// mock-isolation: lifecycle assertions must not create real ACP sessions or workers.
 vi.mock("./control-plane/manager.js", () => ({
-  getAcpSessionManager: () => ({
-    resolveSession: managerMocks.resolveSession,
-    closeSession: managerMocks.closeSession,
-    initializeSession: managerMocks.initializeSession,
-    updateSessionRuntimeOptions: managerMocks.updateSessionRuntimeOptions,
-  }),
+  getAcpSessionManager: () => managerMocks,
 }));
 
-vi.mock("./runtime/session-meta.js", () => ({
-  readAcpSessionEntry: sessionMetaMocks.readAcpSessionEntry,
-}));
-
-vi.mock("./persistent-bindings.resolve.js", () => ({
-  resolveConfiguredAcpBindingSpecBySessionKey:
-    resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey,
-}));
 const baseCfg = {
   session: { mainKey: "main", scope: "per-sender" },
-  agents: {
-    list: [{ id: "codex" }, { id: "claude" }],
-  },
+  agents: { entries: { codex: {}, claude: {} } },
 } satisfies OpenClawConfig;
 
-let resetAcpSessionInPlace: typeof import("./persistent-bindings.lifecycle.js").resetAcpSessionInPlace;
+let ensureConfiguredAcpBindingSession: typeof import("./persistent-bindings.lifecycle.js").ensureConfiguredAcpBindingSession;
 
-beforeAll(async () => {
-  ({ resetAcpSessionInPlace } = await import("./persistent-bindings.lifecycle.js"));
-});
-
-beforeEach(() => {
-  managerMocks.resolveSession.mockReset().mockReturnValue({ kind: "none" });
-  managerMocks.closeSession.mockReset().mockResolvedValue({
-    runtimeClosed: true,
-    metaCleared: false,
-  });
+beforeEach(async () => {
+  vi.resetModules();
+  managerMocks.resolveSessionAsync.mockReset();
+  managerMocks.closeSession.mockReset().mockResolvedValue(undefined);
   managerMocks.initializeSession.mockReset().mockResolvedValue(undefined);
-  managerMocks.updateSessionRuntimeOptions.mockReset().mockResolvedValue(undefined);
-  sessionMetaMocks.readAcpSessionEntry.mockReset().mockReturnValue(undefined);
-  resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey.mockReset().mockReturnValue(null);
+  managerMocks.setSessionConfigOption.mockReset().mockResolvedValue(undefined);
+  ({ ensureConfiguredAcpBindingSession } = await import("./persistent-bindings.lifecycle.js"));
 });
 
-describe("resetAcpSessionInPlace", () => {
-  it("clears configured bindings and lets the next turn recreate them", async () => {
-    const spec = {
-      channel: "demo-binding",
-      accountId: "default",
-      conversationId: "9373ab192b2317f4",
-      agentId: "claude",
-      mode: "persistent",
+function createPersistentSpec(
+  overrides: Partial<ConfiguredAcpBindingSpec> = {},
+): ConfiguredAcpBindingSpec {
+  return {
+    channel: "discord",
+    accountId: "default",
+    conversationId: "1478836151241412759",
+    agentId: "codex",
+    mode: "persistent",
+    ...overrides,
+  };
+}
+
+function mockReadySession(params: {
+  spec: ConfiguredAcpBindingSpec;
+  cwd: string;
+  model?: string;
+  thinking?: string;
+  state?: "idle" | "running" | "error";
+}) {
+  const sessionKey = buildConfiguredAcpSessionKey(params.spec);
+  managerMocks.resolveSessionAsync.mockResolvedValue({
+    kind: "ready",
+    sessionKey,
+    agentId: params.spec.agentId,
+    meta: {
       backend: "acpx",
-      cwd: "/home/bob/clawd",
-    } as const;
-    const sessionKey = buildConfiguredAcpSessionKey(spec);
-    resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey.mockReturnValue(spec);
-    sessionMetaMocks.readAcpSessionEntry.mockReturnValue({
-      acp: {
-        agent: "claude",
-        mode: "persistent",
-        backend: "acpx",
-        runtimeOptions: { cwd: "/home/bob/clawd" },
+      agent: params.spec.acpAgentId ?? params.spec.agentId,
+      runtimeSessionName: "existing",
+      mode: params.spec.mode,
+      runtimeOptions: {
+        cwd: params.cwd,
+        ...(params.model ? { model: params.model } : {}),
+        ...(params.thinking ? { thinking: params.thinking } : {}),
       },
-    });
+      state: params.state ?? "idle",
+      lastActivityAt: Date.now(),
+    },
+  });
+  return sessionKey;
+}
 
-    const result = await resetAcpSessionInPlace({
-      cfg: baseCfg,
-      sessionKey,
-      reason: "reset",
-    });
+function expectNotReplaced() {
+  expect(managerMocks.closeSession).not.toHaveBeenCalled();
+  expect(managerMocks.initializeSession).not.toHaveBeenCalled();
+}
 
-    expect(result).toEqual({ ok: true });
-    expect(resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey).toHaveBeenCalledTimes(1);
-    expect(managerMocks.closeSession).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionKey,
-        discardPersistentState: true,
-        clearMeta: true,
-      }),
+const ensure = (spec: ConfiguredAcpBindingSpec) =>
+  ensureConfiguredAcpBindingSession({ cfg: baseCfg, spec });
+
+describe("ensureConfiguredAcpBindingSession", () => {
+  it("updates configured runtime options in place", async () => {
+    const runtimeOptions = { model: "anthropic/claude-sonnet-4-6", thinking: "off" };
+    const spec = createPersistentSpec(runtimeOptions);
+    const sessionKey = mockReadySession({
+      spec,
+      cwd: "/workspace/openclaw",
+      model: "anthropic/claude-haiku-4-5",
+      thinking: "high",
+    });
+    expect(await ensure(spec)).toEqual({ ok: true, sessionKey });
+    expect(managerMocks.setSessionConfigOption.mock.calls).toEqual(
+      Object.entries(runtimeOptions).map(([key, value]) => [
+        { cfg: baseCfg, sessionKey, agentId: spec.agentId, key, value },
+      ]),
     );
-    expect(managerMocks.initializeSession).not.toHaveBeenCalled();
-    expect(managerMocks.updateSessionRuntimeOptions).not.toHaveBeenCalled();
+    expectNotReplaced();
   });
 
-  it("falls back to close-only resets when no configured binding exists", async () => {
-    const sessionKey = "agent:claude:acp:binding:demo-binding:default:9373ab192b2317f4";
-    sessionMetaMocks.readAcpSessionEntry.mockReturnValue({
-      acp: {
-        agent: "claude",
-        mode: "persistent",
-        backend: "acpx",
-      },
-    });
+  it("reports rejected live thinking without replacing or overwriting the existing session", async () => {
+    const spec = createPersistentSpec({ thinking: "off" });
+    const sessionKey = mockReadySession({ spec, cwd: "/workspace/openclaw", thinking: "high" });
+    managerMocks.setSessionConfigOption.mockRejectedValue(new Error("Live off is unsupported"));
 
-    const result = await resetAcpSessionInPlace({
-      cfg: baseCfg,
-      sessionKey,
-      reason: "reset",
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect(resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey).toHaveBeenCalledTimes(1);
-    expect(managerMocks.closeSession).toHaveBeenCalledWith(
-      expect.objectContaining({
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(await ensure(spec)).toEqual({
+        ok: false,
         sessionKey,
-        clearMeta: false,
-      }),
-    );
-    expect(managerMocks.initializeSession).not.toHaveBeenCalled();
+        error: "Live off is unsupported",
+      });
+    }
+    expect(managerMocks.setSessionConfigOption).toHaveBeenCalledTimes(2);
+    expectNotReplaced();
   });
 
-  it("can force metadata clearing for bound ACP targets outside the configured registry", async () => {
-    const sessionKey = "agent:claude:acp:binding:demo-binding:default:9373ab192b2317f4";
-    sessionMetaMocks.readAcpSessionEntry.mockReturnValue({
-      acp: {
-        agent: "claude",
-        mode: "persistent",
-        backend: "acpx",
-      },
+  it("reinitializes a ready session when binding config explicitly sets mismatched cwd", async () => {
+    const spec = createPersistentSpec({
+      cwd: "/workspace/repo-a",
+      agentId: "coding",
+      acpAgentId: "codex",
+      model: "anthropic/claude-sonnet-4-6",
+      thinking: "off",
     });
-
-    const result = await resetAcpSessionInPlace({
-      cfg: baseCfg,
-      sessionKey,
-      reason: "new",
-      clearMeta: true,
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect(resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey).toHaveBeenCalledTimes(1);
-    expect(managerMocks.closeSession).toHaveBeenCalledWith(
+    const sessionKey = mockReadySession({ spec, cwd: "/workspace/other-repo" });
+    expect(await ensure(spec)).toEqual({ ok: true, sessionKey });
+    expect(managerMocks.closeSession).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ sessionKey, clearMeta: false }),
+    );
+    expect(managerMocks.initializeSession).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        sessionKey,
-        clearMeta: true,
+        agent: "codex",
+        runtimeOptions: { model: "anthropic/claude-sonnet-4-6", thinking: "off" },
       }),
     );
+    expect(managerMocks.initializeSession.mock.calls[0]?.[0]).not.toHaveProperty("modelExplicit");
   });
 
-  it("treats configured bindings with no ACP metadata as already reset", async () => {
-    const spec = {
-      channel: "demo-binding",
-      accountId: "default",
-      conversationId: "9373ab192b2317f4",
-      agentId: "claude",
-      mode: "persistent",
-      backend: "acpx",
-      cwd: "/home/bob/clawd",
-    } as const;
-    const sessionKey = buildConfiguredAcpSessionKey(spec);
-    resolveMocks.resolveConfiguredAcpBindingSpecBySessionKey.mockReturnValue(spec);
-
-    const result = await resetAcpSessionInPlace({
-      cfg: baseCfg,
-      sessionKey,
-      reason: "new",
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect(managerMocks.closeSession).not.toHaveBeenCalled();
-    expect(managerMocks.initializeSession).not.toHaveBeenCalled();
+  it("reinitializes a matching session when the stored ACP session is in error state", async () => {
+    const spec = createPersistentSpec({ cwd: "/home/bob/clawd" });
+    const sessionKey = mockReadySession({ spec, cwd: "/home/bob/clawd", state: "error" });
+    expect(await ensure(spec)).toEqual({ ok: true, sessionKey });
+    expect(managerMocks.closeSession).toHaveBeenCalledTimes(1);
+    expect(managerMocks.initializeSession).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,23 +1,24 @@
-import type { SsrFPolicy } from "../../../../src/infra/net/ssrf.js";
-import { retryAsync } from "../../../../src/infra/retry.js";
+import { retryAsync } from "@openclaw/retry";
+import type { SsrFPolicy } from "./openclaw-runtime-network.js";
 import { postJson } from "./post-json.js";
+import type { RemoteEmbeddingRequestAuth } from "./remote-http.js";
 
+/** POST JSON and retry provider 429/5xx failures with bounded backoff. */
 export async function postJsonWithRetry<T>(params: {
   url: string;
   headers: Record<string, string>;
   ssrfPolicy?: SsrFPolicy;
+  fetchImpl?: typeof fetch;
+  resolveRequestHeaders?: RemoteEmbeddingRequestAuth;
+  retryImpl?: typeof retryAsync;
   body: unknown;
   errorPrefix: string;
 }): Promise<T> {
-  return await retryAsync(
+  const retry = params.retryImpl ?? retryAsync;
+  return await retry(
     async () => {
       return await postJson<T>({
-        url: params.url,
-        headers: params.headers,
-        ssrfPolicy: params.ssrfPolicy,
-        body: params.body,
-        errorPrefix: params.errorPrefix,
-        attachStatus: true,
+        ...params,
         parse: async (payload) => payload as T,
       });
     },

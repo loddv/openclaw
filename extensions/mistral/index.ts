@@ -1,53 +1,35 @@
 import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
+import { buildProviderReplayFamilyHooks } from "openclaw/plugin-sdk/provider-model-shared";
 import { applyMistralModelCompat } from "./api.js";
 import { mistralMediaUnderstandingProvider } from "./media-understanding-provider.js";
-import { applyMistralConfig, MISTRAL_DEFAULT_MODEL_REF } from "./onboard.js";
-import { buildMistralProvider } from "./provider-catalog.js";
-import { contributeMistralResolvedModelCompat } from "./provider-compat.js";
+import { mistralMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
+import { applyMistralConnectionConfig } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
+import { buildMistralRealtimeTranscriptionProvider } from "./realtime-transcription-provider-factory.js";
 
 const PROVIDER_ID = "mistral";
-export function buildMistralReplayPolicy() {
-  return {
-    sanitizeToolCallIds: true,
-    toolCallIdMode: "strict9" as const,
-  };
-}
-
 export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "Mistral Provider",
-  description: "Bundled Mistral provider plugin",
+  description: "Official Mistral provider plugin",
+  manifest,
   provider: {
     label: "Mistral",
     docsPath: "/providers/models",
-    auth: [
-      {
-        methodId: "api-key",
-        label: "Mistral API key",
-        hint: "API key",
-        optionKey: "mistralApiKey",
-        flagName: "--mistral-api-key",
-        envVar: "MISTRAL_API_KEY",
-        promptMessage: "Enter Mistral API key",
-        defaultModel: MISTRAL_DEFAULT_MODEL_REF,
-        applyConfig: (cfg) => applyMistralConfig(cfg),
-        wizard: {
-          groupLabel: "Mistral AI",
-        },
-      },
-    ],
+    manifestAuth: { applyConfig: applyMistralConnectionConfig },
     catalog: {
-      buildProvider: buildMistralProvider,
+      discoveryMode: "strict",
       allowExplicitBaseUrl: true,
+      liveModelDiscovery: true,
     },
     matchesContextOverflowError: ({ errorMessage }) =>
       /\bmistral\b.*(?:input.*too long|token limit.*exceeded)/i.test(errorMessage),
     normalizeResolvedModel: ({ model }) => applyMistralModelCompat(model),
-    contributeResolvedModelCompat: ({ modelId, model }) =>
-      contributeMistralResolvedModelCompat({ modelId, model }),
-    buildReplayPolicy: () => buildMistralReplayPolicy(),
+    ...buildProviderReplayFamilyHooks({ family: "mistral" }),
   },
   register(api) {
+    api.registerEmbeddingProvider(mistralMemoryEmbeddingProviderAdapter);
     api.registerMediaUnderstandingProvider(mistralMediaUnderstandingProvider);
+    api.registerRealtimeTranscriptionProvider(buildMistralRealtimeTranscriptionProvider);
   },
 });

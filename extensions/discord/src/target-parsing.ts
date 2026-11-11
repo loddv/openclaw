@@ -5,7 +5,7 @@ import {
   type MessagingTarget,
   type MessagingTargetKind,
   type MessagingTargetParseOptions,
-} from "openclaw/plugin-sdk/messaging-targets";
+} from "openclaw/plugin-sdk/channel-targets";
 
 export type DiscordTargetKind = MessagingTargetKind;
 
@@ -20,6 +20,14 @@ export function parseDiscordTarget(
   const trimmed = raw.trim();
   if (!trimmed) {
     return undefined;
+  }
+  const providerPrefix = /^discord:(channel|user):(.+)$/i.exec(trimmed);
+  if (providerPrefix) {
+    const kind = providerPrefix[1]?.toLowerCase() as "channel" | "user" | undefined;
+    const id = providerPrefix[2]?.trim();
+    if (kind && id) {
+      return buildMessagingTarget(kind, id, `${kind}:${id}`);
+    }
   }
   const userTarget = parseMentionPrefixOrAtUserTarget({
     raw: trimmed,
@@ -41,7 +49,7 @@ export function parseDiscordTarget(
     }
     throw new Error(
       options.ambiguousMessage ??
-        `Ambiguous Discord recipient "${trimmed}". Use "user:${trimmed}" for DMs or "channel:${trimmed}" for channel messages.`,
+        `Ambiguous Discord recipient "${trimmed}". For DMs use "user:${trimmed}" or "<@${trimmed}>"; for channels use "channel:${trimmed}".`,
     );
   }
   return buildMessagingTarget("channel", trimmed, trimmed);

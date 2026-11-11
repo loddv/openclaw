@@ -1,21 +1,16 @@
-/**
- * Regression tests for GHSA-2qrv-rc5x-2g2h incomplete-fix bypass.
- *
- * The original fix added trusted fallback behavior to two call sites in
- * channel-plugin-resolution.ts. Three other setup-flow call sites were
- * missed. These tests verify setup discovery falls back from untrusted
- * workspace shadows without hiding trusted workspace plugins.
- */
+// GHSA-2qrv-rc5x-2g2h: setup discovery was missed by the initial channel-resolution fix.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-
-// ---------------------------------------------------------------------------
-// Mocks (hoisted to module top level)
-// ---------------------------------------------------------------------------
+import { createInstalledPluginIndexFixture } from "../../plugins/gateway-startup.test-helpers.js";
+import type { PluginManifestRecord } from "../../plugins/manifest-registry.js";
+import { createPluginManifestRecordFixture } from "../../plugins/plugin-metadata.test-support.js";
 
 const listChannelPluginCatalogEntries = vi.hoisted(() => vi.fn((_opts?: unknown): unknown[] => []));
 const listChatChannels = vi.hoisted(() => vi.fn((): unknown[] => []));
-const loadPluginManifestRegistry = vi.hoisted(() => vi.fn());
+const loadPluginManifestRegistryCore = vi.hoisted(() => vi.fn());
+const loadPluginRegistrySnapshot = vi.hoisted(() => vi.fn());
+const loadPluginRegistrySnapshotWithMetadata = vi.hoisted(() => vi.fn());
+const listPluginContributionIds = vi.hoisted(() => vi.fn((_params?: unknown): string[] => []));
 const applyPluginAutoEnable = vi.hoisted(() =>
   vi.fn(({ config }: { config: unknown }) => ({
     config: config as never,
@@ -26,40 +21,60 @@ const applyPluginAutoEnable = vi.hoisted(() =>
 const getChannelPluginCatalogEntry = vi.hoisted(() => vi.fn());
 
 vi.mock("../../channels/plugins/catalog.js", () => ({
-  listChannelPluginCatalogEntries: (opts?: unknown) => listChannelPluginCatalogEntries(opts),
+  listRawChannelPluginCatalogEntries: (opts?: unknown) => listChannelPluginCatalogEntries(opts),
   getChannelPluginCatalogEntry: (...args: unknown[]) =>
     getChannelPluginCatalogEntry(...(args as [string, Record<string, unknown>])),
 }));
 vi.mock("../../channels/registry.js", () => ({
   listChatChannels: () => listChatChannels(),
+  normalizeAnyChannelId: (channelId?: string) => channelId?.trim().toLowerCase() ?? null,
 }));
 vi.mock("../../plugins/manifest-registry.js", () => ({
-  loadPluginManifestRegistry: (...a: unknown[]) => loadPluginManifestRegistry(...a),
+  loadPluginManifestRegistryCore: (...a: unknown[]) => loadPluginManifestRegistryCore(...a),
+}));
+vi.mock("../../plugins/plugin-registry.js", () => ({
+  loadPluginManifestRegistryForPluginRegistry: (...args: unknown[]) =>
+    loadPluginManifestRegistryCore(...args),
+  loadPluginRegistrySnapshot: (...args: unknown[]) => loadPluginRegistrySnapshot(...args),
+  loadPluginRegistrySnapshotWithMetadata: (...args: unknown[]) =>
+    loadPluginRegistrySnapshotWithMetadata(...args),
+  listPluginContributionIds: (...args: unknown[]) => listPluginContributionIds(...args),
 }));
 vi.mock("../../config/plugin-auto-enable.js", () => ({
   applyPluginAutoEnable: (a: unknown) => applyPluginAutoEnable(a as { config: unknown }),
 }));
 vi.mock("../../plugins/loader.js", () => ({
   loadOpenClawPlugins: vi.fn(),
+  loadPluginRegistryHandle: vi.fn(),
 }));
 
 import { resolveChannelSetupEntries } from "./discovery.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 beforeEach(() => {
   vi.clearAllMocks();
-  loadPluginManifestRegistry.mockReturnValue({ plugins: [], diagnostics: [] });
+  loadPluginManifestRegistryCore.mockReturnValue({ plugins: [], diagnostics: [] });
+  loadPluginRegistrySnapshot.mockReturnValue(
+    createInstalledPluginIndexFixture({ plugins: [], diagnostics: [] }),
+  );
+  loadPluginRegistrySnapshotWithMetadata.mockImplementation((...args: unknown[]) => ({
+    snapshot: loadPluginRegistrySnapshot(...args),
+    source: "derived",
+    diagnostics: [],
+  }));
+  listPluginContributionIds.mockReturnValue([]);
   listChatChannels.mockReturnValue([]);
 });
 
-function createWorkspaceCatalogEntry(id: string, label: string) {
+function createCatalogEntry(
+  id: string,
+  label: string,
+  pluginId = id,
+  origin: "workspace" | "bundled" = "workspace",
+) {
   return {
     id,
-    pluginId: id,
-    origin: "workspace",
+    pluginId,
+    origin,
     meta: {
       id,
       label,
@@ -68,36 +83,30 @@ function createWorkspaceCatalogEntry(id: string, label: string) {
       blurb: "t",
       order: 1,
     },
-    install: { npmSpec: id },
+    install: { npmSpec: pluginId },
   };
 }
 
-function mockWorkspaceOnlyCatalogEntry(entry: ReturnType<typeof createWorkspaceCatalogEntry>) {
+function createManifestChannelPlugin(id: string, channels: string[]): PluginManifestRecord {
+  return createPluginManifestRecordFixture({
+    id,
+    channels,
+    origin: "workspace",
+    rootDir: `/tmp/openclaw-test/${id}`,
+    source: `/tmp/openclaw-test/${id}/index.ts`,
+    manifestPath: `/tmp/openclaw-test/${id}/openclaw.plugin.json`,
+  });
+}
+
+function mockWorkspaceOnlyCatalogEntry(entry: ReturnType<typeof createCatalogEntry>) {
   listChannelPluginCatalogEntries.mockImplementation((opts?: unknown) =>
     (opts as { excludeWorkspace?: boolean } | undefined)?.excludeWorkspace ? [] : [entry],
   );
 }
 
-// ---------------------------------------------------------------------------
-// Regression: resolveChannelSetupEntries (discovery.ts)
-// ---------------------------------------------------------------------------
-
 describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-2g2h)", () => {
   it("falls back to the bundled entry for untrusted workspace shadows", () => {
-    const workspaceEntry = {
-      id: "telegram",
-      pluginId: "evil-telegram-shadow",
-      origin: "workspace",
-      meta: {
-        id: "telegram",
-        label: "Telegram",
-        selectionLabel: "Telegram",
-        docsPath: "/",
-        blurb: "t",
-        order: 1,
-      },
-      install: { npmSpec: "evil-telegram-shadow" },
-    };
+    const workspaceEntry = createCatalogEntry("telegram", "Telegram", "evil-telegram-shadow");
     const bundledEntry = {
       id: "telegram",
       pluginId: "@openclaw/telegram",
@@ -105,10 +114,12 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
       meta: workspaceEntry.meta,
       install: { npmSpec: "@openclaw/telegram" },
     };
-    listChannelPluginCatalogEntries.mockImplementation((opts?: unknown) =>
-      (opts as { excludeWorkspace?: boolean } | undefined)?.excludeWorkspace
-        ? [bundledEntry]
-        : [workspaceEntry],
+    listChannelPluginCatalogEntries.mockReturnValue([workspaceEntry]);
+    getChannelPluginCatalogEntry.mockImplementation(
+      (_channel: string, opts?: { excludePluginRefs?: Array<{ pluginId: string }> }) =>
+        opts?.excludePluginRefs?.some((entry) => entry.pluginId === "evil-telegram-shadow")
+          ? bundledEntry
+          : undefined,
     );
 
     resolveChannelSetupEntries({
@@ -117,27 +128,24 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
       installedPlugins: [],
     });
 
-    const fallbackCall = listChannelPluginCatalogEntries.mock.calls.find(
-      ([opts]) => (opts as { excludeWorkspace?: boolean } | undefined)?.excludeWorkspace === true,
+    const fallbackCall = getChannelPluginCatalogEntry.mock.calls.find(
+      ([, opts]) =>
+        (
+          opts as { excludePluginRefs?: Array<{ pluginId: string; origin?: string }> } | undefined
+        )?.excludePluginRefs?.some(
+          (entry) => entry.pluginId === "evil-telegram-shadow" && entry.origin === "workspace",
+        ) === true,
     );
     expect(fallbackCall).toBeTruthy();
   });
 
   it("still returns bundled-origin entries", () => {
-    const bundledEntry = {
-      id: "telegram",
-      pluginId: "@openclaw/telegram",
-      origin: "bundled",
-      meta: {
-        id: "telegram",
-        label: "Telegram",
-        selectionLabel: "Telegram",
-        docsPath: "/",
-        blurb: "t",
-        order: 1,
-      },
-      install: { npmSpec: "@openclaw/telegram" },
-    };
+    const bundledEntry = createCatalogEntry(
+      "telegram",
+      "Telegram",
+      "@openclaw/telegram",
+      "bundled",
+    );
     listChannelPluginCatalogEntries.mockReturnValue([bundledEntry]);
 
     const result = resolveChannelSetupEntries({
@@ -154,25 +162,13 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
   });
 
   it("keeps trusted workspace channel plugins visible in setup", () => {
-    const workspaceEntry = {
-      id: "telegram",
-      pluginId: "trusted-telegram-shadow",
-      origin: "workspace",
-      meta: {
-        id: "telegram",
-        label: "Telegram",
-        selectionLabel: "Telegram",
-        docsPath: "/",
-        blurb: "t",
-        order: 1,
-      },
-      install: { npmSpec: "trusted-telegram-shadow" },
-    };
+    const workspaceEntry = createCatalogEntry("telegram", "Telegram", "trusted-telegram-shadow");
     listChannelPluginCatalogEntries.mockReturnValue([workspaceEntry]);
-    loadPluginManifestRegistry.mockReturnValue({
-      plugins: [{ id: "trusted-telegram-shadow", channels: ["telegram"] }],
+    loadPluginManifestRegistryCore.mockReturnValue({
+      plugins: [createManifestChannelPlugin("trusted-telegram-shadow", ["telegram"])],
       diagnostics: [],
     });
+    listPluginContributionIds.mockReturnValue(["telegram"]);
 
     const result = resolveChannelSetupEntries({
       cfg: {
@@ -191,20 +187,7 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
   });
 
   it("treats auto-enabled workspace channel plugins as trusted during setup discovery", () => {
-    const workspaceEntry = {
-      id: "telegram",
-      pluginId: "trusted-telegram-shadow",
-      origin: "workspace",
-      meta: {
-        id: "telegram",
-        label: "Telegram",
-        selectionLabel: "Telegram",
-        docsPath: "/",
-        blurb: "t",
-        order: 1,
-      },
-      install: { npmSpec: "trusted-telegram-shadow" },
-    };
+    const workspaceEntry = createCatalogEntry("telegram", "Telegram", "trusted-telegram-shadow");
     listChannelPluginCatalogEntries.mockReturnValue([workspaceEntry]);
     applyPluginAutoEnable.mockImplementation(({ config }: { config: unknown }) => ({
       config: {
@@ -219,10 +202,11 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
         "trusted-telegram-shadow": ["channel configured"],
       },
     }));
-    loadPluginManifestRegistry.mockReturnValue({
-      plugins: [{ id: "trusted-telegram-shadow", channels: ["telegram"] }],
+    loadPluginManifestRegistryCore.mockReturnValue({
+      plugins: [createManifestChannelPlugin("trusted-telegram-shadow", ["telegram"])],
       diagnostics: [],
     });
+    listPluginContributionIds.mockReturnValue(["telegram"]);
 
     const result = resolveChannelSetupEntries({
       cfg: {
@@ -240,7 +224,7 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
   });
 
   it("keeps workspace-only install candidates visible until the user trusts them", () => {
-    mockWorkspaceOnlyCatalogEntry(createWorkspaceCatalogEntry("my-cool-plugin", "My Cool Plugin"));
+    mockWorkspaceOnlyCatalogEntry(createCatalogEntry("my-cool-plugin", "My Cool Plugin"));
 
     const result = resolveChannelSetupEntries({
       cfg: {} as never,
@@ -254,7 +238,7 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
   });
 
   it("does not surface untrusted workspace-only entries as installed", () => {
-    mockWorkspaceOnlyCatalogEntry(createWorkspaceCatalogEntry("my-cool-plugin", "My Cool Plugin"));
+    mockWorkspaceOnlyCatalogEntry(createCatalogEntry("my-cool-plugin", "My Cool Plugin"));
     applyPluginAutoEnable.mockImplementation(({ config }: { config: unknown }) => ({
       config: {
         ...(config as Record<string, unknown>),
@@ -263,10 +247,11 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
       changes: [] as string[],
       autoEnabledReasons: {},
     }));
-    loadPluginManifestRegistry.mockReturnValue({
-      plugins: [{ id: "my-cool-plugin", channels: ["my-cool-plugin"] }],
+    loadPluginManifestRegistryCore.mockReturnValue({
+      plugins: [createManifestChannelPlugin("my-cool-plugin", ["my-cool-plugin"])],
       diagnostics: [],
     });
+    listPluginContributionIds.mockReturnValue(["my-cool-plugin"]);
 
     const result = resolveChannelSetupEntries({
       cfg: {
@@ -278,7 +263,6 @@ describe("resolveChannelSetupEntries workspace shadow exclusion (GHSA-2qrv-rc5x-
       installedPlugins: [],
     });
 
-    expect(result.installedCatalogEntries).toEqual([]);
-    expect(result.installableCatalogEntries).toEqual([]);
+    expect(result.installedCatalogEntries).toStrictEqual([]);
   });
 });

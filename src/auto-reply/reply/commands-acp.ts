@@ -1,12 +1,7 @@
 import { logVerbose } from "../../globals.js";
-import { requireGatewayClientScopeForInternalChannel } from "./command-gates.js";
-import {
-  COMMAND,
-  type AcpAction,
-  resolveAcpAction,
-  resolveAcpHelpText,
-  stopWithText,
-} from "./commands-acp/shared.js";
+import { commandReply, rejectNonOwnerCommand, requireGatewayClientScope } from "./command-gates.js";
+import { COMMAND, resolveAcpHelpText } from "./commands-acp/shared.js";
+import { matchSlashCommandToken, splitCommandAction } from "./commands-slash-parse.js";
 import type {
   CommandHandler,
   CommandHandlerResult,
@@ -16,82 +11,36 @@ import type {
 type AcpActionHandler = (
   params: HandleCommandsParams,
   tokens: string[],
-) => Promise<CommandHandlerResult>;
+  // The argument text after the action, with line breaks and spacing intact.
+  text: string,
+) => Promise<CommandHandlerResult> | CommandHandlerResult;
 
-let lifecycleHandlersPromise: Promise<typeof import("./commands-acp/lifecycle.js")> | undefined;
-let runtimeOptionHandlersPromise:
-  | Promise<typeof import("./commands-acp/runtime-options.js")>
-  | undefined;
-let diagnosticHandlersPromise: Promise<typeof import("./commands-acp/diagnostics.js")> | undefined;
+const ACP_ACTION_LOADERS: Readonly<Record<string, () => Promise<AcpActionHandler>>> = {
+  spawn: async () => (await import("./commands-acp/lifecycle.js")).handleAcpSpawnAction,
+  cancel: async () => (await import("./commands-acp/lifecycle.js")).handleAcpCancelAction,
+  steer: async () => (await import("./commands-acp/lifecycle.js")).handleAcpSteerAction,
+  close: async () => (await import("./commands-acp/lifecycle.js")).handleAcpCloseAction,
+  status: async () => (await import("./commands-acp/runtime-options.js")).handleAcpStatusAction,
+  "set-mode": async () =>
+    (await import("./commands-acp/runtime-options.js")).handleAcpSetModeAction,
+  set: async () => (await import("./commands-acp/runtime-options.js")).handleAcpSetAction,
+  cwd: async () => (await import("./commands-acp/runtime-options.js")).handleAcpCwdAction,
+  permissions: async () =>
+    (await import("./commands-acp/runtime-options.js")).handleAcpPermissionsAction,
+  timeout: async () => (await import("./commands-acp/runtime-options.js")).handleAcpTimeoutAction,
+  model: async () => (await import("./commands-acp/runtime-options.js")).handleAcpModelAction,
+  "reset-options": async () =>
+    (await import("./commands-acp/runtime-options.js")).handleAcpResetOptionsAction,
+  doctor: async () => (await import("./commands-acp/diagnostics.js")).handleAcpDoctorAction,
+  install: async () => (await import("./commands-acp/diagnostics.js")).handleAcpInstallAction,
+  sessions: async () => (await import("./commands-acp/diagnostics.js")).handleAcpSessionsAction,
+};
 
-async function loadAcpActionHandler(action: Exclude<AcpAction, "help">): Promise<AcpActionHandler> {
-  if (action === "spawn" || action === "cancel" || action === "steer" || action === "close") {
-    lifecycleHandlersPromise ??= import("./commands-acp/lifecycle.js");
-    const handlers = await lifecycleHandlersPromise;
-    return {
-      spawn: handlers.handleAcpSpawnAction,
-      cancel: handlers.handleAcpCancelAction,
-      steer: handlers.handleAcpSteerAction,
-      close: handlers.handleAcpCloseAction,
-    }[action];
-  }
+const ACP_PUBLIC_ACTIONS = new Set(["doctor", "install", "sessions"]);
 
-  if (
-    action === "status" ||
-    action === "set-mode" ||
-    action === "set" ||
-    action === "cwd" ||
-    action === "permissions" ||
-    action === "timeout" ||
-    action === "model" ||
-    action === "reset-options"
-  ) {
-    runtimeOptionHandlersPromise ??= import("./commands-acp/runtime-options.js");
-    const handlers = await runtimeOptionHandlersPromise;
-    return {
-      status: handlers.handleAcpStatusAction,
-      "set-mode": handlers.handleAcpSetModeAction,
-      set: handlers.handleAcpSetAction,
-      cwd: handlers.handleAcpCwdAction,
-      permissions: handlers.handleAcpPermissionsAction,
-      timeout: handlers.handleAcpTimeoutAction,
-      model: handlers.handleAcpModelAction,
-      "reset-options": handlers.handleAcpResetOptionsAction,
-    }[action];
-  }
-
-  diagnosticHandlersPromise ??= import("./commands-acp/diagnostics.js");
-  const handlers = await diagnosticHandlersPromise;
-  const diagnosticHandlers: Record<"doctor" | "install" | "sessions", AcpActionHandler> = {
-    doctor: handlers.handleAcpDoctorAction,
-    install: async (params, tokens) => handlers.handleAcpInstallAction(params, tokens),
-    sessions: async (params, tokens) => handlers.handleAcpSessionsAction(params, tokens),
-  };
-  return diagnosticHandlers[action];
-}
-
-const ACP_MUTATING_ACTIONS = new Set<AcpAction>([
-  "spawn",
-  "cancel",
-  "steer",
-  "close",
-  "status",
-  "set-mode",
-  "set",
-  "cwd",
-  "permissions",
-  "timeout",
-  "model",
-  "reset-options",
-]);
-
-export const handleAcpCommand: CommandHandler = async (params, allowTextCommands) => {
-  if (!allowTextCommands) {
-    return null;
-  }
-
-  const normalized = params.command.commandBodyNormalized;
-  if (!normalized.startsWith(COMMAND)) {
+export const handleAcpCommand: CommandHandler = async (params, _allowTextCommands) => {
+  const rest = matchSlashCommandToken(params.command.commandBodyNormalized, COMMAND);
+  if (rest === null) {
     return null;
   }
 
@@ -100,15 +49,16 @@ export const handleAcpCommand: CommandHandler = async (params, allowTextCommands
     return { shouldContinue: false };
   }
 
-  const rest = normalized.slice(COMMAND.length).trim();
-  const tokens = rest.split(/\s+/).filter(Boolean);
-  const action = resolveAcpAction(tokens);
-  if (action === "help") {
-    return stopWithText(resolveAcpHelpText());
+  const { action, args } = splitCommandAction(rest);
+  const loadHandler = Object.hasOwn(ACP_ACTION_LOADERS, action)
+    ? ACP_ACTION_LOADERS[action]
+    : undefined;
+  if (!loadHandler) {
+    return commandReply(resolveAcpHelpText());
   }
 
-  if (ACP_MUTATING_ACTIONS.has(action)) {
-    const scopeBlock = requireGatewayClientScopeForInternalChannel(params, {
+  if (!ACP_PUBLIC_ACTIONS.has(action)) {
+    const scopeBlock = requireGatewayClientScope(params, {
       label: "/acp",
       allowedScopes: ["operator.admin"],
       missingText: "This /acp action requires operator.admin on the internal channel.",
@@ -116,8 +66,14 @@ export const handleAcpCommand: CommandHandler = async (params, allowTextCommands
     if (scopeBlock) {
       return scopeBlock;
     }
+    // Command auth maps internal operator.admin scope to owner identity, so this
+    // second gate rejects external non-owners without blocking Gateway admins.
+    const nonOwner = rejectNonOwnerCommand(params, "/acp");
+    if (nonOwner) {
+      return nonOwner;
+    }
   }
 
-  const handler = await loadAcpActionHandler(action);
-  return await handler(params, tokens);
+  const handler = await loadHandler();
+  return await handler(params, args.split(/\s+/).filter(Boolean), args);
 };

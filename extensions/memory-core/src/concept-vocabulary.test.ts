@@ -1,33 +1,16 @@
 import { describe, expect, it } from "vitest";
-import {
-  classifyConceptTagScript,
-  deriveConceptTags,
-  summarizeConceptTagScriptCoverage,
-} from "./concept-vocabulary.js";
+import { deriveConceptTags, summarizeConceptTagScriptCoverage } from "./concept-vocabulary.js";
 
 describe("concept vocabulary", () => {
-  it("extracts Unicode-aware concept tags for common European languages", () => {
+  it("respects token boundaries and grammatical stopwords", () => {
     const tags = deriveConceptTags({
       path: "memory/2026-04-04.md",
-      snippet:
-        "Configuración de gateway, configuration du routeur, Sicherung und Überwachung Glacier.",
+      snippet: "kv𐐀 𐐀kv s3𐐀 𐐀s3 Ich der die und mit the and",
     });
-
-    expect(tags).toEqual(
-      expect.arrayContaining([
-        "gateway",
-        "configuración",
-        "configuration",
-        "routeur",
-        "sicherung",
-        "überwachung",
-        "glacier",
-      ]),
-    );
-    expect(tags).not.toContain("de");
-    expect(tags).not.toContain("du");
-    expect(tags).not.toContain("und");
-    expect(tags).not.toContain("2026-04-04.md");
+    expect(tags).toEqual(expect.arrayContaining(["kv𐐨", "𐐨kv", "s3𐐨", "𐐨s3"]));
+    expect(tags).not.toContain("kv");
+    expect(tags).not.toContain("s3");
+    expect(tags).not.toContain("ich");
   });
 
   it("extracts protected and segmented CJK concept tags", () => {
@@ -37,26 +20,18 @@ describe("concept vocabulary", () => {
         "障害対応ルーター設定とバックアップ確認。路由器备份与网关同步。라우터 백업 페일오버 점검.",
     });
 
-    expect(tags).toEqual(
-      expect.arrayContaining([
-        "障害対応",
-        "ルーター",
-        "バックアップ",
-        "路由器",
-        "备份",
-        "网关",
-        "라우터",
-        "백업",
-      ]),
-    );
+    expect(tags).toStrictEqual([
+      "バックアップ",
+      "ルーター",
+      "障害対応",
+      "路由器",
+      "备份",
+      "网关",
+      "라우터",
+      "백업",
+    ]);
     expect(tags).not.toContain("ルー");
     expect(tags).not.toContain("ター");
-  });
-
-  it("classifies concept tags by script family", () => {
-    expect(classifyConceptTagScript("routeur")).toBe("latin");
-    expect(classifyConceptTagScript("路由器")).toBe("cjk");
-    expect(classifyConceptTagScript("qmd路由器")).toBe("mixed");
   });
 
   it("summarizes entry coverage across latin, cjk, and mixed tags", () => {
@@ -64,7 +39,7 @@ describe("concept vocabulary", () => {
       summarizeConceptTagScriptCoverage([
         ["routeur", "sauvegarde"],
         ["路由器", "备份"],
-        ["qmd", "路由器"],
+        ["vectors", "路由器"],
         ["сервер"],
       ]),
     ).toEqual({

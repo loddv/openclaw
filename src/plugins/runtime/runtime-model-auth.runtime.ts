@@ -1,23 +1,31 @@
-import type { Api, Model } from "@mariozechner/pi-ai";
-import { getApiKeyForModel, resolveApiKeyForProvider } from "../../agents/model-auth.js";
+import { getApiKeyForModelCore } from "../../agents/model-auth.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { Model } from "../../llm/types.js";
+import {
+  attachProviderAuthAuthority,
+  getProviderAuthAuthority,
+} from "../provider-auth-authority.js";
 import { prepareProviderRuntimeAuth } from "../provider-runtime.runtime.js";
 import type { ResolvedProviderRuntimeAuth } from "./model-auth-types.js";
 
-export { getApiKeyForModel, resolveApiKeyForProvider };
+export {
+  getApiKeyForModelCore as getApiKeyForModel,
+  resolveApiKeyForProviderCore as resolveProviderRuntimeApiKey,
+} from "../../agents/model-auth.js";
 
 /**
  * Resolve request-ready auth for a runtime model, applying any provider-owned
  * `prepareRuntimeAuth` exchange on top of the standard credential lookup.
  */
-export async function getRuntimeAuthForModel(params: {
-  model: Model<Api>;
+export async function getRuntimeAuthForModelCore(params: {
+  model: Model;
   cfg?: OpenClawConfig;
   workspaceDir?: string;
 }): Promise<ResolvedProviderRuntimeAuth> {
-  const resolvedAuth = await getApiKeyForModel({
+  const resolvedAuth = await getApiKeyForModelCore({
     model: params.model,
     cfg: params.cfg,
+    workspaceDir: params.workspaceDir,
   });
 
   if (!resolvedAuth.apiKey || resolvedAuth.mode === "aws-sdk") {
@@ -35,7 +43,7 @@ export async function getRuntimeAuthForModel(params: {
       env: process.env,
       provider: params.model.provider,
       modelId: params.model.id,
-      model: params.model,
+      model: attachProviderAuthAuthority(params.model, getProviderAuthAuthority(resolvedAuth)),
       apiKey: resolvedAuth.apiKey,
       authMode: resolvedAuth.mode,
       profileId: resolvedAuth.profileId,

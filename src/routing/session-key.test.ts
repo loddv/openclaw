@@ -1,166 +1,115 @@
-import { describe, expect, it } from "vitest";
-import { deriveSessionChatTypeFromKey } from "../sessions/session-chat-type-shared.js";
+import { expect, it, vi } from "vitest";
+
+vi.unmock("./session-key.js");
+import { resolveSessionStoreKey } from "../gateway/session-store-key.js";
 import {
-  getSubagentDepth,
-  isCronSessionKey,
+  parseCronRunScopeSuffix,
   parseThreadSessionSuffix,
-  resolveThreadParentSessionKey,
 } from "../sessions/session-key-utils.js";
-import {
-  classifySessionKeyShape,
-  isValidAgentId,
-  parseAgentSessionKey,
-  toAgentStoreSessionKey,
-} from "./session-key.js";
+import * as keys from "./session-key.js";
 
-describe("classifySessionKeyShape", () => {
-  it.each([
-    { input: undefined, expected: "missing" },
-    { input: "   ", expected: "missing" },
-    { input: "agent:main:main", expected: "agent" },
-    { input: "agent:research:subagent:worker", expected: "agent" },
-    { input: "agent::broken", expected: "malformed_agent" },
-    { input: "agent:main", expected: "malformed_agent" },
-    { input: "main", expected: "legacy_or_alias" },
-    { input: "custom-main", expected: "legacy_or_alias" },
-    { input: "subagent:worker", expected: "legacy_or_alias" },
-  ] as const)("classifies %j as $expected", ({ input, expected }) => {
-    expect(classifySessionKeyShape(input)).toBe(expected);
+const scopeLegacy = (sessionKey: string, mainKey?: string) =>
+  keys.scopeLegacySessionKeyToAgent({ agentId: "Ops", sessionKey, mainKey });
+
+it("keeps legacy agent ids absent until a configured default resolves them", () => {
+  expect(keys.parseAgentSessionKey("main")?.agentId).toBeUndefined();
+  expect(() => keys.resolveAgentIdFromSessionKey("main")).toThrow("configured default agent");
+  expect(() => keys.resolveAgentIdFromSessionKey("main", "   ")).toThrow(
+    "configured default agent",
+  );
+  expect(keys.resolveAgentIdFromSessionKey("main", "primary")).toBe("primary");
+  expect(keys.resolveAgentIdFromSessionKey("agent:worker:main", "primary")).toBe("worker");
+  expect(() => keys.resolveAgentIdFromSessionKey("agent::secret", "primary")).toThrow(
+    "Malformed agent session key",
+  );
+});
+
+it("classifies an absent session key as missing", () => {
+  expect(keys.classifySessionKeyShape(undefined)).toBe("missing");
+});
+
+it.each([
+  ["Incident-42", undefined, "agent:ops:incident-42"],
+  ["main", "work", "agent:ops:work"],
+  ["agent:main:incident-42", undefined, "agent:main:incident-42"],
+] as const)("scopes legacy key %s with main alias %s", (key, mainKey, expected) => {
+  expect(scopeLegacy(key, mainKey)).toBe(expected);
+});
+
+it("recognizes literal global and unknown sentinels", () => {
+  expect(keys.isUnscopedSessionKeySentinel("global")).toBe(true);
+  expect(keys.isUnscopedSessionKeySentinel("UNKNOWN")).toBe(true);
+  expect(keys.isUnscopedSessionKeySentinel("agent:ops:global")).toBe(false);
+  expect(keys.isUnscopedSessionKeySentinel("incident-42")).toBe(false);
+});
+
+it.each([
+  ["incident-42", "agent:ops:incident-42", true],
+  ["agent:OPS:incident-42", "agent:ops:incident-42", true],
+  ["agent:ops:incident-42", "agent:research:incident-42", false],
+  ["agent:ops:incident-42", "main", false],
+] as const)("compares %s with %s without losing a qualified owner", (left, right, expected) => {
+  expect(keys.agentSessionKeysMatchByRequestKey(left, right)).toBe(expected);
+});
+
+it("scopes unprefixed explicit-agent keys to the requested store agent", () => {
+  const cfg = { agents: { entries: { main: {}, ops: {} } }, session: { mainKey: "primary" } };
+  const main = resolveSessionStoreKey({ cfg, sessionKey: "main", storeAgentId: "ops" });
+  const dm = resolveSessionStoreKey({ cfg, sessionKey: "discord:dm:U1", storeAgentId: "ops" });
+  expect([main, dm]).toEqual(["agent:ops:primary", "agent:ops:discord:dm:u1"]);
+});
+
+it("preserves feishu conversation ids that embed :topic: in the base id", () => {
+  const key = "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user";
+  expect(parseThreadSessionSuffix(key)).toEqual({ baseSessionKey: key, threadId: undefined });
+});
+
+it("parses mixed-case :thread: markers without lowercasing the stored key", () => {
+  expect(
+    parseThreadSessionSuffix("agent:main:slack:channel:General:Thread:1699999999.0001"),
+  ).toEqual({
+    baseSessionKey: "agent:main:slack:channel:General",
+    threadId: "1699999999.0001",
   });
 });
 
-describe("session key backward compatibility", () => {
-  function expectBackwardCompatibleDirectSessionKey(key: string) {
-    expect(classifySessionKeyShape(key)).toBe("agent");
-  }
-
-  it.each([
-    "agent:main:telegram:dm:123456",
-    "agent:main:whatsapp:dm:+15551234567",
-    "agent:main:discord:dm:user123",
-    "agent:main:telegram:direct:123456",
-    "agent:main:whatsapp:direct:+15551234567",
-    "agent:main:discord:direct:user123",
-  ] as const)("classifies backward-compatible direct session key %s as valid", (key) => {
-    expectBackwardCompatibleDirectSessionKey(key);
-  });
+it.each([
+  ["AGENT:Work:CRON:Nightly-Job:RUN:ABC-123", "AGENT:Work:CRON:Nightly-Job", "ABC-123"],
+  ["agent:main:slack:channel:general:run:42", "agent:main:slack:channel:general:run:42", undefined],
+  ["agent:main:cron:run:job:run:abc:extra", "agent:main:cron:run:job:run:abc:extra", undefined],
+] as const)("parses case-preserving terminal cron scope: %s", (key, baseSessionKey, runId) => {
+  expect(parseCronRunScopeSuffix(key)).toEqual({ baseSessionKey, runId });
 });
 
-describe("getSubagentDepth", () => {
-  it.each([
-    { key: "agent:main:main", expected: 0 },
-    { key: "main", expected: 0 },
-    { key: undefined, expected: 0 },
-    { key: "agent:main:subagent:parent:subagent:child", expected: 2 },
-  ] as const)("returns $expected for session key %j", ({ key, expected }) => {
-    expect(getSubagentDepth(key)).toBe(expected);
-  });
+it("does not double-prefix already-qualified agent keys", () => {
+  expect(keys.toAgentStoreSessionKey({ agentId: "main", requestKey: "agent:main:main" })).toBe(
+    "agent:main:main",
+  );
 });
 
-describe("isCronSessionKey", () => {
-  it.each([
-    { key: "agent:main:cron:job-1", expected: true },
-    { key: "agent:main:cron:job-1:run:run-1", expected: true },
-    { key: "agent:main:main", expected: false },
-    { key: "agent:main:subagent:worker", expected: false },
-    { key: "cron:job-1", expected: false },
-    { key: undefined, expected: false },
-  ] as const)("matches cron key %j => $expected", ({ key, expected }) => {
-    expect(isCronSessionKey(key)).toBe(expected);
-  });
+it("preserves Signal group ids in group history keys", () => {
+  const peerId = "VWATodkf2hc8zdOS76q9Tb0+5Bi522E03qLdaQ/9ypg=";
+  expect(keys.buildGroupHistoryKey({ channel: "Signal", peerKind: "group", peerId })).toBe(
+    `signal:default:group:${peerId}`,
+  );
 });
 
-describe("deriveSessionChatTypeFromKey", () => {
-  it.each([
-    { key: "agent:main:discord:direct:user1", expected: "direct" },
-    { key: "agent:main:telegram:group:g1", expected: "group" },
-    { key: "agent:main:discord:channel:c1", expected: "channel" },
-    { key: "agent:main:telegram:dm:123456", expected: "direct" },
-    { key: "telegram:dm:123456", expected: "direct" },
-    { key: "discord:acc-1:guild-123:channel-456", expected: "channel" },
-    { key: "12345-678@g.us", expected: "group" },
-    { key: "agent:main:main", expected: "unknown" },
-    { key: "agent:main", expected: "unknown" },
-    { key: "", expected: "unknown" },
-  ] as const)("derives chat type for %j => $expected", ({ key, expected }) => {
-    expect(deriveSessionChatTypeFromKey(key)).toBe(expected);
-  });
+it("keeps non-Signal opaque-looking group ids lowercase", () => {
+  expect(
+    keys.buildAgentPeerSessionKey({
+      agentId: "Main",
+      channel: "Telegram",
+      peerKind: "group",
+      peerId: "MiXeDGroup",
+    }),
+  ).toBe("agent:main:telegram:group:mixedgroup");
 });
 
-describe("thread session suffix parsing", () => {
-  it("preserves feishu conversation ids that embed :topic: in the base id", () => {
-    expect(
-      parseThreadSessionSuffix(
-        "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-      ),
-    ).toEqual({
-      baseSessionKey:
-        "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-      threadId: undefined,
-    });
-    expect(
-      resolveThreadParentSessionKey(
-        "agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-      ),
-    ).toBeNull();
-  });
-
-  it("does not treat telegram :topic: as a generic thread suffix", () => {
-    expect(parseThreadSessionSuffix("agent:main:telegram:group:-100123:topic:77")).toEqual({
-      baseSessionKey: "agent:main:telegram:group:-100123:topic:77",
-      threadId: undefined,
-    });
-    expect(resolveThreadParentSessionKey("agent:main:telegram:group:-100123:topic:77")).toBeNull();
-  });
-
-  it("parses mixed-case :thread: markers without lowercasing the stored key", () => {
-    expect(
-      parseThreadSessionSuffix("agent:main:slack:channel:General:Thread:1699999999.0001"),
-    ).toEqual({
-      baseSessionKey: "agent:main:slack:channel:General",
-      threadId: "1699999999.0001",
-    });
-  });
-});
-
-describe("session key canonicalization", () => {
-  function expectSessionKeyCanonicalizationCase(params: { run: () => void }) {
-    params.run();
-  }
-
-  it.each([
-    {
-      name: "parses agent keys case-insensitively and returns lowercase tokens",
-      run: () =>
-        expect(parseAgentSessionKey("AGENT:Main:Hook:Webhook:42")).toEqual({
-          agentId: "main",
-          rest: "hook:webhook:42",
-        }),
-    },
-    {
-      name: "does not double-prefix already-qualified agent keys",
-      run: () =>
-        expect(
-          toAgentStoreSessionKey({
-            agentId: "main",
-            requestKey: "agent:main:main",
-          }),
-        ).toBe("agent:main:main"),
-    },
-  ] as const)("$name", ({ run }) => {
-    expectSessionKeyCanonicalizationCase({ run });
-  });
-});
-
-describe("isValidAgentId", () => {
-  it.each([
-    { input: "main", expected: true },
-    { input: "my-research_agent01", expected: true },
-    { input: "", expected: false },
-    { input: "Agent not found: xyz", expected: false },
-    { input: "../../../etc/passwd", expected: false },
-    { input: "a".repeat(65), expected: false },
-  ] as const)("validates agent id %j => $expected", ({ input, expected }) => {
-    expect(isValidAgentId(input)).toBe(expected);
-  });
+it.each([
+  ["agent:ops:cron:job-1", undefined, undefined, "agent:ops:cron:job-1"],
+  ["agent:main:cron:backup:run:abc123", "primary", "per-sender", "agent:main:primary"],
+  ["agent:ops:cron:job-1:run:xyz", undefined, "global", "global"],
+  ["agent:main:cron:backup:run:abc:subagent:worker", "primary", "global", "global"],
+] as const)("routes cron event %s to its scoped queue", (key, mainKey, scope, expected) => {
+  expect(keys.resolveEventSessionKey(key, mainKey, scope)).toBe(expected);
 });

@@ -1,34 +1,85 @@
-import type { StreamFn } from "@mariozechner/pi-agent-core";
-import { streamSimple } from "@mariozechner/pi-ai";
+import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
+import type { ModelRequestHeaders } from "openclaw/plugin-sdk/llm";
+import { getEnvApiKey, streamSimple } from "openclaw/plugin-sdk/llm";
 import type { ProviderWrapStreamFnContext } from "openclaw/plugin-sdk/plugin-entry";
+import {
+  resolveProviderEndpoint,
+  supportsClaude1MContext,
+} from "openclaw/plugin-sdk/provider-model-shared";
 import {
   applyAnthropicPayloadPolicyToParams,
   composeProviderStreamWrappers,
+  createAnthropicThinkingPrefillPayloadWrapper,
+  createPayloadPatchStreamWrapper,
+  isAnthropicOAuthApiKey,
   resolveAnthropicPayloadPolicy,
+  resolveAnthropicServerCompactionPlan,
   streamWithPayloadPatch,
 } from "openclaw/plugin-sdk/provider-stream-shared";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
-import { normalizeLowercaseStringOrEmpty, readStringValue } from "openclaw/plugin-sdk/text-runtime";
+import {
+  normalizeFastMode,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  normalizeAnthropicServiceTier,
+  recordFastModeUnsupported,
+  resolveAnthropicFastModePlan,
+  supportsAnthropicPriorityTier,
+  type AnthropicServiceTier,
+} from "./fast-mode-policy.js";
 
 const log = createSubsystemLogger("anthropic-stream");
 
-const ANTHROPIC_CONTEXT_1M_BETA = "context-1m-2025-08-07";
-const ANTHROPIC_1M_MODEL_PREFIXES = ["claude-opus-4", "claude-sonnet-4"] as const;
-const PI_AI_DEFAULT_ANTHROPIC_BETAS = [
+const ANTHROPIC_CONTEXT_1M_BETA_LEGACY = "context-1m-2025-08-07";
+const ANTHROPIC_COMPACTION_BETA = "compact-2026-01-12";
+const ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01";
+const ANTHROPIC_FAST_MODE_COST_MULTIPLIER = 2;
+const OPENCLAW_DEFAULT_ANTHROPIC_BETAS = [
   "fine-grained-tool-streaming-2025-05-14",
   "interleaved-thinking-2025-05-14",
 ] as const;
-const PI_AI_OAUTH_ANTHROPIC_BETAS = [
+const OPENCLAW_OAUTH_ANTHROPIC_BETAS = [
   "claude-code-20250219",
   "oauth-2025-04-20",
-  ...PI_AI_DEFAULT_ANTHROPIC_BETAS,
+  ...OPENCLAW_DEFAULT_ANTHROPIC_BETAS,
 ] as const;
 
-type AnthropicServiceTier = "auto" | "standard_only";
+type DynamicFastMode = boolean | (() => boolean | undefined);
 
-function isAnthropic1MModel(modelId: string): boolean {
-  const normalized = normalizeLowercaseStringOrEmpty(modelId);
-  return ANTHROPIC_1M_MODEL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+/**
+ * Publish the newest known Claude Code version (installed CLI or the version
+ * Anthropic last required) and collect new requirements; the transport owns
+ * the floor, the retry, and the billing snapshot.
+ */
+export function createAnthropicClaudeCodeIdentityWrapper(
+  baseStreamFn: StreamFn | undefined,
+  identity: {
+    resolveVersion: () => Promise<string | undefined>;
+    record: (version: string) => void;
+  },
+  sourceApi?: ProviderWrapStreamFnContext["sourceApi"],
+): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) => {
+    if (
+      model.provider !== "anthropic" ||
+      (sourceApi ?? model.api) !== "anthropic-messages" ||
+      !isAnthropicOAuthApiKey(options?.apiKey ?? getEnvApiKey(model.provider))
+    ) {
+      return underlying(model, context, options);
+    }
+    return identity.resolveVersion().then((version) => {
+      const requestOptions = {
+        ...options,
+        ...(version
+          ? { headers: { ...options?.headers, "user-agent": `claude-cli/${version}` } }
+          : {}),
+        onClaudeCodeVersionRequired: identity.record,
+      };
+      return underlying(model, context, requestOptions);
+    });
+  };
 }
 
 function parseHeaderList(value: unknown): string[] {
@@ -42,9 +93,9 @@ function parseHeaderList(value: unknown): string[] {
 }
 
 function mergeAnthropicBetaHeader(
-  headers: Record<string, string> | undefined,
+  headers: ModelRequestHeaders | undefined,
   betas: string[],
-): Record<string, string> {
+): ModelRequestHeaders {
   const merged = { ...headers };
   const existingKey = Object.keys(merged).find(
     (key) => normalizeLowercaseStringOrEmpty(key) === "anthropic-beta",
@@ -56,65 +107,52 @@ function mergeAnthropicBetaHeader(
   return merged;
 }
 
-function isAnthropicOAuthApiKey(apiKey: unknown): boolean {
-  return typeof apiKey === "string" && apiKey.includes("sk-ant-oat");
+function applyAnthropicFastModePricing(model: Parameters<StreamFn>[0]): Parameters<StreamFn>[0] {
+  const scaleRates = (rates: Parameters<StreamFn>[0]["cost"]) => ({
+    input: rates.input * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
+    output: rates.output * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
+    cacheRead: rates.cacheRead * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
+    cacheWrite: rates.cacheWrite * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
+  });
+  return {
+    ...model,
+    cost: {
+      ...scaleRates(model.cost),
+      ...(model.cost.tieredPricing
+        ? {
+            tieredPricing: model.cost.tieredPricing.map((tier) => ({
+              ...tier,
+              ...scaleRates(tier),
+            })),
+          }
+        : {}),
+    },
+  };
 }
 
-function resolveAnthropicFastServiceTier(enabled: boolean): AnthropicServiceTier {
-  return enabled ? "auto" : "standard_only";
-}
-
-function normalizeFastMode(raw?: string | boolean | null): boolean | undefined {
-  if (typeof raw === "boolean") {
-    return raw;
+function hasConfiguredAnthropicBeta(extraParams: Record<string, unknown> | undefined): boolean {
+  const configured = extraParams?.anthropicBeta;
+  if (typeof configured === "string") {
+    return configured.trim().length > 0;
   }
-  if (!raw) {
-    return undefined;
-  }
-  const key = normalizeLowercaseStringOrEmpty(raw);
-  if (["off", "false", "no", "0", "disable", "disabled", "normal"].includes(key)) {
+  if (!Array.isArray(configured)) {
     return false;
   }
-  if (["on", "true", "yes", "1", "enable", "enabled", "fast"].includes(key)) {
-    return true;
-  }
-  return undefined;
-}
-
-function normalizeAnthropicServiceTier(value: unknown): AnthropicServiceTier | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const normalized = normalizeLowercaseStringOrEmpty(value);
-  if (normalized === "auto" || normalized === "standard_only") {
-    return normalized;
-  }
-  return undefined;
+  return configured.some((beta) => typeof beta === "string" && beta.trim().length > 0);
 }
 
 export function resolveAnthropicBetas(
   extraParams: Record<string, unknown> | undefined,
-  modelId: string,
+  _modelId: string,
 ): string[] | undefined {
-  const betas = new Set<string>();
   const configured = extraParams?.anthropicBeta;
-  if (typeof configured === "string" && configured.trim()) {
-    betas.add(configured.trim());
-  } else if (Array.isArray(configured)) {
-    for (const beta of configured) {
-      if (typeof beta === "string" && beta.trim()) {
-        betas.add(beta.trim());
-      }
-    }
-  }
+  const values =
+    typeof configured === "string" ? [configured] : Array.isArray(configured) ? configured : [];
+  const betas = new Set(values.flatMap(parseHeaderList));
 
-  if (extraParams?.context1m === true) {
-    if (isAnthropic1MModel(modelId)) {
-      betas.add(ANTHROPIC_CONTEXT_1M_BETA);
-    } else {
-      log.warn(`ignoring context1m for non-opus/sonnet model: anthropic/${modelId}`);
-    }
-  }
+  // Newer Claude 4.x 1M context is GA. Keep context1m as a context-sizing
+  // opt-in, but do not send the retired beta even if it remains in older config.
+  betas.delete(ANTHROPIC_CONTEXT_1M_BETA_LEGACY);
 
   return betas.size > 0 ? [...betas] : undefined;
 }
@@ -126,21 +164,12 @@ export function createAnthropicBetaHeadersWrapper(
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
     const isOauth = isAnthropicOAuthApiKey(options?.apiKey);
-    const requestedContext1m = betas.includes(ANTHROPIC_CONTEXT_1M_BETA);
-    const effectiveBetas =
-      isOauth && requestedContext1m
-        ? betas.filter((beta) => beta !== ANTHROPIC_CONTEXT_1M_BETA)
-        : betas;
-    if (isOauth && requestedContext1m) {
-      log.warn(
-        `ignoring context1m for Anthropic Claude CLI or legacy token auth on ${model.provider}/${model.id}; falling back to the standard context window because Anthropic rejects context-1m beta with non-API-key auth`,
-      );
-    }
+    const effectiveBetas = betas.filter((beta) => beta !== ANTHROPIC_CONTEXT_1M_BETA_LEGACY);
 
-    const piAiBetas = isOauth
-      ? (PI_AI_OAUTH_ANTHROPIC_BETAS as readonly string[])
-      : (PI_AI_DEFAULT_ANTHROPIC_BETAS as readonly string[]);
-    const allBetas = [...new Set([...piAiBetas, ...effectiveBetas])];
+    const openClawBetas = isOauth
+      ? OPENCLAW_OAUTH_ANTHROPIC_BETAS
+      : OPENCLAW_DEFAULT_ANTHROPIC_BETAS;
+    const allBetas = [...openClawBetas, ...effectiveBetas];
     return underlying(model, context, {
       ...options,
       headers: mergeAnthropicBetaHeader(options?.headers, allBetas),
@@ -150,28 +179,86 @@ export function createAnthropicBetaHeadersWrapper(
 
 export function createAnthropicFastModeWrapper(
   baseStreamFn: StreamFn | undefined,
-  enabled: boolean,
+  enabled: DynamicFastMode,
+  extraParams?: Record<string, unknown>,
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
-  const serviceTier = resolveAnthropicFastServiceTier(enabled);
+  const fastPayloadWrapper = createPayloadPatchStreamWrapper(underlying, ({ payload }) => {
+    delete payload.service_tier;
+    payload.speed = "fast";
+  });
   return (model, context, options) => {
-    if (isAnthropicOAuthApiKey(options?.apiKey)) {
+    const resolved = typeof enabled === "function" ? enabled() : enabled;
+    if (resolved === undefined) {
       return underlying(model, context, options);
     }
-
-    const payloadPolicy = resolveAnthropicPayloadPolicy({
-      provider: readStringValue(model.provider),
-      api: readStringValue(model.api),
-      baseUrl: readStringValue(model.baseUrl),
-      serviceTier,
+    return withPlan(model, context, options, resolved);
+  };
+  function withPlan(
+    model: Parameters<StreamFn>[0],
+    context: Parameters<StreamFn>[1],
+    options: Parameters<StreamFn>[2],
+    resolved: boolean,
+  ): ReturnType<StreamFn> {
+    const plan = resolveAnthropicFastModePlan({
+      provider: model.provider,
+      modelId: model.id,
+      api: model.api,
+      baseUrl: model.baseUrl,
+      modelParams: model.params,
+      params: extraParams,
+      authMode: isAnthropicOAuthApiKey(options?.apiKey) ? "oauth" : "api_key",
+      requestCapabilities: {
+        endpointClass: resolveProviderEndpoint(model.baseUrl).endpointClass,
+        allowsAnthropicServiceTier: resolveAnthropicPayloadPolicy({
+          provider: model.provider,
+          api: model.api,
+          baseUrl: model.baseUrl,
+        }).allowsServiceTier,
+      },
     });
-    if (!payloadPolicy.allowsServiceTier) {
+    if (plan === "native") {
+      if (!resolved) {
+        return underlying(model, context, options);
+      }
+      const fastOptions = {
+        ...options,
+        headers: mergeAnthropicBetaHeader(options?.headers, [ANTHROPIC_FAST_MODE_BETA]),
+        onFastModeUnsupported: recordFastModeUnsupported,
+      };
+      return fastPayloadWrapper(applyAnthropicFastModePricing(model), context, fastOptions);
+    }
+    return plan === "service-tier"
+      ? createAnthropicServiceTierWrapper(underlying, resolved ? "auto" : "standard_only")(
+          model,
+          context,
+          options,
+        )
+      : underlying(model, context, options);
+  }
+}
+
+function createAnthropicCompactionWrapper(
+  baseStreamFn: StreamFn | undefined,
+  extraParams: Record<string, unknown> | undefined,
+): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) => {
+    const compaction = resolveAnthropicServerCompactionPlan(
+      model,
+      extraParams,
+      options?.apiKey ?? getEnvApiKey(model.provider),
+    );
+    if (!compaction.enabled) {
       return underlying(model, context, options);
     }
-
-    return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) =>
-      applyAnthropicPayloadPolicyToParams(payloadObj, payloadPolicy),
-    );
+    const requestOptions = {
+      ...options,
+      anthropicServerCompaction: true,
+      anthropicCompactThreshold: compaction.threshold,
+      headers: mergeAnthropicBetaHeader(options?.headers, [ANTHROPIC_COMPACTION_BETA]),
+    };
+    return underlying(model, context, requestOptions);
   };
 }
 
@@ -181,32 +268,37 @@ export function createAnthropicServiceTierWrapper(
 ): StreamFn {
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
-    if (isAnthropicOAuthApiKey(options?.apiKey)) {
+    if (isAnthropicOAuthApiKey(options?.apiKey) || !supportsAnthropicPriorityTier(model)) {
       return underlying(model, context, options);
     }
-
-    const payloadPolicy = resolveAnthropicPayloadPolicy({
-      provider: readStringValue(model.provider),
-      api: readStringValue(model.api),
-      baseUrl: readStringValue(model.baseUrl),
+    const policy = resolveAnthropicPayloadPolicy({
+      provider: model.provider,
+      api: model.api,
+      baseUrl: model.baseUrl,
       serviceTier,
     });
-    if (!payloadPolicy.allowsServiceTier) {
-      return underlying(model, context, options);
-    }
-
-    return streamWithPayloadPatch(underlying, model, context, options, (payloadObj) =>
-      applyAnthropicPayloadPolicyToParams(payloadObj, payloadPolicy),
-    );
+    return policy.allowsServiceTier
+      ? streamWithPayloadPatch(underlying, model, context, options, (payload) =>
+          applyAnthropicPayloadPolicyToParams(payload, policy, new Set()),
+        )
+      : underlying(model, context, options);
   };
+}
+
+function createAnthropicThinkingPrefillWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+  return createAnthropicThinkingPrefillPayloadWrapper(baseStreamFn, (stripped) => {
+    log.warn(
+      `removed ${stripped} trailing assistant prefill message${stripped === 1 ? "" : "s"} because Anthropic extended thinking requires conversations to end with a user turn`,
+    );
+  });
 }
 
 export function resolveAnthropicFastMode(
   extraParams: Record<string, unknown> | undefined,
 ): boolean | undefined {
-  return normalizeFastMode(
-    (extraParams?.fastMode ?? extraParams?.fast_mode) as string | boolean | null | undefined,
-  );
+  const raw = extraParams?.fastMode ?? extraParams?.fast_mode;
+  const fastMode = normalizeFastMode(typeof raw === "function" ? (raw as () => unknown)() : raw);
+  return fastMode === "auto" ? undefined : fastMode === "ultrafast" ? true : fastMode;
 }
 
 export function resolveAnthropicServiceTier(
@@ -221,24 +313,34 @@ export function resolveAnthropicServiceTier(
   return normalized;
 }
 
-export function wrapAnthropicProviderStream(
-  ctx: ProviderWrapStreamFnContext,
-): StreamFn | undefined {
+export function wrapAnthropicProviderStream(ctx: ProviderWrapStreamFnContext): StreamFn {
   const anthropicBetas = resolveAnthropicBetas(ctx.extraParams, ctx.modelId);
+  const needsAnthropicBetaWrapper =
+    anthropicBetas !== undefined ||
+    hasConfiguredAnthropicBeta(ctx.extraParams) ||
+    (ctx.extraParams?.context1m === true && supportsClaude1MContext({ id: ctx.modelId }));
   const serviceTier = resolveAnthropicServiceTier(ctx.extraParams);
-  const fastMode = resolveAnthropicFastMode(ctx.extraParams);
-  return composeProviderStreamWrappers(
+  const hasFastModeParam =
+    ctx.extraParams !== undefined &&
+    (Object.hasOwn(ctx.extraParams, "fastMode") || Object.hasOwn(ctx.extraParams, "fast_mode"));
+  const wrapped = composeProviderStreamWrappers(
     ctx.streamFn,
-    anthropicBetas?.length
-      ? (streamFn) => createAnthropicBetaHeadersWrapper(streamFn, anthropicBetas)
+    needsAnthropicBetaWrapper
+      ? (streamFn) => createAnthropicBetaHeadersWrapper(streamFn, anthropicBetas ?? [])
       : undefined,
     serviceTier
       ? (streamFn) => createAnthropicServiceTierWrapper(streamFn, serviceTier)
       : undefined,
-    fastMode !== undefined
-      ? (streamFn) => createAnthropicFastModeWrapper(streamFn, fastMode)
+    hasFastModeParam
+      ? (streamFn) =>
+          createAnthropicFastModeWrapper(
+            streamFn,
+            () => resolveAnthropicFastMode(ctx.extraParams),
+            ctx.extraParams,
+          )
       : undefined,
+    // The shared plan owns the default, opt-out, and per-request auth/route gates.
+    (streamFn) => createAnthropicCompactionWrapper(streamFn, ctx.extraParams),
   );
+  return createAnthropicThinkingPrefillWrapper(wrapped);
 }
-
-export const __testing = { log };

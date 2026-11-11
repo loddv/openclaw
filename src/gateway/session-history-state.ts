@@ -1,219 +1,340 @@
+import { isDeepStrictEqual } from "node:util";
+import { expectDefined } from "@openclaw/normalization-core";
+import { asPositiveSafeInteger } from "@openclaw/normalization-core/number-coercion";
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { captureSessionActorTranscriptRead } from "../config/sessions/session-actor-transcript-read.js";
+import type {
+  PaginatedSessionHistory,
+  SessionHistoryMessage,
+  SessionHistoryReadParams,
+  SessionHistorySnapshot,
+  SessionHistoryTranscriptTarget,
+} from "../config/sessions/session-history-types.js";
+import { isIncognitoSessionKey } from "../shared/incognito-session-key.js";
 import {
-  DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
-  sanitizeChatHistoryMessages,
-} from "./server-methods/chat.js";
-import { attachOpenClawTranscriptMeta, readSessionMessages } from "./session-utils.js";
+  projectChatDisplayMessages,
+  projectChatDisplayMessagesWithState,
+  createCurrentUserProfileMessageProjector,
+} from "./chat-display-projection.core.js";
+import { prepareForwardedMessageCronJobNameResolver } from "./chat-display-projection.cron.js";
+import { DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS } from "./chat-display-projection.helpers.js";
+import {
+  createSubagentCoordinationHistoryProjection,
+  projectForwardedMessages,
+} from "./chat-display-projection.history.js";
+import { resolveCurrentUserProfileDisplay } from "./current-user-profile-display.js";
+import {
+  createPreparedSessionHistorySubagentProjection,
+  readSessionHistorySubagentLookup,
+} from "./session-history-delta-visibility.js";
+import { readSessionHistorySnapshotKernel } from "./session-history-snapshot.js";
+import {
+  buildPaginatedSessionHistory,
+  readChatHistoryMessageSeq as resolveMessageSeq,
+} from "./session-history-tail.js";
+import {
+  readTranscriptMessageIdempotencyKey,
+  attachOpenClawTranscriptMeta,
+} from "./session-transcript-entry-message.js";
+import { createSessionActorTranscriptReader } from "./session-transcript-memory-reader.js";
+import { resolveTranscriptPathForComparison } from "./session-transcript-path.js";
+import type { SubagentCoordinationDisplayResolver } from "./session-transcript-read.types.js";
+import * as sessionTranscriptReaders from "./session-transcript-readers.js";
 
-type SessionHistoryTranscriptMeta = {
-  seq?: number;
+type InlineSessionHistoryAppend = {
+  message?: SessionHistoryMessage;
+  messageSeq?: number;
+  shouldRefresh?: boolean;
 };
 
-export type SessionHistoryMessage = Record<string, unknown> & {
-  __openclaw?: SessionHistoryTranscriptMeta;
-};
-
-export type PaginatedSessionHistory = {
-  items: SessionHistoryMessage[];
-  messages: SessionHistoryMessage[];
-  nextCursor?: string;
-  hasMore: boolean;
-};
-
-export type SessionHistorySnapshot = {
-  history: PaginatedSessionHistory;
-  rawTranscriptSeq: number;
-};
-
-type SessionHistoryTranscriptTarget = {
-  sessionId: string;
-  storePath?: string;
-  sessionFile?: string;
-};
-
-function resolveCursorSeq(cursor: string | undefined): number | undefined {
-  if (!cursor) {
-    return undefined;
-  }
-  const normalized = cursor.startsWith("seq:") ? cursor.slice(4) : cursor;
-  const value = Number.parseInt(normalized, 10);
-  return Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-function toSessionHistoryMessages(messages: unknown[]): SessionHistoryMessage[] {
-  return messages.filter(
-    (message): message is SessionHistoryMessage =>
-      Boolean(message) && typeof message === "object" && !Array.isArray(message),
-  );
-}
-
-function buildPaginatedSessionHistory(params: {
-  messages: SessionHistoryMessage[];
-  hasMore: boolean;
-  nextCursor?: string;
-}): PaginatedSessionHistory {
-  return {
-    items: params.messages,
-    messages: params.messages,
-    hasMore: params.hasMore,
-    ...(params.nextCursor ? { nextCursor: params.nextCursor } : {}),
-  };
-}
-
-export function resolveMessageSeq(message: SessionHistoryMessage | undefined): number | undefined {
-  const seq = message?.__openclaw?.seq;
-  return typeof seq === "number" && Number.isFinite(seq) && seq > 0 ? seq : undefined;
-}
-
-export function paginateSessionMessages(
-  messages: SessionHistoryMessage[],
-  limit: number | undefined,
-  cursor: string | undefined,
-): PaginatedSessionHistory {
-  const cursorSeq = resolveCursorSeq(cursor);
-  let endExclusive = messages.length;
-  if (typeof cursorSeq === "number") {
-    endExclusive = messages.findIndex((message, index) => {
-      const seq = resolveMessageSeq(message);
-      if (typeof seq === "number") {
-        return seq >= cursorSeq;
-      }
-      return index + 1 >= cursorSeq;
+export async function readSessionHistorySnapshotAsync(
+  params: SessionHistoryReadParams,
+): Promise<SessionHistorySnapshot> {
+  const memory = captureSessionActorTranscriptRead(params.target);
+  if (memory) {
+    const snapshot = await readSessionHistorySnapshotKernel(params, {
+      readers: createSessionActorTranscriptReader(memory),
+      readOnly: true,
+      resolveCurrentUserProfileDisplay,
+      resolveCronJobName: () => undefined,
     });
-    if (endExclusive < 0) {
-      endExclusive = messages.length;
-    }
+    const resolveCronJobName = await prepareForwardedMessageCronJobNameResolver(
+      snapshot.history.messages,
+    );
+    const messages = projectForwardedMessages(snapshot.history.messages, resolveCronJobName);
+    memory.assertCurrent();
+    return { ...snapshot, history: { ...snapshot.history, items: messages, messages } };
   }
-  const start = typeof limit === "number" && limit > 0 ? Math.max(0, endExclusive - limit) : 0;
-  const paginatedMessages = messages.slice(start, endExclusive);
-  const firstSeq = resolveMessageSeq(paginatedMessages[0]);
-  return buildPaginatedSessionHistory({
-    messages: paginatedMessages,
-    hasMore: start > 0,
-    ...(start > 0 && typeof firstSeq === "number" ? { nextCursor: String(firstSeq) } : {}),
+  if (
+    !params.target.storePath ||
+    params.target.sessionEntry?.incognito ||
+    isIncognitoSessionKey(params.target.sessionKey)
+  ) {
+    const snapshot = await readSessionHistorySnapshotKernel(params, {
+      readers: sessionTranscriptReaders,
+      resolveCurrentUserProfileDisplay,
+      // Match the worker projection: install current names on the completed page below.
+      resolveCronJobName: () => undefined,
+    });
+    const resolveCronJobName = await prepareForwardedMessageCronJobNameResolver(
+      snapshot.history.messages,
+    );
+    const messages = projectForwardedMessages(snapshot.history.messages, resolveCronJobName);
+    return { ...snapshot, history: { ...snapshot.history, items: messages, messages } };
+  }
+  const { readSessionHistoryPageInWorker } =
+    await import("../config/sessions/session-history-worker-runtime.js");
+  const entry = params.target.sessionEntry;
+  const snapshot = await readSessionHistoryPageInWorker({
+    kind: "http",
+    params: {
+      ...params,
+      target: {
+        ...params.target,
+        sessionEntry: entry
+          ? {
+              sessionId: entry.sessionId,
+              updatedAt: entry.updatedAt,
+              sessionStartedAt: entry.sessionStartedAt,
+            }
+          : undefined,
+      },
+    },
   });
-}
-
-export function buildSessionHistorySnapshot(params: {
-  rawMessages: unknown[];
-  maxChars?: number;
-  limit?: number;
-  cursor?: string;
-}): SessionHistorySnapshot {
-  const history = paginateSessionMessages(
-    toSessionHistoryMessages(
-      sanitizeChatHistoryMessages(
-        params.rawMessages,
-        params.maxChars ?? DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
-      ),
-    ),
-    params.limit,
-    params.cursor,
+  const resolveCronJobName = await prepareForwardedMessageCronJobNameResolver(
+    snapshot.history.messages,
   );
-  const rawHistoryMessages = toSessionHistoryMessages(params.rawMessages);
-  return {
-    history,
-    rawTranscriptSeq: resolveMessageSeq(rawHistoryMessages.at(-1)) ?? rawHistoryMessages.length,
-  };
+  const project = createCurrentUserProfileMessageProjector(resolveCurrentUserProfileDisplay);
+  const messages = projectForwardedMessages(snapshot.history.messages, resolveCronJobName).map(
+    project,
+  );
+  return { ...snapshot, history: { ...snapshot.history, items: messages, messages } };
 }
 
+/** Tracks session-history SSE state and decides when inline appends are still valid. */
 export class SessionHistorySseState {
   private readonly target: SessionHistoryTranscriptTarget;
   private readonly maxChars: number;
   private readonly limit: number | undefined;
-  private readonly cursor: string | undefined;
+  private cursor: string | undefined;
   private sentHistory: PaginatedSessionHistory;
   private rawTranscriptSeq: number;
+  private turnBoundaryPending: boolean;
+  private assistantErrorPending: boolean;
+  private transcriptPath: string | undefined;
 
-  static fromRawSnapshot(params: {
-    target: SessionHistoryTranscriptTarget;
-    rawMessages: unknown[];
-    maxChars?: number;
-    limit?: number;
-    cursor?: string;
-  }): SessionHistorySseState {
-    return new SessionHistorySseState({
-      target: params.target,
-      maxChars: params.maxChars,
-      limit: params.limit,
-      cursor: params.cursor,
-      initialRawMessages: params.rawMessages,
-    });
+  static fromSnapshot(
+    params: SessionHistoryReadParams & {
+      snapshot: SessionHistorySnapshot;
+    },
+  ): SessionHistorySseState {
+    return new SessionHistorySseState(params);
   }
 
-  constructor(params: {
-    target: SessionHistoryTranscriptTarget;
-    maxChars?: number;
-    limit?: number;
-    cursor?: string;
-    initialRawMessages?: unknown[];
-  }) {
+  private constructor(
+    params: SessionHistoryReadParams & {
+      snapshot: SessionHistorySnapshot;
+    },
+  ) {
     this.target = params.target;
     this.maxChars = params.maxChars ?? DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS;
     this.limit = params.limit;
-    this.cursor = params.cursor;
-    const rawMessages = params.initialRawMessages ?? this.readRawMessages();
-    const snapshot = buildSessionHistorySnapshot({
-      rawMessages,
-      maxChars: this.maxChars,
-      limit: this.limit,
-      cursor: this.cursor,
-    });
+    const snapshot = params.snapshot;
+    this.cursor = snapshot.history.windowReset ? undefined : params.cursor;
     this.sentHistory = snapshot.history;
     this.rawTranscriptSeq = snapshot.rawTranscriptSeq;
+    this.turnBoundaryPending = snapshot.turnBoundaryPending;
+    this.assistantErrorPending = snapshot.assistantErrorPending;
+    this.transcriptPath = resolveTranscriptPathForComparison(snapshot.transcriptPath);
   }
 
   snapshot(): PaginatedSessionHistory {
     return this.sentHistory;
   }
 
-  appendInlineMessage(update: {
+  retainRecentMessages(maxMessages: number): PaginatedSessionHistory {
+    if (this.sentHistory.messages.length <= maxMessages) {
+      return this.snapshot();
+    }
+
+    const messages = this.sentHistory.messages.slice(-maxMessages);
+    const firstSeq = resolveMessageSeq(messages[0]);
+    this.sentHistory = buildPaginatedSessionHistory({
+      messages,
+      hasMore: true,
+      ...(firstSeq !== undefined ? { nextCursor: String(firstSeq) } : {}),
+    });
+    return this.snapshot();
+  }
+
+  async prepareInlineMessage(update: {
     message: unknown;
     messageId?: string;
-  }): { message: unknown; messageSeq?: number } | null {
+    messageSeq?: number;
+  }): Promise<() => InlineSessionHistoryAppend | null> {
     if (this.limit !== undefined || this.cursor !== undefined) {
-      return null;
+      return () => null;
     }
-    this.rawTranscriptSeq += 1;
-    const nextMessage = attachOpenClawTranscriptMeta(update.message, {
+    const carriedSeq = asPositiveSafeInteger(update.messageSeq);
+    if (carriedSeq !== undefined && carriedSeq <= this.rawTranscriptSeq) {
+      return () => ({ shouldRefresh: true });
+    }
+    const messageSeq = carriedSeq ?? this.rawTranscriptSeq + 1;
+    const idempotencyKey = readTranscriptMessageIdempotencyKey(update.message);
+    const message = attachOpenClawTranscriptMeta(update.message, {
       ...(typeof update.messageId === "string" ? { id: update.messageId } : {}),
-      seq: this.rawTranscriptSeq,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+      seq: messageSeq,
     });
-    const sanitized = sanitizeChatHistoryMessages([nextMessage], this.maxChars);
-    if (sanitized.length === 0) {
-      return null;
+    const memory = captureSessionActorTranscriptRead(this.target);
+    const readers = memory && createSessionActorTranscriptReader(memory);
+    let subagentCoordination: SubagentCoordinationDisplayResolver | undefined;
+    const lookup = readSessionHistorySubagentLookup(message);
+    if (readers && lookup) {
+      await readers.prepareVisibility([message]);
+      subagentCoordination = readers.subagentCoordination;
     }
-    const [sanitizedMessage] = toSessionHistoryMessages(sanitized);
-    if (!sanitizedMessage) {
-      return null;
+    if (
+      lookup &&
+      this.target.storePath &&
+      !this.target.sessionEntry?.incognito &&
+      !isIncognitoSessionKey(this.target.sessionKey)
+    ) {
+      const { readSessionHistoryPageInWorker } =
+        await import("../config/sessions/session-history-worker-runtime.js");
+      const prepared = await readSessionHistoryPageInWorker({
+        kind: "inline-visibility",
+        params: { target: this.target, lookup },
+      });
+      subagentCoordination = createPreparedSessionHistorySubagentProjection(
+        prepared.subagentCoordination,
+        prepared.assertCurrent,
+      );
     }
-    const nextMessages = [...this.sentHistory.messages, sanitizedMessage];
-    this.sentHistory = buildPaginatedSessionHistory({
-      messages: nextMessages,
-      hasMore: false,
-    });
-    return {
-      message: sanitizedMessage,
-      messageSeq: resolveMessageSeq(sanitizedMessage),
+    const resolveCronJobName = await prepareForwardedMessageCronJobNameResolver([
+      ...this.sentHistory.messages,
+      message,
+    ]);
+    // The stream queue retains ordering; its publisher reauthorizes before applying this transition.
+    return () => {
+      memory?.assertCurrent();
+      return this.appendInlineMessage(
+        message,
+        messageSeq,
+        subagentCoordination,
+        resolveCronJobName,
+      );
     };
   }
 
-  refresh(): PaginatedSessionHistory {
-    const snapshot = buildSessionHistorySnapshot({
-      rawMessages: this.readRawMessages(),
+  private appendInlineMessage(
+    message: unknown,
+    messageSeq: number,
+    subagentCoordination: SubagentCoordinationDisplayResolver | undefined,
+    resolveCronJobName: (jobId: string) => string | undefined,
+  ): InlineSessionHistoryAppend | null {
+    subagentCoordination?.assertCurrent?.();
+    const hadPendingTurnBoundary = this.turnBoundaryPending;
+    const nextMessage = createSubagentCoordinationHistoryProjection(subagentCoordination)([
+      message,
+    ])[0];
+    const nextProjection = projectChatDisplayMessagesWithState([nextMessage], {
+      includeCommentaryFallbacks: true,
+      maxChars: this.maxChars,
+      turnBoundaryPending: hadPendingTurnBoundary,
+      assistantErrorPending: this.assistantErrorPending,
+      resolveCronJobName,
+    });
+    // Projection can split, drop, or rewrite raw transcript messages. When one
+    // raw append changes multiple visible rows, callers must refresh instead of
+    // emitting a misleading single SSE item.
+    const projectedMessages = projectChatDisplayMessages(
+      [...this.sentHistory.messages, nextMessage],
+      {
+        includeCommentaryFallbacks: true,
+        maxChars: this.maxChars,
+        resolveCurrentUserProfileDisplay,
+        resolveCronJobName,
+      },
+    );
+    subagentCoordination?.assertCurrent?.();
+    this.rawTranscriptSeq = messageSeq;
+    this.turnBoundaryPending = nextProjection.turnBoundaryPending;
+    this.assistantErrorPending = nextProjection.assistantErrorPending;
+    if (nextProjection.assistantErrorRecoveryObserved) {
+      // Keep only the pending bit here: retaining raw transcript context would
+      // undo the bounded SSE memory contract. The caller rereads canonical
+      // history so full projection can remove the already-emitted placeholder.
+      return { shouldRefresh: true };
+    }
+    const projectedPrefix = projectedMessages.slice(0, this.sentHistory.messages.length);
+    // A rewritten prefix needs a full refresh; only an unchanged prefix can append inline.
+    if (
+      projectedMessages.length > this.sentHistory.messages.length &&
+      isDeepStrictEqual(projectedPrefix, this.sentHistory.messages)
+    ) {
+      const addedMessages = projectedMessages.slice(this.sentHistory.messages.length);
+      // The full projection no longer contains the hidden input that armed the
+      // boundary. Copy the flag only when this append itself carried it.
+      // A visible user consumes the flag without carrying it.
+      const attachedPendingBoundary = nextProjection.messages.some(
+        (projected) => asOptionalRecord(projected["__openclaw"])?.turnBoundary === true,
+      );
+      if (attachedPendingBoundary) {
+        const firstAdded = attachOpenClawTranscriptMeta(addedMessages[0], {
+          turnBoundary: true,
+        }) as SessionHistoryMessage;
+        addedMessages[0] = firstAdded;
+        projectedMessages[this.sentHistory.messages.length] = firstAdded;
+      }
+      if (addedMessages.length === 1) {
+        const projectedMessage = expectDefined(addedMessages[0], "projected inline message");
+        const emittedMessage: SessionHistoryMessage =
+          resolveMessageSeq(projectedMessage) === undefined
+            ? (attachOpenClawTranscriptMeta(projectedMessage, {
+                seq: this.rawTranscriptSeq,
+              }) as SessionHistoryMessage)
+            : projectedMessage;
+        this.sentHistory = buildPaginatedSessionHistory({
+          messages: [...this.sentHistory.messages, emittedMessage],
+          hasMore: false,
+        });
+        return { message: emittedMessage, messageSeq: resolveMessageSeq(emittedMessage) };
+      }
+    }
+    if (
+      nextProjection.messages.length === 0 &&
+      isDeepStrictEqual(projectedMessages, this.sentHistory.messages)
+    ) {
+      return null;
+    }
+    this.sentHistory = buildPaginatedSessionHistory({
+      messages: projectedMessages,
+      hasMore: false,
+    });
+    return { shouldRefresh: true };
+  }
+
+  shouldRefreshForTranscriptPath(updatePath: string | undefined): boolean {
+    const nextPath = resolveTranscriptPathForComparison(updatePath);
+    return Boolean(this.transcriptPath && nextPath && this.transcriptPath !== nextPath);
+  }
+
+  async refreshAsync(): Promise<PaginatedSessionHistory> {
+    const snapshot = await readSessionHistorySnapshotAsync({
+      target: this.target,
       maxChars: this.maxChars,
       limit: this.limit,
       cursor: this.cursor,
     });
+    if (snapshot.history.windowReset) {
+      this.cursor = undefined;
+    }
     this.rawTranscriptSeq = snapshot.rawTranscriptSeq;
+    this.turnBoundaryPending = snapshot.turnBoundaryPending;
+    this.assistantErrorPending = snapshot.assistantErrorPending;
+    this.transcriptPath = resolveTranscriptPathForComparison(snapshot.transcriptPath);
     this.sentHistory = snapshot.history;
     return snapshot.history;
-  }
-
-  private readRawMessages(): unknown[] {
-    return readSessionMessages(
-      this.target.sessionId,
-      this.target.storePath,
-      this.target.sessionFile,
-    );
   }
 }

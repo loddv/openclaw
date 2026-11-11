@@ -1,10 +1,16 @@
 import { listChannelCatalogEntries } from "../../plugins/channel-catalog-registry.js";
+import type { PluginDiscoveryResult } from "../../plugins/discovery.js";
 
-let bundledChannelPluginIds: string[] | null = null;
-
-export function listBundledChannelPluginIds(): string[] {
-  bundledChannelPluginIds ??= listChannelCatalogEntries({ origin: "bundled" })
-    .map((entry) => entry.pluginId)
+export function listBundledChannelIds(
+  env: NodeJS.ProcessEnv = process.env,
+  discovery?: PluginDiscoveryResult,
+): string[] {
+  return listChannelCatalogEntries({
+    origin: "bundled",
+    env,
+    discovery,
+  })
+    .map((entry) => entry.channel.id)
+    .filter((channelId): channelId is string => Boolean(channelId))
     .toSorted((left, right) => left.localeCompare(right));
-  return [...bundledChannelPluginIds];
 }

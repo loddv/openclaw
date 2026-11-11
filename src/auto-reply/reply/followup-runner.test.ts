@@ -1,1325 +1,722 @@
-import fs from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../../config/config.js";
-import type { SessionEntry } from "../../config/sessions/types.js";
-import type { FollowupRun, QueueSettings } from "./queue.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import { createAdmittedRunOperatorAuthority } from "../../agents/admitted-run-context.js";
+import {
+  resolveSessionTranscriptReadFence,
+  runWithSessionTranscriptReadFence,
+} from "../../config/sessions/session-transcript-read-fence.js";
+import { createChatSendLateFollowupDisposition } from "../../gateway/server-methods/chat-send-late-followup.js";
+import {
+  getPluginRuntimeGatewayRequestScope,
+  withPluginRuntimeGatewayRequestScope,
+} from "../../plugins/runtime/gateway-request-scope.js";
+import { getReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-payload.js";
+import type { ReplyPayload } from "../types.js";
+import type { FollowupExecutionResult } from "./followup-turn-execution.js";
+import type { FollowupRun } from "./queue.js";
+import type { QueuedFollowupReplyBatch } from "./queue/types.js";
+import type { AdmittedFollowupTurn } from "./reply-agent-turn-preparation.js";
+import { createMockTypingController } from "./test-helpers.js";
 
-const runEmbeddedPiAgentMock = vi.fn();
-const compactEmbeddedPiSessionMock = vi.fn();
-const routeReplyMock = vi.fn();
-const isRoutableChannelMock = vi.fn();
-const runPreflightCompactionIfNeededMock = vi.fn();
-const resolveCommandSecretRefsViaGatewayMock = vi.fn();
-let createFollowupRunner: typeof import("./followup-runner.js").createFollowupRunner;
-let clearRuntimeConfigSnapshot: typeof import("../../config/config.js").clearRuntimeConfigSnapshot;
-let loadSessionStore: typeof import("../../config/sessions/store.js").loadSessionStore;
-let saveSessionStore: typeof import("../../config/sessions/store.js").saveSessionStore;
-let clearSessionStoreCacheForTest: typeof import("../../config/sessions/store.js").clearSessionStoreCacheForTest;
-let clearFollowupQueue: typeof import("./queue.js").clearFollowupQueue;
-let enqueueFollowupRun: typeof import("./queue.js").enqueueFollowupRun;
-let sessionRunAccounting: typeof import("./session-run-accounting.js");
-let setRuntimeConfigSnapshot: typeof import("../../config/config.js").setRuntimeConfigSnapshot;
-let createMockFollowupRun: typeof import("./test-helpers.js").createMockFollowupRun;
-let createMockTypingController: typeof import("./test-helpers.js").createMockTypingController;
-const FOLLOWUP_DEBUG = process.env.OPENCLAW_DEBUG_FOLLOWUP_RUNNER_TEST === "1";
-const FOLLOWUP_TEST_QUEUES = new Map<
-  string,
-  {
-    items: FollowupRun[];
-    lastRun?: FollowupRun["run"];
-  }
->();
-const FOLLOWUP_TEST_SESSION_STORES = new Map<string, Record<string, SessionEntry>>();
+const state = vi.hoisted(() => ({
+  account: vi.fn(),
+  admit: vi.fn(),
+  completeLifecycle: vi.fn(),
+  completedSourceDelivery: false,
+  deliver: vi.fn(),
+  execute: vi.fn(),
+  resolveDecision: vi.fn(),
+}));
 
-function debugFollowupTest(message: string): void {
-  if (!FOLLOWUP_DEBUG) {
-    return;
-  }
-  process.stderr.write(`[followup-runner.test] ${message}\n`);
+vi.mock("../../agents/embedded-agent-runner/delivery-evidence.js", () => ({
+  hasCompletedSourceReplyDeliveryEvidence: () => state.completedSourceDelivery,
+}));
+
+vi.mock("./agent-runner-result-accounting.js", () => ({
+  accountFollowupTurn: (...args: unknown[]) => state.account(...args),
+}));
+
+vi.mock("./reply-agent-turn-preparation.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./reply-agent-turn-preparation.js")>()),
+  prepareReplyAgentTurn: (...args: unknown[]) => state.admit(...args),
+}));
+
+// mock-isolation: Presentation tests use synthetic operations; real owner admission is
+// exercised by followup-runner.queue-custody.test.ts through the production runner.
+vi.mock("./reply-turn-admission-lifecycle.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./reply-turn-admission-lifecycle.js")>()),
+  runWithReplyOperationLifecycleAdmission: async (
+    _operation: unknown,
+    run: () => Promise<unknown>,
+  ) => await run(),
+}));
+
+vi.mock("./followup-turn-execution.js", () => ({
+  executeFollowupTurn: (...args: unknown[]) => state.execute(...args),
+}));
+
+vi.mock("./followup-delivery.js", () => ({
+  deliverFollowupDecision: (...args: unknown[]) => state.deliver(...args),
+  resolveFollowupDeliveryDecision: (...args: unknown[]) => state.resolveDecision(...args),
+}));
+
+vi.mock("./queue.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./queue.js")>()),
+  completeFollowupRunLifecycle: (...args: unknown[]) => state.completeLifecycle(...args),
+}));
+
+vi.mock("../../runtime.js", () => ({ defaultRuntime: { error: vi.fn() } }));
+
+const { createFollowupRunner } = await import("./followup-runner.js");
+let turn: ReturnType<typeof createTurn>;
+let typing: ReturnType<typeof createMockTypingController>;
+
+function createRunner(overrides: Partial<Parameters<typeof createFollowupRunner>[0]> = {}) {
+  return createFollowupRunner({
+    typing,
+    typingMode: "never",
+    defaultModel: "claude",
+    ...overrides,
+  });
 }
 
-function registerFollowupTestSessionStore(
-  storePath: string,
-  sessionStore: Record<string, SessionEntry>,
-): void {
-  FOLLOWUP_TEST_SESSION_STORES.set(storePath, sessionStore);
+function admitTurn(admitted: ReturnType<typeof createTurn>, execution = createSettledExecution()) {
+  state.admit.mockResolvedValue({ kind: "admitted", turn: admitted });
+  state.execute.mockResolvedValue(execution);
 }
 
-async function incrementRunCompactionCountForFollowupTest(
-  params: Parameters<typeof import("./session-run-accounting.js").incrementRunCompactionCount>[0],
-): Promise<number | undefined> {
-  const {
-    sessionStore,
-    sessionKey,
-    sessionEntry,
-    amount = 1,
-    newSessionId,
-    lastCallUsage,
-  } = params;
-  if (!sessionStore || !sessionKey) {
-    return undefined;
-  }
-  const entry = sessionStore[sessionKey] ?? sessionEntry;
-  if (!entry) {
-    return undefined;
-  }
+function attachSource(source: ReturnType<typeof createTurn>) {
+  const deliver = vi.fn(async () => {});
+  source.queued.queuedFollowupReplyDisposition = { kind: "deliver", deliver };
+  return deliver;
+}
 
-  const nextCount = Math.max(0, entry.compactionCount ?? 0) + Math.max(0, amount);
-  const nextEntry: SessionEntry = {
-    ...entry,
-    compactionCount: nextCount,
-    updatedAt: Date.now(),
+function expectTypingComplete() {
+  expect(typing.markRunComplete).toHaveBeenCalledOnce();
+  expect(typing.markDispatchIdle).toHaveBeenCalledOnce();
+}
+
+function createQueuedRun(overrides: Partial<FollowupRun> = {}): FollowupRun {
+  return {
+    prompt: "queued prompt",
+    enqueuedAt: 1,
+    run: {
+      agentId: "agent",
+      agentDir: "/tmp/agent",
+      sessionId: "session",
+      sessionKey: "main",
+      sessionFile: "/tmp/session.jsonl",
+      workspaceDir: "/tmp",
+      config: {},
+      provider: "anthropic",
+      model: "claude",
+      timeoutMs: 1_000,
+      blockReplyBreak: "message_end",
+    },
+    ...overrides,
   };
-  if (newSessionId && newSessionId !== entry.sessionId) {
-    nextEntry.sessionId = newSessionId;
-    if (entry.sessionFile?.trim()) {
-      nextEntry.sessionFile = path.join(path.dirname(entry.sessionFile), `${newSessionId}.jsonl`);
-    }
-  }
-  const promptTokens =
-    (lastCallUsage?.input ?? 0) +
-    (lastCallUsage?.cacheRead ?? 0) +
-    (lastCallUsage?.cacheWrite ?? 0);
-  if (promptTokens > 0) {
-    nextEntry.totalTokens = promptTokens;
-    nextEntry.totalTokensFresh = true;
-    nextEntry.inputTokens = undefined;
-    nextEntry.outputTokens = undefined;
-    nextEntry.cacheRead = undefined;
-    nextEntry.cacheWrite = undefined;
-  }
-
-  sessionStore[sessionKey] = nextEntry;
-  if (sessionEntry) {
-    Object.assign(sessionEntry, nextEntry);
-  }
-  return nextCount;
 }
 
-function getFollowupTestQueue(key: string): {
-  items: FollowupRun[];
-  lastRun?: FollowupRun["run"];
-} {
-  const cleaned = key.trim();
-  const existing = FOLLOWUP_TEST_QUEUES.get(cleaned);
-  if (existing) {
-    return existing;
-  }
-  const created = {
-    items: [] as FollowupRun[],
-    lastRun: undefined as FollowupRun["run"] | undefined,
+function createTurn(
+  order: string[] = [],
+  result: AdmittedFollowupTurn["operation"]["result"] = null,
+) {
+  const operation = {
+    result,
+    complete: vi.fn(() => order.push("operation-complete")),
+    fail: vi.fn(() => order.push("operation-failed")),
   };
-  FOLLOWUP_TEST_QUEUES.set(cleaned, created);
-  return created;
+  return {
+    runId: "run-1",
+    queued: createQueuedRun(),
+    operation,
+    config: {},
+    session: {
+      kind: "session",
+      key: "main",
+      current: () => undefined,
+      publish: vi.fn(),
+    },
+    sendPolicy: "allow",
+    preflightCompactionApplied: false,
+  } as unknown as AdmittedFollowupTurn & { operation: typeof operation };
 }
 
-function clearFollowupQueueForFollowupTest(key: string): number {
-  const cleaned = key.trim();
-  const queue = FOLLOWUP_TEST_QUEUES.get(cleaned);
-  if (!queue) {
-    return 0;
-  }
-  const cleared = queue.items.length;
-  FOLLOWUP_TEST_QUEUES.delete(cleaned);
-  return cleared;
+function createRejectedExecution(order: string[] = []): FollowupExecutionResult {
+  return {
+    commentaryPayloadsEnabled: false,
+    execution: {
+      runId: "run-1",
+      outcome: { kind: "rejected", payload: { text: "failed" } },
+    },
+    runStartedAt: 1,
+    sessionCtx: {},
+    pendingToolTasks: new Set(),
+    progress: {
+      drain: vi.fn(async () => {
+        order.push("progress-drained");
+      }),
+    },
+  } as FollowupExecutionResult;
 }
 
-function enqueueFollowupRunForFollowupTest(key: string, run: FollowupRun): boolean {
-  const queue = getFollowupTestQueue(key);
-  queue.items.push(run);
-  queue.lastRun = run.run;
-  return true;
-}
-
-function refreshQueuedFollowupSessionForFollowupTest(params: {
-  key: string;
-  previousSessionId?: string;
-  nextSessionId?: string;
-  nextSessionFile?: string;
-  nextProvider?: string;
-  nextModel?: string;
-  nextAuthProfileId?: string;
-  nextAuthProfileIdSource?: "auto" | "user";
-}): void {
-  const cleaned = params.key.trim();
-  if (!cleaned) {
-    return;
-  }
-  const queue = FOLLOWUP_TEST_QUEUES.get(cleaned);
-  if (!queue) {
-    return;
-  }
-  const shouldRewriteSession =
-    Boolean(params.previousSessionId) &&
-    Boolean(params.nextSessionId) &&
-    params.previousSessionId !== params.nextSessionId;
-  const shouldRewriteSelection =
-    typeof params.nextProvider === "string" ||
-    typeof params.nextModel === "string" ||
-    Object.hasOwn(params, "nextAuthProfileId") ||
-    Object.hasOwn(params, "nextAuthProfileIdSource");
-  if (!shouldRewriteSession && !shouldRewriteSelection) {
-    return;
-  }
-  const rewrite = (run?: FollowupRun["run"]) => {
-    if (!run) {
-      return;
-    }
-    if (shouldRewriteSession && run.sessionId === params.previousSessionId) {
-      run.sessionId = params.nextSessionId!;
-      if (params.nextSessionFile?.trim()) {
-        run.sessionFile = params.nextSessionFile;
-      }
-    }
-    if (shouldRewriteSelection) {
-      if (typeof params.nextProvider === "string") {
-        run.provider = params.nextProvider;
-      }
-      if (typeof params.nextModel === "string") {
-        run.model = params.nextModel;
-      }
-      if (Object.hasOwn(params, "nextAuthProfileId")) {
-        run.authProfileId = params.nextAuthProfileId?.trim() || undefined;
-      }
-      if (Object.hasOwn(params, "nextAuthProfileIdSource")) {
-        run.authProfileIdSource = run.authProfileId ? params.nextAuthProfileIdSource : undefined;
-      }
-    }
+function createSettledExecution(): FollowupExecutionResult {
+  return {
+    ...createRejectedExecution(),
+    execution: {
+      runId: "run-1",
+      outcome: {
+        kind: "settled",
+        status: "ok",
+        result: { payloads: [], meta: { durationMs: 0 } },
+        resolved: { provider: "anthropic", model: "claude" },
+        fallback: { exhausted: false, attempts: [] },
+        autoCompactionCount: 0,
+      },
+    },
   };
-  rewrite(queue.lastRun);
-  for (const item of queue.items) {
-    rewrite(item.run);
-  }
 }
-
-async function persistRunSessionUsageForFollowupTest(
-  params: Parameters<typeof import("./session-run-accounting.js").persistRunSessionUsage>[0],
-): Promise<void> {
-  const { storePath, sessionKey } = params;
-  if (!storePath || !sessionKey) {
-    return;
-  }
-  const registeredStore = FOLLOWUP_TEST_SESSION_STORES.get(storePath);
-  const store = registeredStore ?? loadSessionStore(storePath, { skipCache: true });
-  const entry = store[sessionKey];
-  if (!entry) {
-    return;
-  }
-  const nextEntry: SessionEntry = {
-    ...entry,
-    updatedAt: Date.now(),
-    modelProvider: params.providerUsed ?? entry.modelProvider,
-    model: params.modelUsed ?? entry.model,
-    contextTokens: params.contextTokensUsed ?? entry.contextTokens,
-    systemPromptReport: params.systemPromptReport ?? entry.systemPromptReport,
-  };
-  if (params.usage) {
-    nextEntry.inputTokens = params.usage.input ?? 0;
-    nextEntry.outputTokens = params.usage.output ?? 0;
-    const cacheUsage = params.lastCallUsage ?? params.usage;
-    nextEntry.cacheRead = cacheUsage?.cacheRead ?? 0;
-    nextEntry.cacheWrite = cacheUsage?.cacheWrite ?? 0;
-  }
-  const promptTokens =
-    params.promptTokens ??
-    (params.lastCallUsage?.input ?? params.usage?.input ?? 0) +
-      (params.lastCallUsage?.cacheRead ?? params.usage?.cacheRead ?? 0) +
-      (params.lastCallUsage?.cacheWrite ?? params.usage?.cacheWrite ?? 0);
-  nextEntry.totalTokens = promptTokens > 0 ? promptTokens : undefined;
-  nextEntry.totalTokensFresh = promptTokens > 0;
-  store[sessionKey] = nextEntry;
-  if (registeredStore) {
-    return;
-  }
-  await saveSessionStore(storePath, store);
-}
-
-async function loadFreshFollowupRunnerModuleForTest() {
-  vi.resetModules();
-  vi.doUnmock("../../config/config.js");
-  vi.doMock(
-    "../../agents/model-fallback.js",
-    async () => await import("../../test-utils/model-fallback.mock.js"),
-  );
-  vi.doMock("../../agents/session-write-lock.js", () => ({
-    acquireSessionWriteLock: vi.fn(async () => ({
-      release: async () => {},
-    })),
-    resolveSessionLockMaxHoldFromTimeout: vi.fn(() => 1),
-  }));
-  vi.doMock("../../agents/pi-embedded.js", () => ({
-    abortEmbeddedPiRun: vi.fn(async () => false),
-    compactEmbeddedPiSession: (params: unknown) => compactEmbeddedPiSessionMock(params),
-    isEmbeddedPiRunActive: vi.fn(() => false),
-    isEmbeddedPiRunStreaming: vi.fn(() => false),
-    queueEmbeddedPiMessage: vi.fn(async () => undefined),
-    resolveEmbeddedSessionLane: (key: string) => `session:${key.trim() || "main"}`,
-    runEmbeddedPiAgent: (params: unknown) => runEmbeddedPiAgentMock(params),
-    waitForEmbeddedPiRunEnd: vi.fn(async () => undefined),
-  }));
-  vi.doMock("./queue.js", () => ({
-    clearFollowupQueue: clearFollowupQueueForFollowupTest,
-    enqueueFollowupRun: enqueueFollowupRunForFollowupTest,
-    refreshQueuedFollowupSession: refreshQueuedFollowupSessionForFollowupTest,
-  }));
-  vi.doMock("./session-run-accounting.js", () => ({
-    persistRunSessionUsage: persistRunSessionUsageForFollowupTest,
-    incrementRunCompactionCount: incrementRunCompactionCountForFollowupTest,
-  }));
-  vi.doMock("./agent-runner-memory.js", () => ({
-    runMemoryFlushIfNeeded: async (params: { sessionEntry?: SessionEntry }) => params.sessionEntry,
-    runPreflightCompactionIfNeeded: (...args: unknown[]) =>
-      runPreflightCompactionIfNeededMock(...args),
-  }));
-  vi.doMock("./route-reply.js", () => ({
-    isRoutableChannel: (...args: unknown[]) => isRoutableChannelMock(...args),
-    routeReply: (...args: unknown[]) => routeReplyMock(...args),
-  }));
-  vi.doMock("../../cli/command-secret-gateway.js", () => ({
-    resolveCommandSecretRefsViaGateway: (...args: unknown[]) =>
-      resolveCommandSecretRefsViaGatewayMock(...args),
-  }));
-  vi.doMock("../../cli/command-secret-targets.js", () => ({
-    getAgentRuntimeCommandSecretTargetIds: () => new Set(["skills.entries."]),
-  }));
-  ({ createFollowupRunner } = await import("./followup-runner.js"));
-  ({ clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } =
-    await import("../../config/config.js"));
-  ({ clearSessionStoreCacheForTest, loadSessionStore, saveSessionStore } =
-    await import("../../config/sessions/store.js"));
-  ({ clearFollowupQueue, enqueueFollowupRun } = await import("./queue.js"));
-  sessionRunAccounting = await import("./session-run-accounting.js");
-  ({ createMockFollowupRun, createMockTypingController } = await import("./test-helpers.js"));
-}
-
-const ROUTABLE_TEST_CHANNELS = new Set([
-  "telegram",
-  "slack",
-  "discord",
-  "signal",
-  "imessage",
-  "whatsapp",
-  "feishu",
-]);
-
-beforeAll(async () => {
-  await loadFreshFollowupRunnerModuleForTest();
-});
 
 beforeEach(() => {
-  clearRuntimeConfigSnapshot?.();
-  runEmbeddedPiAgentMock.mockReset();
-  compactEmbeddedPiSessionMock.mockReset();
-  runPreflightCompactionIfNeededMock.mockReset();
-  resolveCommandSecretRefsViaGatewayMock.mockReset();
-  runPreflightCompactionIfNeededMock.mockImplementation(
-    async (params: { sessionEntry?: SessionEntry }) => params.sessionEntry,
-  );
-  resolveCommandSecretRefsViaGatewayMock.mockImplementation(async ({ config }) => ({
-    resolvedConfig: config,
-    diagnostics: [],
-    targetStatesByPath: {},
-    hadUnresolvedTargets: false,
-  }));
-  routeReplyMock.mockReset();
-  routeReplyMock.mockResolvedValue({ ok: true });
-  isRoutableChannelMock.mockReset();
-  isRoutableChannelMock.mockImplementation((ch: string | undefined) =>
-    Boolean(ch?.trim() && ROUTABLE_TEST_CHANNELS.has(ch.trim().toLowerCase())),
-  );
-  clearFollowupQueue("main");
-  FOLLOWUP_TEST_QUEUES.clear();
-  FOLLOWUP_TEST_SESSION_STORES.clear();
+  vi.clearAllMocks();
+  turn = createTurn();
+  typing = createMockTypingController();
+  admitTurn(turn);
+  state.completedSourceDelivery = false;
+  state.account.mockResolvedValue(undefined);
+  state.resolveDecision.mockReturnValue({ kind: "suppress", reason: "silent" });
+  state.deliver.mockResolvedValue({ kind: "completed", payloads: [] });
 });
 
-afterEach(() => {
-  clearRuntimeConfigSnapshot?.();
-  clearFollowupQueue("main");
-  FOLLOWUP_TEST_QUEUES.clear();
-  FOLLOWUP_TEST_SESSION_STORES.clear();
-  vi.clearAllTimers();
-  vi.useRealTimers();
-  clearSessionStoreCacheForTest();
-  if (!FOLLOWUP_DEBUG) {
-    return;
-  }
-  const handles = (process as NodeJS.Process & { _getActiveHandles?: () => unknown[] })
-    ._getActiveHandles?.()
-    .map((handle) => handle?.constructor?.name ?? typeof handle);
-  debugFollowupTest(`active handles: ${JSON.stringify(handles ?? [])}`);
-  const requests = (process as NodeJS.Process & { _getActiveRequests?: () => unknown[] })
-    ._getActiveRequests?.()
-    .map((request) => request?.constructor?.name ?? typeof request);
-  debugFollowupTest(`active requests: ${JSON.stringify(requests ?? [])}`);
-});
+describe("createFollowupRunner", () => {
+  it.each([
+    { kind: "pending", failed: false },
+    { kind: "pending", failed: true },
+    { kind: "source-retry", failed: false },
+    { kind: "source-retry", failed: true },
+  ] as const)(
+    "distinguishes transport handoff from source retry ($kind, failed=$failed)",
+    async ({ kind, failed }) => {
+      const end = vi.fn();
+      turn.queued.deliveryCorrelations = [{ begin: () => end }];
+      state.admit.mockResolvedValue({ kind: "admitted", turn });
+      state.execute.mockResolvedValue(
+        failed ? createRejectedExecution() : createSettledExecution(),
+      );
+      state.deliver.mockResolvedValue({ kind, payloads: [] });
 
-const baseQueuedRun = (messageProvider = "whatsapp"): FollowupRun =>
-  createMockFollowupRun({ run: { messageProvider } });
+      await createRunner()(turn.queued);
 
-function createQueuedRun(
-  overrides: Partial<Omit<FollowupRun, "run">> & { run?: Partial<FollowupRun["run"]> } = {},
-): FollowupRun {
-  return createMockFollowupRun(overrides);
-}
-
-async function normalizeComparablePath(filePath: string): Promise<string> {
-  const parent = await fs.realpath(path.dirname(filePath)).catch(() => path.dirname(filePath));
-  return path.join(parent, path.basename(filePath));
-}
-
-function mockCompactionRun(params: {
-  willRetry: boolean;
-  result: {
-    payloads: Array<{ text: string }>;
-    meta: Record<string, unknown>;
-  };
-}) {
-  runEmbeddedPiAgentMock.mockImplementationOnce(
-    async (args: {
-      onAgentEvent?: (evt: { stream: string; data: Record<string, unknown> }) => void;
-    }) => {
-      args.onAgentEvent?.({
-        stream: "compaction",
-        data: { phase: "end", willRetry: params.willRetry, completed: true },
-      });
-      return params.result;
+      expect(end).toHaveBeenCalledExactlyOnceWith(
+        kind === "source-retry" && !failed
+          ? undefined
+          : {
+              visibleReplySent: false,
+              failed,
+              completed: !failed,
+              ...(kind === "pending" ? { transportPending: true } : {}),
+            },
+      );
     },
   );
-}
 
-function createAsyncReplySpy() {
-  return vi.fn(async () => {});
-}
-
-describe("createFollowupRunner runtime config", () => {
-  it("uses the active runtime snapshot for queued embedded followup runs", async () => {
-    const sourceConfig: OpenClawConfig = {
-      models: {
-        providers: {
-          openai: {
-            baseUrl: "https://api.openai.com/v1",
-            apiKey: {
-              source: "env",
-              provider: "default",
-              id: "OPENAI_API_KEY",
-            },
-            models: [],
-          },
-        },
-      },
-    };
-    const runtimeConfig: OpenClawConfig = {
-      models: {
-        providers: {
-          openai: {
-            baseUrl: "https://api.openai.com/v1",
-            apiKey: "resolved-runtime-key",
-            models: [],
-          },
-        },
-      },
-    };
-    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [],
-      meta: {},
-    });
-
-    const runner = createFollowupRunner({
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      defaultModel: "openai/gpt-5.4",
-    });
-
-    await runner(
-      createQueuedRun({
-        run: {
-          config: sourceConfig,
-          provider: "openai",
-          model: "gpt-5.4",
-        },
-      }),
-    );
-
-    const call = runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0] as
-      | {
-          config?: unknown;
-        }
-      | undefined;
-    expect(call?.config).toBe(runtimeConfig);
-  });
-
-  it("resolves queued embedded followups before preflight helpers read config", async () => {
-    const sourceConfig: OpenClawConfig = {
-      skills: {
-        entries: {
-          whisper: {
-            apiKey: {
-              source: "env",
-              provider: "default",
-              id: "OPENAI_API_KEY",
-            },
-          },
-        },
-      },
-    };
-    const runtimeConfig: OpenClawConfig = {
-      skills: {
-        entries: {
-          whisper: {
-            apiKey: "resolved-runtime-key",
-          },
-        },
-      },
-    };
-    resolveCommandSecretRefsViaGatewayMock.mockResolvedValueOnce({
-      resolvedConfig: runtimeConfig,
-      diagnostics: [],
-      targetStatesByPath: { "skills.entries.whisper.apiKey": "resolved_local" },
-      hadUnresolvedTargets: false,
-    });
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [],
-      meta: {},
-    });
-
-    const runner = createFollowupRunner({
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      defaultModel: "openai/gpt-5.4",
-    });
-    const queued = createQueuedRun({
-      run: {
-        config: sourceConfig,
-        provider: "openai",
-        model: "gpt-5.4",
-      },
-    });
-
-    await runner(queued);
-
-    expect(queued.run.config).toBe(runtimeConfig);
-    expect(runPreflightCompactionIfNeededMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cfg: runtimeConfig,
-      }),
-    );
-    const call = runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0] as
-      | {
-          config?: unknown;
-        }
-      | undefined;
-    expect(call?.config).toBe(runtimeConfig);
-  });
-});
-
-describe("createFollowupRunner compaction", () => {
-  it("adds verbose auto-compaction notice and tracks count", async () => {
-    const storePath = path.join(
-      await fs.mkdtemp(path.join(tmpdir(), "openclaw-compaction-")),
-      "sessions.json",
-    );
-    const sessionEntry: SessionEntry = {
+  it("reads the current transcript without borrowing the interrupted turn's admission fence", async () => {
+    const admission = {
+      agentId: "agent",
       sessionId: "session",
-      updatedAt: Date.now(),
-    };
-    const sessionStore: Record<string, SessionEntry> = {
-      main: sessionEntry,
-    };
-    const onBlockReply = vi.fn(async () => {});
-    registerFollowupTestSessionStore(storePath, sessionStore);
-
-    mockCompactionRun({
-      willRetry: true,
-      result: { payloads: [{ text: "final" }], meta: {} },
-    });
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      sessionEntry,
-      sessionStore,
       sessionKey: "main",
-      storePath,
-      defaultModel: "anthropic/claude-opus-4-6",
+      storePath: "/tmp/store",
+      generation: "generation",
+      entryId: "interrupted-user-message",
+      rawSeq: 1,
+      effectiveParentId: null,
+      activeMessagePosition: 1,
+      logicalTurnId: "interrupted-turn",
+      role: "user" as const,
+    };
+    state.admit.mockImplementation(async () => {
+      expect(resolveSessionTranscriptReadFence(admission)).toBeUndefined();
+      return { kind: "admitted", turn };
     });
-
-    const queued = createQueuedRun({
-      run: {
-        verboseLevel: "on",
-      },
+    state.execute.mockImplementation(async () => {
+      await Promise.resolve();
+      expect(resolveSessionTranscriptReadFence(admission)).toBeUndefined();
+      return createSettledExecution();
     });
-
-    await runner(queued);
-
-    expect(onBlockReply).toHaveBeenCalled();
-    const firstCall = (onBlockReply.mock.calls as unknown as Array<Array<{ text?: string }>>)[0];
-    expect(firstCall?.[0]?.text).toContain("Auto-compaction complete");
-    expect(sessionStore.main.compactionCount).toBe(1);
+    await runWithSessionTranscriptReadFence(admission, async () => {
+      await createRunner()(turn.queued);
+      expect(resolveSessionTranscriptReadFence(admission)).toBe(admission);
+    });
   });
 
-  it("tracks auto-compaction from embedded result metadata even when no compaction event is emitted", async () => {
-    const storePath = path.join(
-      await fs.mkdtemp(path.join(tmpdir(), "openclaw-compaction-meta-")),
-      "sessions.json",
-    );
-    const sessionEntry: SessionEntry = {
-      sessionId: "session",
-      sessionFile: path.join(path.dirname(storePath), "session.jsonl"),
-      updatedAt: Date.now(),
-    };
-    const sessionStore: Record<string, SessionEntry> = {
-      main: sessionEntry,
-    };
-    const onBlockReply = vi.fn(async () => {});
-    registerFollowupTestSessionStore(storePath, sessionStore);
-
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "final" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session-rotated",
-          compactionCount: 2,
-          lastCallUsage: { input: 10_000, output: 3_000, total: 13_000 },
-        },
-      },
-    });
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      sessionEntry,
-      sessionStore,
-      sessionKey: "main",
-      storePath,
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    const queued = createQueuedRun({
-      run: {
-        verboseLevel: "on",
-      },
-    });
-
-    await runner(queued);
-
-    expect(onBlockReply).toHaveBeenCalled();
-    const firstCall = (onBlockReply.mock.calls as unknown as Array<Array<{ text?: string }>>)[0];
-    expect(firstCall?.[0]?.text).toContain("Auto-compaction complete");
-    expect(sessionStore.main.compactionCount).toBe(2);
-    expect(sessionStore.main.sessionId).toBe("session-rotated");
-    expect(await normalizeComparablePath(sessionStore.main.sessionFile ?? "")).toBe(
-      await normalizeComparablePath(path.join(path.dirname(storePath), "session-rotated.jsonl")),
-    );
-  });
-
-  it("refreshes queued followup runs to the rotated transcript", async () => {
-    const storePath = path.join(
-      await fs.mkdtemp(path.join(tmpdir(), "openclaw-compaction-queue-")),
-      "sessions.json",
-    );
-    const sessionEntry: SessionEntry = {
-      sessionId: "session",
-      sessionFile: path.join(path.dirname(storePath), "session.jsonl"),
-      updatedAt: Date.now(),
-    };
-    const sessionStore: Record<string, SessionEntry> = {
-      main: sessionEntry,
-    };
-    registerFollowupTestSessionStore(storePath, sessionStore);
-
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "final" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session-rotated",
-          compactionCount: 1,
-          lastCallUsage: { input: 10_000, output: 3_000, total: 13_000 },
-        },
-      },
-    });
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: vi.fn(async () => {}) },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      sessionEntry,
-      sessionStore,
-      sessionKey: "main",
-      storePath,
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    const queuedNext = createQueuedRun({
-      prompt: "next",
-      run: {
-        sessionId: "session",
-        sessionFile: path.join(path.dirname(storePath), "session.jsonl"),
-      },
-    });
-    const queueSettings: QueueSettings = { mode: "queue" };
-    enqueueFollowupRun("main", queuedNext, queueSettings);
-
-    const current = createQueuedRun({
-      run: {
-        verboseLevel: "on",
-        sessionId: "session",
-        sessionFile: path.join(path.dirname(storePath), "session.jsonl"),
-      },
-    });
-
-    await runner(current);
-
-    expect(queuedNext.run.sessionId).toBe("session-rotated");
-    expect(await normalizeComparablePath(queuedNext.run.sessionFile)).toBe(
-      await normalizeComparablePath(path.join(path.dirname(storePath), "session-rotated.jsonl")),
-    );
-  });
-
-  it("does not count failed compaction end events in followup runs", async () => {
-    const storePath = path.join(
-      await fs.mkdtemp(path.join(tmpdir(), "openclaw-compaction-failed-")),
-      "sessions.json",
-    );
-    const sessionEntry: SessionEntry = {
-      sessionId: "session",
-      updatedAt: Date.now(),
-    };
-    const sessionStore: Record<string, SessionEntry> = {
-      main: sessionEntry,
-    };
-    const onBlockReply = vi.fn(async () => {});
-    registerFollowupTestSessionStore(storePath, sessionStore);
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      sessionEntry,
-      sessionStore,
-      sessionKey: "main",
-      storePath,
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    const queued = createQueuedRun({
-      run: {
-        verboseLevel: "on",
-      },
-    });
-
-    runEmbeddedPiAgentMock.mockImplementationOnce(async (args) => {
-      args.onAgentEvent?.({
-        stream: "compaction",
-        data: { phase: "end", willRetry: false, completed: false },
-      });
-      return {
-        payloads: [{ text: "final" }],
-        meta: {
-          agentMeta: {
-            compactionCount: 0,
-            lastCallUsage: { input: 10_000, output: 3_000, total: 13_000 },
-          },
-        },
-      };
-    });
-
-    await runner(queued);
-
-    expect(onBlockReply).toHaveBeenCalledTimes(1);
-    const firstCall = (onBlockReply.mock.calls as unknown as Array<Array<{ text?: string }>>)[0];
-    expect(firstCall?.[0]?.text).toBe("final");
-    expect(sessionStore.main.compactionCount).toBeUndefined();
-  });
-
-  it("injects the post-compaction refresh prompt before followup runs after preflight compaction", async () => {
-    const workspaceDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-preflight-followup-"));
-    const storePath = path.join(workspaceDir, "sessions.json");
-    const transcriptPath = path.join(workspaceDir, "session.jsonl");
-    await fs.writeFile(
-      transcriptPath,
-      `${JSON.stringify({
-        message: {
-          role: "user",
-          content: "x".repeat(320_000),
-          timestamp: Date.now(),
-        },
-      })}\n`,
-      "utf-8",
-    );
-    await fs.writeFile(
-      path.join(workspaceDir, "AGENTS.md"),
-      [
-        "## Session Startup",
-        "Read AGENTS.md before replying.",
-        "",
-        "## Red Lines",
-        "Never skip safety checks.",
-      ].join("\n"),
-      "utf-8",
-    );
-
-    const sessionEntry: SessionEntry = {
-      sessionId: "session",
-      updatedAt: Date.now(),
-      sessionFile: transcriptPath,
-      totalTokens: 10,
-      totalTokensFresh: false,
-      compactionCount: 1,
-    };
-    const sessionStore: Record<string, SessionEntry> = {
-      main: sessionEntry,
-    };
-    registerFollowupTestSessionStore(storePath, sessionStore);
-
-    compactEmbeddedPiSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "compacted",
-        firstKeptEntryId: "first-kept",
-        tokensBefore: 90_000,
-        tokensAfter: 8_000,
-      },
-    });
-    runPreflightCompactionIfNeededMock.mockImplementationOnce(
-      async (params: {
-        followupRun: FollowupRun;
-        sessionEntry?: SessionEntry;
-        sessionStore?: Record<string, SessionEntry>;
-        sessionKey?: string;
-        storePath?: string;
-      }) => {
-        await compactEmbeddedPiSessionMock({
-          sessionFile: transcriptPath,
-          workspaceDir,
+  it.each([
+    { channel: "webchat", phase: "end", succeeds: true },
+    { channel: "webchat", phase: "end", succeeds: false },
+    { channel: "discord", phase: "start", succeeds: true },
+  ] as const)(
+    "delivers $channel compaction $phase at its owner boundary (admitted=$succeeds)",
+    async ({ channel, phase, succeeds }) => {
+      turn.queued.originatingChannel = channel;
+      if (channel === "webchat") {
+        const source = createChatSendLateFollowupDisposition({
+          runId: "source-run",
+          originatingChannel: channel,
+          logGateway: { info: vi.fn() } as never,
+          deliver: async () => ({ kind: "delivered" }),
         });
-        params.followupRun.run.extraSystemPrompt = [
-          params.followupRun.run.extraSystemPrompt,
-          "Post-compaction context refresh",
-          "Read AGENTS.md before replying.",
-        ]
-          .filter(Boolean)
-          .join("\n\n");
-        const updatedEntry =
-          params.sessionEntry ??
-          (params.sessionKey && params.sessionStore
-            ? params.sessionStore[params.sessionKey]
-            : undefined);
-        if (updatedEntry) {
-          updatedEntry.compactionCount = 2;
-          updatedEntry.updatedAt = Date.now();
-          if (params.sessionKey && params.sessionStore) {
-            params.sessionStore[params.sessionKey] = updatedEntry;
-          }
-          if (params.storePath && params.sessionKey) {
-            const registeredStore = FOLLOWUP_TEST_SESSION_STORES.get(params.storePath);
-            if (registeredStore) {
-              registeredStore[params.sessionKey] = updatedEntry;
-            } else {
-              const store = loadSessionStore(params.storePath, { skipCache: true });
-              store[params.sessionKey] = updatedEntry;
-              await saveSessionStore(params.storePath, store);
-            }
-          }
-        }
-        return updatedEntry;
-      },
-    );
-
-    const embeddedCalls: Array<{ extraSystemPrompt?: string }> = [];
-    runEmbeddedPiAgentMock.mockImplementationOnce(
-      async (params: { extraSystemPrompt?: string }) => {
-        embeddedCalls.push({ extraSystemPrompt: params.extraSystemPrompt });
-        return {
-          payloads: [{ text: "final" }],
-          meta: { agentMeta: { usage: { input: 1, output: 1 } } },
-        };
-      },
-    );
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: vi.fn(async () => {}) },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      sessionEntry,
-      sessionStore,
-      sessionKey: "main",
-      storePath,
-      defaultModel: "anthropic/claude-opus-4-6",
-      agentCfgContextTokens: 100_000,
-    });
-
-    const queued = createQueuedRun({
-      run: {
-        sessionFile: transcriptPath,
-        workspaceDir,
-      },
-    });
-
-    await runner(queued);
-
-    expect(compactEmbeddedPiSessionMock).toHaveBeenCalledOnce();
-    expect(embeddedCalls[0]?.extraSystemPrompt).toContain("Post-compaction context refresh");
-    expect(embeddedCalls[0]?.extraSystemPrompt).toContain("Read AGENTS.md before replying.");
-    expect(sessionStore.main?.compactionCount).toBe(2);
-  });
-});
-
-describe("createFollowupRunner bootstrap warning dedupe", () => {
-  it("passes stored warning signature history to embedded followup runs", async () => {
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [],
-      meta: {},
-    });
-
-    const sessionEntry: SessionEntry = {
-      sessionId: "session",
-      updatedAt: Date.now(),
-      systemPromptReport: {
-        source: "run",
-        generatedAt: Date.now(),
-        systemPrompt: {
-          chars: 1,
-          projectContextChars: 0,
-          nonProjectContextChars: 1,
-        },
-        injectedWorkspaceFiles: [],
-        skills: {
-          promptChars: 0,
-          entries: [],
-        },
-        tools: {
-          listChars: 0,
-          schemaChars: 0,
-          entries: [],
-        },
-        bootstrapTruncation: {
-          warningMode: "once",
-          warningShown: true,
-          promptWarningSignature: "sig-b",
-          warningSignaturesSeen: ["sig-a", "sig-b"],
-          truncatedFiles: 1,
-          nearLimitFiles: 0,
-          totalNearLimit: false,
-        },
-      },
-    };
-    const sessionStore: Record<string, SessionEntry> = { main: sessionEntry };
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: vi.fn(async () => {}) },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      sessionEntry,
-      sessionStore,
-      sessionKey: "main",
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    await runner(baseQueuedRun());
-
-    const call = runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0] as
-      | {
-          allowGatewaySubagentBinding?: boolean;
-          bootstrapPromptWarningSignaturesSeen?: string[];
-          bootstrapPromptWarningSignature?: string;
-        }
-      | undefined;
-    expect(call?.allowGatewaySubagentBinding).toBe(true);
-    expect(call?.bootstrapPromptWarningSignaturesSeen).toEqual(["sig-a", "sig-b"]);
-    expect(call?.bootstrapPromptWarningSignature).toBe("sig-b");
-  });
-});
-
-describe("createFollowupRunner messaging tool dedupe", () => {
-  function createMessagingDedupeRunner(
-    onBlockReply: (payload: unknown) => Promise<void>,
-    overrides: Partial<{
-      sessionEntry: SessionEntry;
-      sessionStore: Record<string, SessionEntry>;
-      sessionKey: string;
-      storePath: string;
-    }> = {},
-  ) {
-    if (overrides.storePath && overrides.sessionStore) {
-      registerFollowupTestSessionStore(overrides.storePath, overrides.sessionStore);
-    }
-    return createFollowupRunner({
-      opts: { onBlockReply },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-      sessionEntry: overrides.sessionEntry,
-      sessionStore: overrides.sessionStore,
-      sessionKey: overrides.sessionKey,
-      storePath: overrides.storePath,
-    });
-  }
-
-  async function runMessagingCase(params: {
-    agentResult: Record<string, unknown>;
-    queued?: FollowupRun;
-    runnerOverrides?: Partial<{
-      sessionEntry: SessionEntry;
-      sessionStore: Record<string, SessionEntry>;
-      sessionKey: string;
-      storePath: string;
-    }>;
-  }) {
-    const onBlockReply = createAsyncReplySpy();
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      meta: {},
-      ...params.agentResult,
-    });
-    const runner = createMessagingDedupeRunner(onBlockReply, params.runnerOverrides);
-    await runner(params.queued ?? baseQueuedRun());
-    return { onBlockReply };
-  }
-
-  function makeTextReplyDedupeResult(overrides?: Record<string, unknown>) {
-    return {
-      payloads: [{ text: "hello world!" }],
-      messagingToolSentTexts: ["different message"],
-      ...overrides,
-    };
-  }
-
-  it("persists usage even when replies are suppressed", async () => {
-    const storePath = "/tmp/openclaw-followup-usage.json";
-    const sessionKey = "main";
-    const sessionEntry: SessionEntry = { sessionId: "session", updatedAt: Date.now() };
-    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
-    const persistSpy = vi.spyOn(sessionRunAccounting, "persistRunSessionUsage");
-    persistSpy.mockImplementationOnce(async (params) => {
-      const nextEntry: SessionEntry = {
-        ...sessionStore[sessionKey],
-        updatedAt: Date.now(),
-        totalTokens: params.lastCallUsage?.input,
-        totalTokensFresh: true,
-        model: params.modelUsed,
-        modelProvider: params.providerUsed,
-        inputTokens: params.usage?.input,
-        outputTokens: params.usage?.output,
+        source.recordQueued();
+        turn.queued.queuedFollowupReplyDisposition = { kind: "deliver", deliver: source.deliver };
+      }
+      const failure = new Error("session generation changed after compaction");
+      const notice = {
+        text: phase === "start" ? "Compacting context" : "Context compacted",
+        replyToCurrent: true,
+        isCompactionNotice: true,
       };
-      sessionStore[sessionKey] = nextEntry;
-      Object.assign(sessionEntry, nextEntry);
-    });
-
-    const { onBlockReply } = await runMessagingCase({
-      agentResult: {
-        ...makeTextReplyDedupeResult(),
-        messagingToolSentTargets: [{ tool: "slack", provider: "slack", to: "channel:C1" }],
-        meta: {
-          agentMeta: {
-            usage: { input: 1_000, output: 50 },
-            lastCallUsage: { input: 400, output: 20 },
-            model: "claude-opus-4-6",
-            provider: "anthropic",
-          },
+      const order: string[] = [];
+      state.admit.mockImplementation(
+        async (
+          params: Parameters<
+            typeof import("./reply-agent-turn-preparation.js").prepareReplyAgentTurn
+          >[0],
+        ) => {
+          await params.onCompactionNotice?.(phase, notice.text, turn);
+          if (!succeeds) {
+            throw failure;
+          }
+          order.push("compaction-finished");
+          return { kind: "admitted", turn };
         },
-      },
-      runnerOverrides: {
-        sessionEntry,
-        sessionStore,
-        sessionKey,
-        storePath,
-      },
-      queued: baseQueuedRun("slack"),
-    });
+      );
+      state.execute.mockImplementation(async () => {
+        order.push("execution-settled");
+        return createSettledExecution();
+      });
+      state.deliver.mockImplementation(async (params: { kind?: string }) => {
+        order.push(params.kind === "block" ? "notice-delivered" : "final-delivered");
+        return { kind: "completed", payloads: [] };
+      });
+      const run = createRunner()(turn.queued);
+      if (!succeeds) {
+        await expect(run).rejects.toBe(failure);
+        expect(state.execute).not.toHaveBeenCalled();
+        expect(state.deliver).not.toHaveBeenCalled();
+        expect(state.completeLifecycle).not.toHaveBeenCalled();
+        return;
+      }
+      await run;
+      expect(order).toEqual(
+        channel === "webchat"
+          ? ["compaction-finished", "execution-settled", "notice-delivered", "final-delivered"]
+          : ["notice-delivered", "compaction-finished", "execution-settled", "final-delivered"],
+      );
+      if (channel === "webchat") {
+        expect(state.deliver).toHaveBeenNthCalledWith(
+          1,
+          expect.objectContaining({
+            kind: "block",
+            decision: { kind: "deliver", payloads: [notice] },
+            runId: turn.runId,
+          }),
+        );
+      }
+    },
+  );
 
-    expect(onBlockReply).not.toHaveBeenCalled();
-    expect(persistSpy).toHaveBeenCalledWith(
+  it("closes the current run once after transferring source delivery to recovery", async () => {
+    const deliver = attachSource(turn);
+    state.resolveDecision.mockReturnValue({
+      kind: "retry-source-delivery",
+      run: turn.queued,
+      finalTextLength: 300,
+      resolved: { provider: "anthropic", model: "claude" },
+    });
+    state.deliver.mockResolvedValue({ kind: "source-retry" });
+
+    await createRunner()(turn.queued);
+
+    expect(deliver).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
-        storePath,
-        sessionKey,
-        modelUsed: "claude-opus-4-6",
-        providerUsed: "anthropic",
+        runId: turn.runId,
+        completion: { kind: "completed" },
+        payloads: [],
       }),
     );
-    expect(sessionStore[sessionKey]?.totalTokens).toBe(400);
-    expect(sessionStore[sessionKey]?.model).toBe("claude-opus-4-6");
-    // Accumulated usage is still stored for usage/cost tracking.
-    expect(sessionStore[sessionKey]?.inputTokens).toBe(1_000);
-    expect(sessionStore[sessionKey]?.outputTokens).toBe(50);
-    persistSpy.mockRestore();
   });
 
-  it("passes queued config into usage persistence during drained followups", async () => {
-    const storePath = "/tmp/openclaw-followup-usage-cfg.json";
-    const sessionKey = "main";
-    const sessionEntry: SessionEntry = { sessionId: "session", updatedAt: Date.now() };
-    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
+  it.each(["silent", "send-policy"] as const)(
+    "settles the queued source when final delivery is suppressed by %s",
+    async (reason) => {
+      const deliver = attachSource(turn);
+      const execution = createSettledExecution();
+      admitTurn(turn, execution);
+      state.resolveDecision.mockReturnValue({ kind: "suppress", reason });
 
-    const cfg = {
-      messages: {
-        responsePrefix: "agent",
+      await createRunner()(turn.queued);
+
+      expect(deliver).toHaveBeenCalledExactlyOnceWith({
+        kind: "queued-followup",
+        runId: turn.runId,
+        originatingChannel: undefined,
+        payloads: [],
+        completion: {
+          kind: "completed",
+          ...(reason === "silent" ? { allowCanvasOnly: true } : {}),
+        },
+      });
+    },
+  );
+
+  it.each(["timeout", "user", "restart"] as const)(
+    "preserves %s classification when the queue owns completion",
+    async (reason) => {
+      const deliver = attachSource(turn);
+      const execution = createSettledExecution();
+      if (reason === "timeout" && execution.execution.outcome.kind === "settled") {
+        execution.execution.outcome = {
+          ...execution.execution.outcome,
+          status: "failed",
+          terminalFailurePayload: { text: "Provider timed out", isError: true },
+          result: {
+            payloads: [],
+            meta: {
+              durationMs: 1000,
+              timeoutPhase: "provider",
+              stopReason: "timeout",
+              aborted: true,
+              providerStarted: true,
+            },
+          },
+        };
+      } else if (reason !== "timeout") {
+        execution.execution.outcome = { kind: "aborted", reason };
+      }
+      admitTurn(turn, execution);
+
+      await createRunner()(turn.queued);
+
+      expect(deliver).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          completion:
+            reason === "timeout"
+              ? {
+                  kind: "failed",
+                  error: "Provider timed out",
+                  stopReason: "timeout",
+                  errorKind: "timeout",
+                }
+              : { kind: "aborted", stopReason: reason === "user" ? "aborted" : reason },
+        }),
+      );
+    },
+  );
+
+  it("retains its Gateway and drops caller authority through the delivery retry handoff", async () => {
+    const resolveGatewayContext = () => undefined;
+    const otherGatewayContext = () => undefined;
+    const staleAuthority = vi.fn();
+    const observed: unknown[] = [];
+    let retry: ((queued: FollowupRun) => Promise<void>) | undefined;
+    state.admit.mockImplementation(async () => {
+      const scope = getPluginRuntimeGatewayRequestScope();
+      observed.push({
+        resolver: scope?.resolveGatewayContext,
+        authority: scope?.assertNodeExecutionCurrent,
+      });
+      return { kind: "admitted", turn };
+    });
+    state.execute.mockResolvedValue(createRejectedExecution());
+    state.deliver
+      .mockResolvedValue({ kind: "completed", payloads: [] })
+      .mockImplementationOnce(
+        async (
+          params: Parameters<typeof import("./followup-delivery.js").deliverFollowupDecision>[0],
+        ) => {
+          retry = params.runFollowup;
+          return { kind: "source-retry" };
+        },
+      );
+    const run = createRunner({ resolveGatewayContext, typingMode: "instant" });
+    await withPluginRuntimeGatewayRequestScope(
+      {
+        resolveGatewayContext: otherGatewayContext,
+        assertNodeExecutionCurrent: staleAuthority,
+        isWebchatConnect: () => false,
       },
+      async () => {
+        await run(turn.queued);
+        if (!retry) {
+          throw new Error("expected delivery retry callback");
+        }
+        await retry(turn.queued);
+      },
+    );
+    expect(observed).toEqual([
+      { resolver: resolveGatewayContext, authority: undefined },
+      { resolver: resolveGatewayContext, authority: undefined },
+    ]);
+    expect(state.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["already-aborted", "unowned skip", "owned skip"] as const)(
+    "settles terminal input without execution (%s)",
+    async (kind) => {
+      const end = vi.fn();
+      turn.queued.deliveryCorrelations = [{ begin: () => end }];
+      if (kind === "already-aborted") {
+        turn.queued.abortSignal = AbortSignal.abort();
+      } else {
+        state.admit.mockResolvedValue({
+          kind: "skipped",
+          reason: "lifecycle-invalidated",
+          ...(kind === "owned skip" ? { operation: turn.operation } : {}),
+        });
+      }
+      await expect(
+        createRunner({ typing, typingMode: "instant" })(turn.queued),
+      ).resolves.toBeUndefined();
+      if (kind === "already-aborted") {
+        expect(state.admit).not.toHaveBeenCalled();
+      }
+      expect(state.execute).not.toHaveBeenCalled();
+      expect(turn.operation.complete).toHaveBeenCalledTimes(kind === "owned skip" ? 1 : 0);
+      expectTypingComplete();
+      expect(end).toHaveBeenCalledExactlyOnceWith({
+        visibleReplySent: false,
+        failed: true,
+        completed: false,
+      });
+    },
+  );
+
+  it("consumes a user abort before execution starts", async () => {
+    turn = createTurn([], { kind: "aborted", code: "aborted_by_user" });
+    const deliver = attachSource(turn);
+    state.admit.mockResolvedValue({ kind: "admitted", turn });
+    state.execute.mockRejectedValue(new Error("aborted before execution start"));
+
+    await createRunner({ typing, typingMode: "instant" })(turn.queued);
+
+    expect(turn.operation.fail).not.toHaveBeenCalled();
+    expect(deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        completion: { kind: "aborted", stopReason: "aborted" },
+        payloads: [],
+      }),
+    );
+  });
+
+  it("consumes revoked operator input instead of retrying a pre-execution refusal", async () => {
+    const failure = new Error("original operator role changed");
+    turn.queued.operatorAuthority = createAdmittedRunOperatorAuthority({
+      profileId: "guest",
+      scopes: ["operator.write"],
+      assertCurrent: () => {
+        throw failure;
+      },
+    });
+    state.admit.mockRejectedValueOnce(failure);
+
+    await expect(
+      createRunner({ typing, typingMode: "never" })(turn.queued),
+    ).resolves.toBeUndefined();
+
+    expect(state.execute).not.toHaveBeenCalled();
+    expect(state.completeLifecycle).toHaveBeenCalledWith(turn.queued);
+    expect(typing.markRunComplete).toHaveBeenCalledOnce();
+  });
+
+  it("does not replay a settled execution after progress presentation fails", async () => {
+    const failure = new Error("progress presentation failed");
+    const execution = createSettledExecution();
+    const deliver = attachSource(turn);
+    admitTurn(turn, execution);
+    execution.progress.drain = vi.fn(async () => {
+      throw failure;
+    });
+    await createRunner({ typingMode: "instant" })(turn.queued);
+    expect(state.execute).toHaveBeenCalledOnce();
+    expect(turn.operation.fail).toHaveBeenCalledWith("run_failed", failure);
+    expect(deliver).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        completion: { kind: "failed", error: failure.message },
+        payloads: [],
+      }),
+    );
+  });
+
+  it("holds the reply operation through progress drain, accounting, and delivery", async () => {
+    const order: string[] = [];
+    turn = createTurn(order);
+    const execution = createRejectedExecution(order);
+    const sourceDelivery = vi.fn(async () => {
+      order.push("completion");
+    });
+    const presentationGate = createDeferred();
+    const presentationStarted = createDeferred();
+    const endCorrelation = vi.fn();
+    turn.queued.deliveryCorrelations = [{ begin: () => endCorrelation }];
+    let presentation: Promise<void> | undefined;
+    turn.queued.queuedFollowupReplyDisposition = { kind: "deliver", deliver: sourceDelivery };
+    const decision = {
+      kind: "deliver" as const,
+      payloads: [{ text: "done\nUsage: 1.3k total" } satisfies ReplyPayload],
     };
-    const persistSpy = vi.spyOn(sessionRunAccounting, "persistRunSessionUsage");
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "hello world!" }],
-      meta: {
-        agentMeta: {
-          usage: { input: 10, output: 5 },
-          lastCallUsage: { input: 6, output: 3 },
-          model: "claude-opus-4-6",
+    admitTurn(turn, execution);
+    state.account.mockImplementation(async () => {
+      order.push("accounted");
+      return { payloadArray: [{ text: "raw accounting reply" }] };
+    });
+    state.resolveDecision.mockImplementation(() => {
+      order.push("decision");
+      return decision;
+    });
+    state.deliver.mockImplementation(async () => {
+      order.push("delivered");
+      return { kind: "completed", payloads: decision.payloads };
+    });
+    state.completeLifecycle.mockImplementation(() => order.push("lifecycle-complete"));
+
+    const run = createRunner({
+      typing,
+      typingMode: "instant",
+      opts: {
+        onQueuedFollowupSettled: () => {
+          presentation = (async () => {
+            order.push("presentation-settling");
+            presentationStarted.resolve();
+            await presentationGate.promise;
+            order.push("presentation-settled");
+          })();
+          return presentation;
         },
       },
-    });
+    })(turn.queued);
 
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: createAsyncReplySpy() },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-      sessionEntry,
-      sessionStore,
-      sessionKey,
-      storePath,
-    });
+    const settledRun = Promise.allSettled([run]);
+    try {
+      await Promise.race([presentationStarted.promise, run]);
+      expect(order).toContain("presentation-settling");
+      expect(state.completeLifecycle).not.toHaveBeenCalled();
+      expect(turn.operation.complete).not.toHaveBeenCalled();
+      expect(endCorrelation).not.toHaveBeenCalled();
+    } finally {
+      presentationGate.resolve();
+      await settledRun;
+      await presentation;
+    }
+    await run;
 
-    await expect(
-      runner(
-        createQueuedRun({
-          run: {
-            config: cfg,
-          },
-        }),
-      ),
-    ).resolves.toBeUndefined();
+    expect(endCorrelation).toHaveBeenCalledExactlyOnceWith(undefined);
 
-    expect(persistSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        storePath,
-        sessionKey,
-        cfg,
-      }),
+    expect(order).toEqual([
+      "progress-drained",
+      "accounted",
+      "decision",
+      "delivered",
+      "completion",
+      "presentation-settling",
+      "presentation-settled",
+      "lifecycle-complete",
+      "operation-complete",
+    ]);
+    expect(sourceDelivery).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ payloads: decision.payloads }),
     );
-    persistSpy.mockRestore();
   });
 
-  it("uses providerUsed for snapshot freshness when agent metadata overrides the run provider", async () => {
-    const storePath = "/tmp/openclaw-followup-usage-provider.json";
-    const sessionKey = "main";
-    const sessionEntry: SessionEntry = { sessionId: "session", updatedAt: Date.now() };
-    const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
-    const persistSpy = vi.spyOn(sessionRunAccounting, "persistRunSessionUsage");
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "hello world!" }],
-      meta: {
-        agentMeta: {
-          usage: { input: 10, output: 5 },
-          lastCallUsage: { input: 6, output: 3 },
-          model: "claude-opus-4-6",
-          provider: "anthropic",
+  it.each(["delivered", "filtered", "delivery-failed", "completion-failed"])(
+    "closes queued continuation adoption after its delivery owner settles (%s)",
+    async (outcome) => {
+      let continuationOpen = true;
+      let openAtCleanup: boolean | undefined;
+      const adoptionResults: Array<boolean | undefined> = [];
+      const adopt = vi.fn(() => continuationOpen);
+      const statusPayload = setReplyPayloadMetadata(
+        { text: "The worker is continuing." },
+        {
+          continuationStatus: true,
+          progressContinuation: {
+            adopt,
+            close: () => {
+              continuationOpen = false;
+            },
+          },
         },
-      },
-    });
+      );
+      const decision = { kind: "deliver", payloads: [statusPayload] };
+      const draft = { push: () => undefined, retire: () => undefined };
+      const failure = new Error("terminal delivery failed");
+      const deliver = vi.fn(async (batch: QueuedFollowupReplyBatch) => {
+        for (const payload of batch.payloads) {
+          adoptionResults.push(
+            getReplyPayloadMetadata(payload)?.progressContinuation?.adopt(draft),
+          );
+        }
+        if (outcome === "completion-failed") {
+          throw new Error("completion failed after adoption");
+        }
+      });
+      turn.queued.queuedFollowupReplyDisposition = { kind: "deliver", deliver };
+      state.resolveDecision.mockResolvedValue(decision);
+      state.deliver.mockImplementation(async () => {
+        if (outcome === "delivery-failed") {
+          throw failure;
+        }
+        return {
+          kind: "completed",
+          payloads: outcome === "filtered" ? [] : decision.payloads,
+        };
+      });
 
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: createAsyncReplySpy() },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-      sessionEntry,
-      sessionStore,
-      sessionKey,
-      storePath,
-    });
-
-    await expect(
-      runner(
-        createQueuedRun({
-          run: {
-            provider: "openai",
-            config: {
-              agents: {
-                defaults: {
-                  cliBackends: {
-                    anthropic: { command: "anthropic" },
-                  },
-                },
-              },
-            } as OpenClawConfig,
+      await createRunner({
+        opts: {
+          onQueuedFollowupSettled: async () => {
+            openAtCleanup = continuationOpen;
           },
-        }),
-      ),
-    ).resolves.toBeUndefined();
+        },
+      })(turn.queued);
 
-    expect(persistSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        providerUsed: "anthropic",
-        usageIsContextSnapshot: true,
-      }),
-    );
-    persistSpy.mockRestore();
-  });
+      expect(adopt()).toBe(false);
+      expect(openAtCleanup).toBe(true);
+      expect(adoptionResults).toEqual(
+        outcome === "delivered" || outcome === "completion-failed" ? [true] : [],
+      );
+      if (outcome === "delivery-failed") {
+        expect(state.execute).toHaveBeenCalledOnce();
+        expect(turn.operation.fail).toHaveBeenCalledWith("run_failed", failure);
+        expect(deliver).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            completion: { kind: "failed", error: failure.message },
+            payloads: [],
+          }),
+        );
+      }
+    },
+  );
 
-  it("does not fall back to dispatcher when cross-channel origin routing fails", async () => {
-    routeReplyMock.mockResolvedValueOnce({
-      ok: false,
-      error: "forced route failure",
-    });
-    const { onBlockReply } = await runMessagingCase({
-      agentResult: { payloads: [{ text: "hello world!" }] },
-      queued: {
-        ...baseQueuedRun("webchat"),
-        originatingChannel: "discord",
-        originatingTo: "channel:C1",
-      } as FollowupRun,
-    });
+  it.each([true, false])(
+    "settles source delivery correlations with visible=%s",
+    async (visible) => {
+      const onObservedReplyDelivery = vi.fn(async () => {});
+      const endCorrelation = vi.fn();
+      turn.queued.deliveryCorrelations = [{ begin: () => endCorrelation }];
+      const execution = createSettledExecution();
+      state.completedSourceDelivery = visible;
+      admitTurn(turn, execution);
 
-    expect(routeReplyMock).toHaveBeenCalled();
-    expect(onBlockReply).not.toHaveBeenCalled();
-  });
+      await createRunner({
+        typing,
+        typingMode: "instant",
+        opts: { onObservedReplyDelivery },
+      })(turn.queued);
 
-  it("falls back to dispatcher when same-channel origin routing fails", async () => {
-    routeReplyMock.mockResolvedValueOnce({
-      ok: false,
-      error: "outbound adapter unavailable",
-    });
-    const { onBlockReply } = await runMessagingCase({
-      agentResult: { payloads: [{ text: "hello world!" }] },
-      queued: {
-        ...baseQueuedRun(" Feishu "),
-        originatingChannel: "FEISHU",
-        originatingTo: "ou_abc123",
-      } as FollowupRun,
-    });
-
-    expect(routeReplyMock).toHaveBeenCalled();
-    expect(onBlockReply).toHaveBeenCalledTimes(1);
-    expect(onBlockReply).toHaveBeenCalledWith(expect.objectContaining({ text: "hello world!" }));
-  });
-
-  it("routes followups with originating account/thread metadata", async () => {
-    const { onBlockReply } = await runMessagingCase({
-      agentResult: { payloads: [{ text: "hello world!" }] },
-      queued: {
-        ...baseQueuedRun("webchat"),
-        originatingChannel: "discord",
-        originatingTo: "channel:C1",
-        originatingAccountId: "work",
-        originatingThreadId: "1739142736.000100",
-      } as FollowupRun,
-    });
-
-    expect(routeReplyMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "discord",
-        to: "channel:C1",
-        accountId: "work",
-        threadId: "1739142736.000100",
-      }),
-    );
-    expect(onBlockReply).not.toHaveBeenCalled();
-  });
-});
-
-describe("createFollowupRunner typing cleanup", () => {
-  async function runTypingCase(agentResult: Record<string, unknown>) {
-    const typing = createMockTypingController();
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      meta: {},
-      ...agentResult,
-    });
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: createAsyncReplySpy() },
-      typing,
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    await runner(baseQueuedRun());
-    return typing;
-  }
-
-  function expectTypingCleanup(typing: ReturnType<typeof createMockTypingController>) {
-    expect(typing.markRunComplete).toHaveBeenCalled();
-    expect(typing.markDispatchIdle).toHaveBeenCalled();
-  }
-
-  it("calls both markRunComplete and markDispatchIdle on NO_REPLY", async () => {
-    const typing = await runTypingCase({ payloads: [{ text: "NO_REPLY" }] });
-    expectTypingCleanup(typing);
-  });
-
-  it("calls both markRunComplete and markDispatchIdle on empty payloads", async () => {
-    const typing = await runTypingCase({ payloads: [] });
-    expectTypingCleanup(typing);
-  });
-
-  it("calls both markRunComplete and markDispatchIdle on agent error", async () => {
-    const typing = createMockTypingController();
-    runEmbeddedPiAgentMock.mockRejectedValueOnce(new Error("agent exploded"));
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply: vi.fn(async () => {}) },
-      typing,
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    await runner(baseQueuedRun());
-
-    expectTypingCleanup(typing);
-  });
-
-  it("calls both markRunComplete and markDispatchIdle on successful delivery", async () => {
-    const typing = createMockTypingController();
-    const onBlockReply = vi.fn(async () => {});
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "hello world!" }],
-      meta: {},
-    });
-
-    const runner = createFollowupRunner({
-      opts: { onBlockReply },
-      typing,
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-
-    await runner(baseQueuedRun());
-
-    expect(onBlockReply).toHaveBeenCalled();
-    expectTypingCleanup(typing);
-  });
-});
-
-describe("createFollowupRunner agentDir forwarding", () => {
-  it("passes queued run agentDir to runEmbeddedPiAgent", async () => {
-    runEmbeddedPiAgentMock.mockClear();
-    const onBlockReply = vi.fn(async () => {});
-    runEmbeddedPiAgentMock.mockResolvedValueOnce({
-      payloads: [{ text: "hello world!" }],
-      messagingToolSentTexts: ["different message"],
-      meta: {},
-    });
-    const runner = createFollowupRunner({
-      opts: { onBlockReply },
-      typing: createMockTypingController(),
-      typingMode: "instant",
-      defaultModel: "anthropic/claude-opus-4-6",
-    });
-    const agentDir = path.join("/tmp", "agent-dir");
-    const queued = createQueuedRun();
-    await runner({
-      ...queued,
-      run: {
-        ...queued.run,
-        agentDir,
-      },
-    });
-
-    expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
-    const call = runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0] as { agentDir?: string };
-    expect(call?.agentDir).toBe(agentDir);
-  });
+      expect(onObservedReplyDelivery).toHaveBeenCalledTimes(visible ? 1 : 0);
+      expect(endCorrelation).toHaveBeenCalledExactlyOnceWith({
+        visibleReplySent: visible,
+        failed: false,
+        completed: true,
+      });
+    },
+  );
 });

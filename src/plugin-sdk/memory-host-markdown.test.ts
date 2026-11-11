@@ -12,31 +12,6 @@ describe("withTrailingNewline", () => {
 });
 
 describe("replaceManagedMarkdownBlock", () => {
-  it("appends a managed block when missing", () => {
-    expect(
-      replaceManagedMarkdownBlock({
-        original: "# Title\n",
-        heading: "## Generated",
-        startMarker: "<!-- start -->",
-        endMarker: "<!-- end -->",
-        body: "- first",
-      }),
-    ).toBe("# Title\n\n## Generated\n<!-- start -->\n- first\n<!-- end -->\n");
-  });
-
-  it("replaces an existing managed block in place", () => {
-    expect(
-      replaceManagedMarkdownBlock({
-        original:
-          "# Title\n\n## Generated\n<!-- start -->\n- old\n<!-- end -->\n\n## Notes\nkept\n",
-        heading: "## Generated",
-        startMarker: "<!-- start -->",
-        endMarker: "<!-- end -->",
-        body: "- new",
-      }),
-    ).toBe("# Title\n\n## Generated\n<!-- start -->\n- new\n<!-- end -->\n\n## Notes\nkept\n");
-  });
-
   it("supports headingless blocks", () => {
     expect(
       replaceManagedMarkdownBlock({
@@ -46,5 +21,55 @@ describe("replaceManagedMarkdownBlock", () => {
         body: "beta",
       }),
     ).toBe("alpha\n\n<!-- start -->\nbeta\n<!-- end -->\n");
+  });
+
+  it("replaces headed blocks with CRLF line endings in place", () => {
+    expect(
+      replaceManagedMarkdownBlock({
+        original: "# Title\r\n\r\n## Generated\r\n<!-- start -->\r\n- old\r\n<!-- end -->\r\n",
+        heading: "## Generated",
+        startMarker: "<!-- start -->",
+        endMarker: "<!-- end -->",
+        body: "- new",
+      }),
+    ).toBe("# Title\r\n\r\n## Generated\n<!-- start -->\n- new\n<!-- end -->\r\n");
+  });
+
+  it("preserves unmanaged markdown while removing duplicate blocks", () => {
+    const original = [
+      "# Title",
+      "",
+      "Paragraph A",
+      "",
+      "",
+      "Paragraph B",
+      "",
+      "## Generated",
+      "<!-- start -->",
+      "- old",
+      "<!-- end -->",
+      "",
+      "## Generated",
+      "<!-- start -->",
+      "- stale",
+      "<!-- end -->",
+      "",
+      "## Notes",
+      "kept",
+      "",
+      "",
+    ].join("\n");
+
+    expect(
+      replaceManagedMarkdownBlock({
+        original,
+        heading: "## Generated",
+        startMarker: "<!-- start -->",
+        endMarker: "<!-- end -->",
+        body: "- new",
+      }),
+    ).toBe(
+      "# Title\n\nParagraph A\n\n\nParagraph B\n\n## Generated\n<!-- start -->\n- new\n<!-- end -->\n\n## Notes\nkept\n\n",
+    );
   });
 });

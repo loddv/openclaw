@@ -1,41 +1,20 @@
-import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { FallbackAttempt } from "../agents/model-fallback.types.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { MusicGenerationRequest } from "./provider-types.js";
 import type {
-  GeneratedMusicAsset,
   MusicGenerationIgnoredOverride,
   MusicGenerationNormalization,
-  MusicGenerationOutputFormat,
-  MusicGenerationProvider,
-  MusicGenerationSourceImage,
+  MusicGenerationResult,
 } from "./types.js";
 
-export type GenerateMusicParams = {
-  cfg: OpenClawConfig;
-  prompt: string;
-  agentDir?: string;
-  authStore?: AuthProfileStore;
+export type GenerateMusicParams = Omit<MusicGenerationRequest, "provider" | "model"> & {
   modelOverride?: string;
-  lyrics?: string;
-  instrumental?: boolean;
-  durationSeconds?: number;
-  format?: MusicGenerationOutputFormat;
-  inputImages?: MusicGenerationSourceImage[];
+  autoProviderFallback?: boolean;
 };
 
-export type GenerateMusicRuntimeResult = {
-  tracks: GeneratedMusicAsset[];
+export type GenerateMusicRuntimeResult = Omit<MusicGenerationResult, "model"> & {
   provider: string;
   model: string;
   attempts: FallbackAttempt[];
-  lyrics?: string[];
   normalization?: MusicGenerationNormalization;
-  metadata?: Record<string, unknown>;
   ignoredOverrides: MusicGenerationIgnoredOverride[];
 };
-
-export type ListRuntimeMusicGenerationProvidersParams = {
-  config?: OpenClawConfig;
-};
-
-export type RuntimeMusicGenerationProvider = MusicGenerationProvider;

@@ -1,34 +1,34 @@
 // Manual facade. Keep loader boundary explicit.
-type FacadeModule = typeof import("@openclaw/qa-lab/cli.js");
-import { loadBundledPluginPublicSurfaceModuleSync } from "./facade-loader.js";
+import { loadBundledPluginPublicSurfaceModuleSyncCore } from "./facade-loader.js";
+
+type FacadeModule = {
+  isQaLabCliAvailable: () => boolean;
+  registerQaLabCli: (program: unknown) => void;
+};
 
 function loadFacadeModule(): FacadeModule {
-  return loadBundledPluginPublicSurfaceModuleSync<FacadeModule>({
+  return loadBundledPluginPublicSurfaceModuleSyncCore<FacadeModule>({
     dirName: "qa-lab",
     artifactBasename: "cli.js",
   });
 }
 
-function isMissingQaLabFacadeError(err: unknown): boolean {
-  if (!(err instanceof Error)) {
-    return false;
-  }
-  return (
-    err.message === "Unable to resolve bundled plugin public surface qa-lab/cli.js" ||
-    err.message.startsWith("Unable to open bundled plugin public surface ")
-  );
-}
+/** Register QA Lab CLI commands when the bundled QA Lab facade is present. */
+export const registerQaLabCli: FacadeModule["registerQaLabCli"] = (...args) =>
+  loadFacadeModule().registerQaLabCli(...args);
 
-export const registerQaLabCli: FacadeModule["registerQaLabCli"] = ((...args) =>
-  loadFacadeModule().registerQaLabCli(...args)) as FacadeModule["registerQaLabCli"];
-
-export const isQaLabCliAvailable: FacadeModule["isQaLabCliAvailable"] = (() => {
+/** Returns whether the QA Lab CLI facade can be loaded in this package build. */
+export const isQaLabCliAvailable: FacadeModule["isQaLabCliAvailable"] = () => {
   try {
     return loadFacadeModule().isQaLabCliAvailable();
   } catch (err) {
-    if (isMissingQaLabFacadeError(err)) {
+    if (
+      err instanceof Error &&
+      (err.message === "Unable to resolve bundled plugin public surface qa-lab/cli.js" ||
+        err.message.startsWith("Unable to open bundled plugin public surface "))
+    ) {
       return false;
     }
     throw err;
   }
-}) as FacadeModule["isQaLabCliAvailable"];
+};

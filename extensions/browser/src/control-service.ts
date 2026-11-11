@@ -1,53 +1,43 @@
+import { createSubsystemLogger } from "openclaw/plugin-sdk/logging-core";
+import { captureRuntimeConfigAsyncReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import {
+  createBrowserControlContext,
+  ensureBrowserControlRuntime,
+  getBrowserControlState,
+  stopBrowserControlRuntime,
+  withBrowserControlStart,
+} from "./browser-control-state.js";
+import { loadBrowserConfigForRuntimeRefresh } from "./browser/config-refresh-source.js";
 import { resolveBrowserConfig } from "./browser/config.js";
-import { ensureBrowserControlAuth } from "./browser/control-auth.js";
-import { createBrowserRuntimeState, stopBrowserRuntime } from "./browser/runtime-lifecycle.js";
-import { type BrowserServerState, createBrowserRouteContext } from "./browser/server-context.js";
-import { loadConfig } from "./config/config.js";
-import { createSubsystemLogger } from "./logging/subsystem.js";
-import { isDefaultBrowserPluginEnabled } from "./plugin-enabled.js";
+import { getGatewayExtensionRelayModule } from "./browser/extension-relay.runtime.js";
+import { stopBrowserScreencasts } from "./browser/screencast/session.js";
+import type { BrowserServerState } from "./browser/server-context.js";
+import { resolveBrowserPluginEnableState } from "./plugin-enabled.js";
 
-let state: BrowserServerState | null = null;
 const log = createSubsystemLogger("browser");
 const logService = log.child("service");
 
-export function getBrowserControlState(): BrowserServerState | null {
-  return state;
-}
-
-export function createBrowserControlContext() {
-  return createBrowserRouteContext({
-    getState: () => state,
-    refreshConfigFromDisk: true,
-  });
-}
-
-export async function startBrowserControlServiceFromConfig(): Promise<BrowserServerState | null> {
-  if (state) {
-    return state;
+async function startBrowserControlServiceUnlocked(): Promise<BrowserServerState | null> {
+  const current = getBrowserControlState();
+  if (current) {
+    return current;
   }
 
-  const cfg = loadConfig();
-  if (!isDefaultBrowserPluginEnabled(cfg)) {
+  const cfg = await captureRuntimeConfigAsyncReader()();
+  const browserCfg = loadBrowserConfigForRuntimeRefresh();
+  if (!resolveBrowserPluginEnableState(cfg).enabled) {
     return null;
   }
-  const resolved = resolveBrowserConfig(cfg.browser, cfg);
+  const resolved = resolveBrowserConfig(browserCfg.browser, browserCfg);
   if (!resolved.enabled) {
     return null;
   }
-  try {
-    const ensured = await ensureBrowserControlAuth({ cfg });
-    if (ensured.generatedToken) {
-      logService.info("No browser auth configured; generated gateway.auth.token automatically.");
-    }
-  } catch (err) {
-    logService.warn(`failed to auto-configure browser auth: ${String(err)}`);
-  }
-
-  state = await createBrowserRuntimeState({
+  // This in-process service has no HTTP listener, so it needs no browser credential. Listeners
+  // (the HTTP server and sandbox bridges) own theirs; a lazy start must never write auth config.
+  const state = await ensureBrowserControlRuntime({
     server: null,
     port: resolved.controlPort,
     resolved,
-    onWarn: (message) => logService.warn(message),
   });
 
   logService.info(
@@ -56,14 +46,23 @@ export async function startBrowserControlServiceFromConfig(): Promise<BrowserSer
   return state;
 }
 
-export async function stopBrowserControlService(): Promise<void> {
-  const current = state;
-  await stopBrowserRuntime({
-    current,
-    getState: () => state,
-    clearState: () => {
-      state = null;
-    },
-    onWarn: (message) => logService.warn(message),
-  });
+export async function startBrowserControlServiceFromConfig(): Promise<BrowserServerState | null> {
+  return await withBrowserControlStart(startBrowserControlServiceUnlocked);
 }
+
+export async function stopBrowserControlService(): Promise<void> {
+  try {
+    await stopBrowserControlRuntime({
+      requestedBy: "service",
+      onWarn: (message) => logService.warn(message),
+    });
+  } finally {
+    // Direct Gateway auth sockets can exist before Browser control lazy-starts,
+    // so plugin shutdown must close them even when there is no runtime state.
+    const gatewayRelay = await getGatewayExtensionRelayModule.peek();
+    gatewayRelay?.disposeGatewayExtensionRelay();
+    await stopBrowserScreencasts();
+  }
+}
+
+export { createBrowserControlContext, getBrowserControlState };

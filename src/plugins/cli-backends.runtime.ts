@@ -1,35 +1,33 @@
-import { createRequire } from "node:module";
 import type { CliBackendPlugin } from "./cli-backend.types.js";
+import { isPluginRegistryRetired } from "./registry-lifecycle.js";
+import { getPluginRegistryForContext } from "./runtime/gateway-request-scope.js";
 
-export type PluginCliBackendEntry = CliBackendPlugin & {
+type PluginCliBackendEntry = CliBackendPlugin & {
   pluginId: string;
+  builtWithOpenClawVersion?: string;
 };
 
-type PluginRuntimeModule = Pick<typeof import("./runtime.js"), "getActivePluginRegistry">;
+type PluginCliBackendMetadata = Pick<
+  PluginCliBackendEntry,
+  "id" | "modelProvider" | "subscriptionAuthDispatch" | "pluginId"
+>;
 
-const require = createRequire(import.meta.url);
-const RUNTIME_MODULE_CANDIDATES = ["./runtime.js", "./runtime.ts"] as const;
-
-let pluginRuntimeModule: PluginRuntimeModule | undefined;
-
-function loadPluginRuntime(): PluginRuntimeModule | null {
-  if (pluginRuntimeModule) {
-    return pluginRuntimeModule;
-  }
-  for (const candidate of RUNTIME_MODULE_CANDIDATES) {
-    try {
-      pluginRuntimeModule = require(candidate) as PluginRuntimeModule;
-      return pluginRuntimeModule;
-    } catch {
-      // Try source/runtime candidates in order.
-    }
-  }
-  return null;
-}
-
-export function resolveRuntimeCliBackends(): PluginCliBackendEntry[] {
-  return (loadPluginRuntime()?.getActivePluginRegistry()?.cliBackends ?? []).map((entry) => ({
-    ...entry.backend,
-    pluginId: entry.pluginId,
-  }));
+export function resolveRuntimeCliBackends(mode: "metadata"): PluginCliBackendMetadata[];
+export function resolveRuntimeCliBackends(): PluginCliBackendEntry[];
+export function resolveRuntimeCliBackends(mode?: "metadata"): PluginCliBackendMetadata[] {
+  const registry = getPluginRegistryForContext();
+  return (registry && !isPluginRegistryRetired(registry) ? registry.cliBackends : []).map(
+    (entry) =>
+      mode === "metadata"
+        ? {
+            id: entry.backend.id,
+            modelProvider: entry.backend.modelProvider,
+            subscriptionAuthDispatch: entry.backend.subscriptionAuthDispatch,
+            pluginId: entry.pluginId,
+          }
+        : Object.assign({}, entry.backend, {
+            pluginId: entry.pluginId,
+            builtWithOpenClawVersion: entry.builtWithOpenClawVersion,
+          }),
+  );
 }

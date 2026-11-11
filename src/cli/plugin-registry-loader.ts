@@ -1,31 +1,46 @@
-import { loggingState } from "../logging/state.js";
-import type { PluginRegistryScope } from "./plugin-registry.js";
+// Lazy plugin-registry loader for CLI commands that need plugin command/capability metadata.
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createLazyImportLoader } from "../shared/lazy-promise.js";
+import type { CliPluginRegistryScope } from "./command-catalog-types.js";
+import { measureCliCommandStartup } from "./command-startup-timing.js";
+import { withConsoleLogsRoutedToStderr } from "./json-output-mode.js";
 
-let pluginRegistryModulePromise: Promise<typeof import("./plugin-registry.js")> | undefined;
+const pluginRegistryModuleLoader = createLazyImportLoader(
+  () => import("../plugins/runtime/runtime-registry-loader.js"),
+);
+const sandboxRegistryModuleLoader = createLazyImportLoader(
+  () => import("../agents/sandbox/registry.js"),
+);
 
-function loadPluginRegistryModule() {
-  pluginRegistryModulePromise ??= import("./plugin-registry.js");
-  return pluginRegistryModulePromise;
+async function readPersistedSandboxBackendIds(): Promise<string[]> {
+  // Management must activate each recorded owner before lifecycle code can
+  // inspect or remove its runtime. Configured-only activation strands old rows.
+  const { readRegistry } = await sandboxRegistryModuleLoader.load();
+  const registry = await readRegistry();
+  return [...new Set(registry.entries.map((entry) => entry.backendId ?? "docker"))].toSorted();
 }
 
-export function resolvePluginRegistryScopeForCommandPath(
-  commandPath: string[],
-): Exclude<PluginRegistryScope, "configured-channels"> {
-  return commandPath[0] === "status" || commandPath[0] === "health" ? "channels" : "all";
-}
-
+/** Load the CLI plugin registry and optionally route activation logs to stderr. */
 export async function ensureCliPluginRegistryLoaded(params: {
-  scope: PluginRegistryScope;
+  scope: CliPluginRegistryScope;
   routeLogsToStderr?: boolean;
+  config?: OpenClawConfig;
 }) {
-  const { ensurePluginRegistryLoaded } = await loadPluginRegistryModule();
-  const previousForceStderr = loggingState.forceConsoleToStderr;
-  if (params.routeLogsToStderr) {
-    loggingState.forceConsoleToStderr = true;
-  }
-  try {
-    ensurePluginRegistryLoaded({ scope: params.scope });
-  } finally {
-    loggingState.forceConsoleToStderr = previousForceStderr;
-  }
+  const persistedSandboxBackendIds =
+    params.scope === "sandbox-management"
+      ? await measureCliCommandStartup("sandbox-registry-read", readPersistedSandboxBackendIds)
+      : undefined;
+  const { ensurePluginRegistryLoaded } = await measureCliCommandStartup(
+    "plugin-registry-module-import",
+    pluginRegistryModuleLoader.load,
+  );
+  const load = () =>
+    ensurePluginRegistryLoaded({
+      scope: params.scope === "sandbox-management" ? "sandbox-backends" : params.scope,
+      ...(params.config ? { config: params.config } : {}),
+      ...(persistedSandboxBackendIds ? { persistedSandboxBackendIds } : {}),
+    });
+  await measureCliCommandStartup("plugin-registry-runtime-load", () =>
+    params.routeLogsToStderr ? withConsoleLogsRoutedToStderr(load) : load(),
+  );
 }

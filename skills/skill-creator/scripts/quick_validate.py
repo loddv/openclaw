@@ -21,9 +21,16 @@ def _extract_frontmatter(content: str) -> Optional[str]:
     if not lines or lines[0].strip() != "---":
         return None
     for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
+        if lines[i].rstrip() == "---":
             return "\n".join(lines[1:i])
     return None
+
+
+def _strip_scalar_comment(value: str) -> str:
+    if value.startswith("#"):
+        return ""
+    # Only a leading quote delimits a quoted scalar; apostrophes in plain text do not.
+    return re.sub(r"""^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^'"].*?)[ \t]+#.*$""", r"\1", value)
 
 
 def _parse_simple_frontmatter(frontmatter_text: str) -> Optional[dict[str, str]]:
@@ -33,29 +40,38 @@ def _parse_simple_frontmatter(frontmatter_text: str) -> Optional[dict[str, str]]
     """
     parsed: dict[str, str] = {}
     current_key: Optional[str] = None
+    block_scalar = False
     for raw_line in frontmatter_text.splitlines():
         stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
+        is_indented = raw_line[:1].isspace()
+        if not stripped or (stripped.startswith("#") and not (block_scalar and is_indented)):
             continue
 
-        is_indented = raw_line[:1].isspace()
         if is_indented:
             if current_key is None:
                 return None
             current_value = parsed[current_key]
-            parsed[current_key] = (
-                f"{current_value}\n{stripped}" if current_value else stripped
-            )
+            if not block_scalar:
+                if not current_value:
+                    stripped = _strip_scalar_comment(stripped)
+                elif not current_value.startswith(("'", '"')):
+                    # Quotes on a plain scalar's continuation are literal text.
+                    stripped = re.sub(r"[ \t]+#.*$", "", stripped)
+            parsed[current_key] = f"{current_value}\n{stripped}" if current_value else stripped
             continue
 
         if ":" not in stripped:
             return None
         key, value = stripped.split(":", 1)
         key = key.strip()
-        value = value.strip()
+        value = _strip_scalar_comment(value.strip())
         if not key:
             return None
-        if (value.startswith('"') and value.endswith('"')) or (
+        # Block headers describe the scalar; only its indented body is content.
+        block_scalar = bool(re.fullmatch(r"[>|](?:[1-9][+-]?|[+-][1-9]?)?", value))
+        if block_scalar:
+            value = ""
+        elif (value.startswith('"') and value.endswith('"')) or (
             value.startswith("'") and value.endswith("'")
         ):
             value = value[1:-1]
@@ -73,8 +89,8 @@ def validate_skill(skill_path):
         return False, "SKILL.md not found"
 
     try:
-        content = skill_md.read_text(encoding="utf-8")
-    except OSError as e:
+        content = skill_md.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
         return False, f"Could not read SKILL.md: {e}"
 
     frontmatter_text = _extract_frontmatter(content)
@@ -95,12 +111,24 @@ def validate_skill(skill_path):
                 "Invalid YAML in frontmatter: unsupported syntax without PyYAML installed",
             )
 
-    allowed_properties = {"name", "description", "license", "allowed-tools", "metadata"}
+    allowed_properties = {
+        "name",
+        "description",
+        "homepage",
+        "license",
+        "allowed-tools",
+        "user-invocable",
+        "disable-model-invocation",
+        "command-dispatch",
+        "command-tool",
+        "command-arg-mode",
+        "metadata",
+    }
 
     unexpected_keys = set(frontmatter.keys()) - allowed_properties
     if unexpected_keys:
         allowed = ", ".join(sorted(allowed_properties))
-        unexpected = ", ".join(sorted(unexpected_keys))
+        unexpected = ", ".join(sorted(str(key) for key in unexpected_keys))
         return (
             False,
             f"Unexpected key(s) in SKILL.md frontmatter: {unexpected}. Allowed properties are: {allowed}",
@@ -115,36 +143,38 @@ def validate_skill(skill_path):
     if not isinstance(name, str):
         return False, f"Name must be a string, got {type(name).__name__}"
     name = name.strip()
-    if name:
-        if not re.match(r"^[a-z0-9-]+$", name):
-            return (
-                False,
-                f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)",
-            )
-        if name.startswith("-") or name.endswith("-") or "--" in name:
-            return (
-                False,
-                f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens",
-            )
-        if len(name) > MAX_SKILL_NAME_LENGTH:
-            return (
-                False,
-                f"Name is too long ({len(name)} characters). "
-                f"Maximum is {MAX_SKILL_NAME_LENGTH} characters.",
-            )
+    if not name:
+        return False, "Name must not be empty"
+    if not re.match(r"^[a-z0-9-]+$", name):
+        return (
+            False,
+            f"Name '{name}' should be hyphen-case (lowercase letters, digits, and hyphens only)",
+        )
+    if name.startswith("-") or name.endswith("-") or "--" in name:
+        return (
+            False,
+            f"Name '{name}' cannot start/end with hyphen or contain consecutive hyphens",
+        )
+    if len(name) > MAX_SKILL_NAME_LENGTH:
+        return (
+            False,
+            f"Name is too long ({len(name)} characters). "
+            f"Maximum is {MAX_SKILL_NAME_LENGTH} characters.",
+        )
 
     description = frontmatter.get("description", "")
     if not isinstance(description, str):
         return False, f"Description must be a string, got {type(description).__name__}"
     description = description.strip()
-    if description:
-        if "<" in description or ">" in description:
-            return False, "Description cannot contain angle brackets (< or >)"
-        if len(description) > 1024:
-            return (
-                False,
-                f"Description is too long ({len(description)} characters). Maximum is 1024 characters.",
-            )
+    if not description:
+        return False, "Description must not be empty"
+    if "<" in description or ">" in description:
+        return False, "Description cannot contain angle brackets (< or >)"
+    if len(description) > 1024:
+        return (
+            False,
+            f"Description is too long ({len(description)} characters). Maximum is 1024 characters.",
+        )
 
     return True, "Skill is valid!"
 

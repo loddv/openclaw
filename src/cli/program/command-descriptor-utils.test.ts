@@ -1,28 +1,8 @@
-import { Command } from "commander";
+// Command descriptor utilities retain the shared first-wins grouping contract.
 import { describe, expect, it } from "vitest";
-import {
-  addCommandDescriptorsToProgram,
-  collectUniqueCommandDescriptors,
-  defineCommandDescriptorCatalog,
-  getCommandDescriptorNames,
-  getCommandsWithSubcommands,
-} from "./command-descriptor-utils.js";
+import { collectUniqueCommandDescriptors } from "./command-descriptor-utils.js";
 
 describe("command-descriptor-utils", () => {
-  const descriptors = [
-    { name: "alpha", description: "Alpha", hasSubcommands: false },
-    { name: "beta", description: "Beta", hasSubcommands: true },
-    { name: "gamma", description: "Gamma", hasSubcommands: true },
-  ] as const;
-
-  it("returns descriptor names in order", () => {
-    expect(getCommandDescriptorNames(descriptors)).toEqual(["alpha", "beta", "gamma"]);
-  });
-
-  it("returns commands with subcommands", () => {
-    expect(getCommandsWithSubcommands(descriptors)).toEqual(["beta", "gamma"]);
-  });
-
   it("collects unique descriptors across groups in order", () => {
     expect(
       collectUniqueCommandDescriptors([
@@ -39,36 +19,6 @@ describe("command-descriptor-utils", () => {
       { name: "alpha", description: "Alpha" },
       { name: "beta", description: "Beta" },
       { name: "gamma", description: "Gamma" },
-    ]);
-  });
-
-  it("defines a reusable descriptor catalog", () => {
-    const catalog = defineCommandDescriptorCatalog(descriptors);
-
-    expect(catalog.descriptors).toBe(descriptors);
-    expect(catalog.getDescriptors()).toBe(descriptors);
-    expect(catalog.getNames()).toEqual(["alpha", "beta", "gamma"]);
-    expect(catalog.getCommandsWithSubcommands()).toEqual(["beta", "gamma"]);
-  });
-
-  it("adds descriptors without duplicating existing commands", () => {
-    const program = new Command();
-    const existingCommands = addCommandDescriptorsToProgram(program, descriptors);
-
-    addCommandDescriptorsToProgram(
-      program,
-      [
-        { name: "beta", description: "Ignored duplicate" },
-        { name: "delta", description: "Delta" },
-      ],
-      existingCommands,
-    );
-
-    expect(program.commands.map((command) => command.name())).toEqual([
-      "alpha",
-      "beta",
-      "gamma",
-      "delta",
     ]);
   });
 });

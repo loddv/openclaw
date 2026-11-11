@@ -1,44 +1,20 @@
-import { hasNonEmptyString } from "../infra/outbound/channel-target.js";
-import { isRecord } from "../utils.js";
-import type { OpenClawConfig } from "./config.js";
+import { getChannelEnvVars } from "../secrets/channel-env-vars.js";
+import {
+  hasMeaningfulChannelConfigShallow,
+  resolveChannelConfigRecord,
+} from "./channel-config-activation.js";
+import type { OpenClawConfig } from "./types.openclaw.js";
 
-const STATIC_ENV_RULES: Record<string, string[] | ((env: NodeJS.ProcessEnv) => boolean)> = {
-  discord: ["DISCORD_BOT_TOKEN"],
-  slack: ["SLACK_BOT_TOKEN"],
-  telegram: ["TELEGRAM_BOT_TOKEN"],
-  irc: (env) => hasNonEmptyString(env.IRC_HOST) && hasNonEmptyString(env.IRC_NICK),
-};
-
-export function resolveChannelConfigRecord(
-  cfg: OpenClawConfig,
-  channelId: string,
-): Record<string, unknown> | null {
-  const channels = cfg.channels as Record<string, unknown> | undefined;
-  const entry = channels?.[channelId];
-  return isRecord(entry) ? entry : null;
-}
-
-export function hasMeaningfulChannelConfigShallow(value: unknown): boolean {
-  if (!isRecord(value)) {
-    return false;
-  }
-  return Object.keys(value).some((key) => key !== "enabled");
-}
-
+/** Detects static channel configuration from known env vars or `channels.<id>` config. */
 export function isStaticallyChannelConfigured(
   cfg: OpenClawConfig,
   channelId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  const staticRule = STATIC_ENV_RULES[channelId];
-  if (Array.isArray(staticRule)) {
-    for (const envVar of staticRule) {
-      if (hasNonEmptyString(env[envVar])) {
-        return true;
-      }
+  for (const envVar of getChannelEnvVars(channelId, { config: cfg, env })) {
+    if (typeof env[envVar] === "string" && env[envVar].trim().length > 0) {
+      return true;
     }
-  } else if (staticRule?.(env)) {
-    return true;
   }
-  return hasMeaningfulChannelConfigShallow(resolveChannelConfigRecord(cfg, channelId));
+  return hasMeaningfulChannelConfigShallow(resolveChannelConfigRecord(cfg, channelId), channelId);
 }

@@ -1,95 +1,110 @@
-import type { OpenClawConfig } from "../config/types.js";
-import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import {
-  bundledProviderSupportsNativePdfDocument,
-  resolveBundledAutoMediaKeyProviders,
-  resolveBundledDefaultMediaModel,
-} from "./bundled-defaults.js";
-import { buildMediaUnderstandingRegistry, normalizeMediaProviderId } from "./provider-registry.js";
-import type { MediaUnderstandingCapability, MediaUnderstandingProvider } from "./types.js";
+  normalizeMediaExecutionProviderId,
+  normalizeMediaProviderId,
+} from "../../packages/media-understanding-common/src/provider-id.js";
+import type { OpenClawConfig } from "../config/types.js";
+import { loadManifestMetadataSnapshot } from "../plugins/manifest-contract-eligibility.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { listImageCapableConfiguredProviders } from "./config-provider-models.js";
+import {
+  resolveAutoMediaKeyProvidersFromRegistry,
+  resolveDefaultMediaModelFromRegistry,
+} from "./provider-registry-metadata.js";
+import type { MediaUnderstandingProvider } from "./provider-types.js";
+import type { MediaUnderstandingCapability } from "./types.js";
+export { CLI_OUTPUT_MAX_BUFFER } from "./defaults.constants.js";
 
-const MB = 1024 * 1024;
+// Defaults follow the selected immutable manifest generation, including retained
+// owners. Configured model overrides remain outside this projection.
+const registriesByManifest = new WeakMap<
+  PluginManifestRegistry,
+  Map<string, MediaUnderstandingProvider>
+>();
 
-export const DEFAULT_MAX_CHARS = 500;
-export const DEFAULT_MAX_CHARS_BY_CAPABILITY: Record<
-  MediaUnderstandingCapability,
-  number | undefined
-> = {
-  image: DEFAULT_MAX_CHARS,
-  audio: undefined,
-  video: DEFAULT_MAX_CHARS,
-};
-export const DEFAULT_MAX_BYTES: Record<MediaUnderstandingCapability, number> = {
-  image: 10 * MB,
-  audio: 20 * MB,
-  video: 50 * MB,
-};
-export const DEFAULT_TIMEOUT_SECONDS: Record<MediaUnderstandingCapability, number> = {
-  image: 60,
-  audio: 60,
-  video: 120,
-};
-export const DEFAULT_PROMPT: Record<MediaUnderstandingCapability, string> = {
-  image: "Describe the image.",
-  audio: "Transcribe the audio.",
-  video: "Describe the video.",
-};
-export const DEFAULT_VIDEO_MAX_BASE64_BYTES = 70 * MB;
-export const CLI_OUTPUT_MAX_BUFFER = 5 * MB;
-export const DEFAULT_MEDIA_CONCURRENCY = 2;
-
-function providerSupportsCapability(
-  provider: MediaUnderstandingProvider | undefined,
-  capability: MediaUnderstandingCapability,
-): boolean {
-  if (!provider) {
-    return false;
+/** Builds a media provider registry from trusted manifest metadata without loading plugin code. */
+function buildMediaUnderstandingManifestMetadataRegistry(
+  cfg?: OpenClawConfig,
+  workspaceDir?: string,
+): Map<string, MediaUnderstandingProvider> {
+  const snapshot = loadManifestMetadataSnapshot({
+    config: cfg,
+    env: process.env,
+    ...(workspaceDir ? { workspaceDir } : {}),
+  });
+  const cached = registriesByManifest.get(snapshot.manifestRegistry);
+  if (cached) {
+    return cached;
   }
-  if (capability === "audio") {
-    return Boolean(provider.transcribeAudio);
+  const registry = new Map<string, MediaUnderstandingProvider>();
+  for (const plugin of snapshot.plugins) {
+    // Metadata only counts when the manifest also declares the provider contract.
+    const declaredProviders = new Set(
+      (plugin.contracts?.mediaUnderstandingProviders ?? []).map((providerId) =>
+        normalizeMediaProviderId(providerId),
+      ),
+    );
+    for (const [providerId, metadata] of Object.entries(
+      plugin.mediaUnderstandingProviderMetadata ?? {},
+    )) {
+      // Metadata is trusted only when the plugin also declares the corresponding
+      // provider contract; stray manifest fields must not register providers.
+      const normalizedProviderId = normalizeMediaProviderId(providerId);
+      if (!normalizedProviderId || !declaredProviders.has(normalizedProviderId)) {
+        continue;
+      }
+      registry.set(normalizedProviderId, {
+        id: normalizedProviderId,
+        capabilities: metadata.capabilities,
+        defaultModels: metadata.defaultModels,
+        autoPriority: metadata.autoPriority,
+        nativeDocumentInputs: metadata.nativeDocumentInputs,
+        documentModels: metadata.documentModels,
+      });
+    }
   }
-  if (capability === "image") {
-    return Boolean(provider.describeImage);
-  }
-  return Boolean(provider.describeVideo);
-}
-
-function resolveDefaultRegistry(cfg?: OpenClawConfig) {
-  return buildMediaUnderstandingRegistry(undefined, cfg ?? ({} as OpenClawConfig));
+  registriesByManifest.set(snapshot.manifestRegistry, registry);
+  return registry;
 }
 
 function resolveConfiguredImageProviderModel(params: {
   cfg?: OpenClawConfig;
   providerId: string;
 }): string | undefined {
-  const providers = params.cfg?.models?.providers;
-  if (!providers || typeof providers !== "object") {
-    return undefined;
-  }
   const normalizedProviderId = normalizeMediaProviderId(params.providerId);
-  for (const [providerKey, providerCfg] of Object.entries(providers)) {
+  for (const [providerKey, providerCfg] of Object.entries(params.cfg?.models?.providers ?? {})) {
     if (normalizeMediaProviderId(providerKey) !== normalizedProviderId) {
       continue;
     }
-    const models = providerCfg?.models ?? [];
-    const match = models.find(
-      (model) =>
-        Boolean(normalizeOptionalString(model?.id)) &&
-        Array.isArray(model?.input) &&
-        model.input.includes("image"),
+    const match = (providerCfg.models ?? []).find(
+      (model) => Boolean(normalizeOptionalString(model.id)) && model.input?.includes("image"),
     );
     return normalizeOptionalString(match?.id);
   }
   return undefined;
 }
 
+function resolveConfiguredImageProviderIds(cfg?: OpenClawConfig): string[] {
+  return uniqueStrings(
+    listImageCapableConfiguredProviders(cfg).map(normalizeMediaExecutionProviderId),
+  );
+}
+
+function isExecutionAliasProvider(providerId: string): boolean {
+  return normalizeMediaProviderId(providerId) !== providerId;
+}
+
+/** Resolves the default provider model for a media capability from config or manifest metadata. */
 export function resolveDefaultMediaModel(params: {
   providerId: string;
   capability: MediaUnderstandingCapability;
   cfg?: OpenClawConfig;
+  workspaceDir?: string;
   providerRegistry?: Map<string, MediaUnderstandingProvider>;
+  includeConfiguredImageModels?: boolean;
 }): string | undefined {
-  if (!params.providerRegistry) {
+  if (!params.providerRegistry && params.includeConfiguredImageModels !== false) {
     const configuredImageModel =
       params.capability === "image"
         ? resolveConfiguredImageProviderModel({
@@ -100,86 +115,72 @@ export function resolveDefaultMediaModel(params: {
     if (configuredImageModel) {
       return configuredImageModel;
     }
-    const bundledDefault = resolveBundledDefaultMediaModel({
-      providerId: params.providerId,
-      capability: params.capability,
-    });
-    if (bundledDefault) {
-      return bundledDefault;
-    }
   }
-  const registry = params.providerRegistry ?? resolveDefaultRegistry(params.cfg);
-  const provider = registry.get(normalizeMediaProviderId(params.providerId));
-  return normalizeOptionalString(provider?.defaultModels?.[params.capability]);
+  const registry =
+    params.providerRegistry ??
+    buildMediaUnderstandingManifestMetadataRegistry(params.cfg, params.workspaceDir);
+  return resolveDefaultMediaModelFromRegistry({
+    providerId: params.providerId,
+    capability: params.capability,
+    providerRegistry: registry,
+  });
 }
 
+/** Resolves auto-discovery provider order for a media capability using manifest priorities. */
 export function resolveAutoMediaKeyProviders(params: {
   capability: MediaUnderstandingCapability;
   cfg?: OpenClawConfig;
+  workspaceDir?: string;
   providerRegistry?: Map<string, MediaUnderstandingProvider>;
 }): string[] {
-  if (!params.providerRegistry) {
-    const bundledProviders = resolveBundledAutoMediaKeyProviders(params.capability);
-    if (params.capability !== "image") {
-      return bundledProviders;
-    }
-    const configProviders = params.cfg?.models?.providers;
-    if (!configProviders || typeof configProviders !== "object") {
-      return bundledProviders;
-    }
-    const merged = [...bundledProviders];
-    for (const [providerKey, providerCfg] of Object.entries(configProviders)) {
-      const normalizedProviderId = normalizeMediaProviderId(providerKey);
-      const models = providerCfg?.models ?? [];
-      const hasImageModel = models.some(
-        (model) => Array.isArray(model?.input) && model.input.includes("image"),
-      );
-      if (hasImageModel && !merged.includes(normalizedProviderId)) {
-        merged.push(normalizedProviderId);
-      }
-    }
-    return merged;
+  const registry =
+    params.providerRegistry ??
+    buildMediaUnderstandingManifestMetadataRegistry(params.cfg, params.workspaceDir);
+  const prioritized = resolveAutoMediaKeyProvidersFromRegistry({
+    capability: params.capability,
+    providerRegistry: registry,
+  });
+  if (params.providerRegistry || params.capability !== "image") {
+    return prioritized;
   }
-  const registry = params.providerRegistry ?? resolveDefaultRegistry(params.cfg);
-  type AutoProviderEntry = {
-    provider: MediaUnderstandingProvider;
-    priority: number;
-  };
-  return [...registry.values()]
-    .filter((provider) => providerSupportsCapability(provider, params.capability))
-    .map((provider): AutoProviderEntry | null => {
-      const priority = provider.autoPriority?.[params.capability];
-      return typeof priority === "number" && Number.isFinite(priority)
-        ? { provider, priority }
-        : null;
-    })
-    .filter((entry): entry is AutoProviderEntry => entry !== null)
-    .toSorted((left, right) => {
-      if (left.priority !== right.priority) {
-        return left.priority - right.priority;
-      }
-      return left.provider.id.localeCompare(right.provider.id);
-    })
-    .map((entry) => normalizeMediaProviderId(entry.provider.id))
-    .filter(Boolean);
+  const configured = resolveConfiguredImageProviderIds(params.cfg);
+  for (const providerId of configured.filter(isExecutionAliasProvider)) {
+    const canonicalIndex = prioritized.indexOf(normalizeMediaProviderId(providerId));
+    if (canonicalIndex >= 0) {
+      prioritized.splice(canonicalIndex, 0, providerId);
+    } else {
+      prioritized.unshift(providerId);
+    }
+  }
+  for (const providerId of configured.filter((id) => !isExecutionAliasProvider(id))) {
+    prioritized.push(providerId);
+  }
+  return uniqueStrings(prioritized);
 }
 
+/** Returns whether provider metadata declares native PDF document input support. */
 export function providerSupportsNativePdfDocument(params: {
   providerId: string;
   cfg?: OpenClawConfig;
-  providerRegistry?: Map<string, MediaUnderstandingProvider>;
+  workspaceDir?: string;
 }): boolean {
-  if (!params.providerRegistry && bundledProviderSupportsNativePdfDocument(params.providerId)) {
-    return true;
-  }
-  const registry = params.providerRegistry ?? resolveDefaultRegistry(params.cfg);
+  const registry = buildMediaUnderstandingManifestMetadataRegistry(params.cfg, params.workspaceDir);
   const provider = registry.get(normalizeMediaProviderId(params.providerId));
   return provider?.nativeDocumentInputs?.includes("pdf") ?? false;
 }
 
-/**
- * Minimum audio file size in bytes below which transcription is skipped.
- * Files smaller than this threshold are almost certainly empty or corrupt
- * and would cause unhelpful API errors from Whisper/transcription providers.
- */
-export const MIN_AUDIO_FILE_BYTES = 1024;
+/** Resolves provider-specific document model hints, preserving explicit unsupported markers. */
+export function resolveDocumentMediaModel(params: {
+  providerId: string;
+  mode: "textExtraction" | "image";
+  cfg?: OpenClawConfig;
+  workspaceDir?: string;
+}): string | false | undefined {
+  const registry = buildMediaUnderstandingManifestMetadataRegistry(params.cfg, params.workspaceDir);
+  const provider = registry.get(normalizeMediaProviderId(params.providerId));
+  const value = provider?.documentModels?.pdf?.[params.mode];
+  if (value === false) {
+    return false;
+  }
+  return normalizeOptionalString(value);
+}

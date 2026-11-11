@@ -1,32 +1,44 @@
-export type MSTeamsQuoteInfo = {
-  sender: string;
-  body: string;
-};
+import { decodeHtmlEntities } from "openclaw/plugin-sdk/html-entity-runtime";
 
-/**
- * Decode common HTML entities to plain text.
- */
-export function decodeHtmlEntities(html: string): string {
-  return html
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&"); // must be last to prevent double-decoding (e.g. &amp;lt; → &lt; not <)
+export function htmlToPlainText(html: string): string {
+  return decodeHtmlEntities(html.replace(/<[^>]*>/g, " "))
+    .replaceAll("\u00a0", " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /**
- * Strip HTML tags, preserving text content.
+ * Content of the first `<p ...>` whose opening tag contains `attribute`, up to the next
+ * `</p>`, matching `/<p[^>]*ATTRIBUTE[^>]*>(.*?)<\/p>/is`. Opening tags, attribute
+ * matches and `>` positions are all visited in one forward pass.
  */
-export function htmlToPlainText(html: string): string {
-  return decodeHtmlEntities(
-    html
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim(),
-  );
+function findParagraphContent(html: string, attribute: RegExp): string | undefined {
+  const attributes = Array.from(html.matchAll(attribute), (match) => ({
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
+  let nextAttribute = 0;
+  let tagEnd = -1;
+  for (const open of html.matchAll(/<p/gi)) {
+    const afterOpen = open.index + open[0].length;
+    if (tagEnd < afterOpen) {
+      tagEnd = html.indexOf(">", afterOpen);
+      if (tagEnd < 0) {
+        return undefined;
+      }
+    }
+    while (nextAttribute < attributes.length && attributes[nextAttribute]!.start < afterOpen) {
+      nextAttribute += 1;
+    }
+    const match = attributes[nextAttribute];
+    if (match && match.end <= tagEnd) {
+      const close = /<\/p>/gi;
+      close.lastIndex = tagEnd + 1;
+      const closeMatch = close.exec(html);
+      return closeMatch ? html.slice(tagEnd + 1, closeMatch.index) : undefined;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -35,7 +47,7 @@ export function htmlToPlainText(html: string): string {
  */
 export function extractMSTeamsQuoteInfo(
   attachments: Array<{ contentType?: string | null; content?: unknown }>,
-): MSTeamsQuoteInfo | undefined {
+) {
   for (const att of attachments) {
     // Content may be a plain string or an object with .text/.body (e.g. Adaptive Card payloads).
     let content = "";
@@ -54,30 +66,39 @@ export function extractMSTeamsQuoteInfo(
       continue;
     }
 
-    // Look for the Skype Reply schema blockquote.
     if (!content.includes("http://schema.skype.com/Reply")) {
       continue;
     }
 
-    // Extract sender from <strong itemprop="mri">.
     const senderMatch = /<strong[^>]*itemprop=["']mri["'][^>]*>(.*?)<\/strong>/i.exec(content);
     const sender = senderMatch?.[1] ? htmlToPlainText(senderMatch[1]) : undefined;
 
-    // Extract body from <p itemprop="copy">.
-    const bodyMatch = /<p[^>]*itemprop=["']copy["'][^>]*>(.*?)<\/p>/is.exec(content);
-    const body = bodyMatch?.[1] ? htmlToPlainText(bodyMatch[1]) : undefined;
+    // Extract body from <p itemprop="copy"> (full quoted text) and fall back to
+    // <p itemprop="preview"> — the truncated snippet Teams actually sends for
+    // quote replies. Prefer `copy` when both are present.
+    const bodyHtml =
+      findParagraphContent(content, /itemprop=["']copy["']/gi) ??
+      findParagraphContent(content, /itemprop=["']preview["']/gi);
+    const body = bodyHtml ? htmlToPlainText(bodyHtml) : undefined;
+
+    // Capture the blockquote `itemid` (the quoted message's Teams id) so callers
+    // can fetch the complete message text via Graph when only a preview snippet
+    // is available.
+    const idMatch = /<blockquote[^>]*\bitemid=["']([^"']+)["'][^>]*>/is.exec(content);
+    const id = idMatch?.[1]?.trim() || undefined;
 
     if (body) {
-      return { sender: sender ?? "unknown", body };
+      return { sender: sender ?? "unknown", body, ...(id ? { id } : {}) };
     }
   }
   return undefined;
 }
 
-export type MentionableActivity = {
+type MentionableActivity = {
   recipient?: { id?: string } | null;
   entities?: Array<{
     type?: string;
+    text?: string;
     mentioned?: { id?: string };
   }> | null;
 };
@@ -114,28 +135,33 @@ export function stripMSTeamsMentionTags(text: string): string {
   return text.replace(/<at[^>]*>.*?<\/at>/gi, "").trim();
 }
 
-/**
- * Bot Framework uses 'a:xxx' conversation IDs for personal chats, but Graph API
- * requires the '19:{userId}_{botAppId}@unq.gbl.spaces' format.
- *
- * This is the documented Graph API format for 1:1 chat thread IDs between a user
- * and a bot/app. See Microsoft docs "Get chat between user and app":
- * https://learn.microsoft.com/en-us/graph/api/userscopeteamsappinstallation-get-chat
- *
- * The format is only synthesized when the Bot Framework conversation ID starts with
- * 'a:' (the opaque format used by BF but not recognized by Graph). If the ID already
- * has the '19:...' Graph format, it is passed through unchanged.
- */
-export function translateMSTeamsDmConversationIdForGraph(params: {
-  isDirectMessage: boolean;
-  conversationId: string;
-  aadObjectId?: string | null;
-  appId?: string | null;
-}): string {
-  const { isDirectMessage, conversationId, aadObjectId, appId } = params;
-  return isDirectMessage && conversationId.startsWith("a:") && aadObjectId && appId
-    ? `19:${aadObjectId}_${appId}@unq.gbl.spaces`
-    : conversationId;
+export function normalizeMSTeamsMentionTags(
+  text: string,
+  activity: MentionableActivity,
+  options: { preserveHtml?: boolean } = {},
+): string {
+  const normalizeTag = (tag: string) =>
+    tag.trim().replace(/<\/?at\b/gi, (delimiter) => delimiter.toLowerCase());
+  const botId = activity.recipient?.id;
+  const botMentions = new Map<string, boolean>();
+  for (const entity of activity.entities ?? []) {
+    if (entity.type !== "mention" || typeof entity.text !== "string") {
+      continue;
+    }
+    const tag = normalizeTag(entity.text);
+    const isBot = Boolean(botId && entity.mentioned?.id === botId);
+    botMentions.set(tag, isBot && botMentions.get(tag) !== false);
+  }
+  return text
+    .replace(/<at\b[^>]*>([\s\S]*?)<\/at\s*>/gi, (tag: string, label: string) => {
+      // Identical display spans can name different users; remove only an unambiguous bot span.
+      if (botMentions.get(normalizeTag(tag))) {
+        return options.preserveHtml ? " " : "";
+      }
+      const displayName = htmlToPlainText(label);
+      return displayName ? `@${options.preserveHtml ? label : displayName}` : "";
+    })
+    .trim();
 }
 
 export function wasMSTeamsBotMentioned(activity: MentionableActivity): boolean {

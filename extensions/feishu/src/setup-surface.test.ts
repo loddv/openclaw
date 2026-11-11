@@ -1,441 +1,238 @@
-import { adaptScopedAccountAccessor } from "openclaw/plugin-sdk/channel-config-helpers";
-import { describe, expect, it, vi } from "vitest";
-import { createNonExitingTypedRuntimeEnv } from "../../../test/helpers/plugins/runtime-env.js";
 import {
+  createNonExitingRuntimeEnv,
   createPluginSetupWizardConfigure,
   createPluginSetupWizardStatus,
   createTestWizardPrompter,
   runSetupWizardConfigure,
-  type WizardPrompter,
-} from "../../../test/helpers/plugins/setup-wizard.js";
-import {
-  listFeishuAccountIds,
-  resolveDefaultFeishuAccountId,
-  resolveFeishuAccount,
-} from "./accounts.js";
-import { feishuSetupAdapter } from "./setup-core.js";
-import { feishuSetupWizard } from "./setup-surface.js";
+} from "openclaw/plugin-sdk/plugin-test-runtime";
+import { withEnvAsync } from "openclaw/plugin-sdk/test-env";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { FeishuProbeResult } from "./types.js";
 
-vi.mock("./probe.js", () => ({
-  probeFeishu: vi.fn(async () => ({ ok: false, error: "mocked" })),
+const { begin, owner, init, poll, qr, probe } = vi.hoisted(() => ({
+  begin: vi.fn(),
+  owner: vi.fn(),
+  init: vi.fn(),
+  poll: vi.fn(),
+  qr: vi.fn(),
+  probe: vi.fn<() => Promise<FeishuProbeResult>>(),
 }));
+// mock-isolation: setup discovery must not probe the Feishu network.
+vi.mock("./probe.js", () => ({ probeFeishu: probe }));
+// mock-isolation: setup tests control registration and QR polling without remote account effects.
+vi.mock("./app-registration.js", () => ({
+  initAppRegistration: init,
+  beginAppRegistration: begin,
+  pollAppRegistration: poll,
+  printQrCode: qr,
+  getAppOwnerOpenId: owner,
+}));
+import { feishuPlugin } from "./channel.js";
+import { setFeishuNamedAccountEnabled } from "./setup-core.js";
 
-const baseStatusContext = {
-  accountOverrides: {},
-};
-
-const feishuSetupPlugin = {
-  id: "feishu",
-  meta: {
-    id: "feishu",
-    label: "Feishu",
-    selectionLabel: "Feishu/Lark (飞书)",
-    docsPath: "/channels/feishu",
-    blurb: "飞书/Lark enterprise messaging.",
-  },
-  capabilities: {
-    chatTypes: ["direct", "group"] as Array<"direct" | "group">,
-  },
-  config: {
-    listAccountIds: (cfg: unknown) => listFeishuAccountIds(cfg as never),
-    defaultAccountId: (cfg: unknown) => resolveDefaultFeishuAccountId(cfg as never),
-    resolveAccount: adaptScopedAccountAccessor(resolveFeishuAccount),
-  },
-  setup: feishuSetupAdapter,
-  setupWizard: feishuSetupWizard,
-} as const;
-
-async function withEnvVars(values: Record<string, string | undefined>, run: () => Promise<void>) {
-  const previous = new Map<string, string | undefined>();
-  for (const [key, value] of Object.entries(values)) {
-    previous.set(key, process.env[key]);
-    if (value === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = value;
-    }
-  }
-
-  try {
-    await run();
-  } finally {
-    for (const [key, prior] of previous.entries()) {
-      if (prior === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = prior;
-      }
-    }
-  }
+const credentials = <I, S>(appId: I, appSecret: S) => ({ appId, appSecret });
+function credentialRefs(appId = "FEISHU_APP_ID", appSecret = "FEISHU_APP_SECRET") {
+  const ref = (id: string) => ({ source: "env", id, provider: "default" });
+  return credentials(ref(appId), ref(appSecret));
 }
-
-async function getStatusWithEnvRefs(params: { appIdKey: string; appSecretKey: string }) {
-  return await feishuGetStatus({
-    cfg: {
-      channels: {
-        feishu: {
-          appId: { source: "env", id: params.appIdKey, provider: "default" },
-          appSecret: { source: "env", id: params.appSecretKey, provider: "default" },
-        },
-      },
-    } as never,
-    ...baseStatusContext,
-  });
+function answers(...values: string[]) {
+  const mock = vi.fn();
+  for (const value of values) {
+    mock.mockResolvedValueOnce(value);
+  }
+  return mock;
 }
-
-const feishuConfigure = createPluginSetupWizardConfigure(feishuSetupPlugin);
-const feishuGetStatus = createPluginSetupWizardStatus(feishuSetupPlugin);
-type FeishuConfigureRuntime = Parameters<typeof feishuConfigure>[0]["runtime"];
-
-describe("feishu setup wizard", () => {
-  it("setup adapter preserves a selected named account id", () => {
-    expect(
-      feishuSetupPlugin.setup?.resolveAccountId?.({
-        cfg: {} as never,
-        accountId: "work",
-        input: {},
-      } as never),
-    ).toBe("work");
+const feishuConfigure = createPluginSetupWizardConfigure(feishuPlugin);
+const feishuGetStatus = createPluginSetupWizardStatus(feishuPlugin);
+const withFeishu = (feishu: Record<string, unknown>) => ({ channels: { feishu } });
+const status = (feishu: Record<string, unknown>) =>
+  feishuGetStatus({ cfg: withFeishu(feishu), accountOverrides: {} });
+const scanPrompts = (domain = "feishu", policy = "allowlist") => ({
+  select: answers("scan", domain, policy) as never,
+});
+async function configure(
+  prompts: Parameters<typeof createTestWizardPrompter>[0] = {},
+  feishu?: Record<string, unknown>,
+  options?: Parameters<typeof feishuConfigure>[0]["options"],
+) {
+  const result = await runSetupWizardConfigure({
+    configure: feishuConfigure,
+    cfg: feishu ? withFeishu(feishu) : {},
+    prompter: createTestWizardPrompter(prompts),
+    runtime: createNonExitingRuntimeEnv(),
+    options,
   });
-
-  it("setup adapter uses configured defaultAccount when accountId is omitted", () => {
-    expect(
-      feishuSetupPlugin.setup?.resolveAccountId?.({
-        cfg: {
-          channels: {
-            feishu: {
-              defaultAccount: "work",
-              accounts: {
-                work: {
-                  appId: "work-app",
-                  appSecret: "work-secret", // pragma: allowlist secret
-                },
-              },
-            },
-          },
-        } as never,
-        accountId: undefined,
-        input: {},
-      } as never),
-    ).toBe("work");
-  });
-
-  it("does not throw when config appId/appSecret are SecretRef objects", async () => {
-    const text = vi
-      .fn()
-      .mockResolvedValueOnce("cli_from_prompt")
-      .mockResolvedValueOnce("secret_from_prompt")
-      .mockResolvedValueOnce("oc_group_1");
-    const prompter = createTestWizardPrompter({
-      text,
-      confirm: vi.fn(async () => true),
-      select: vi.fn(
-        async ({ initialValue }: { initialValue?: string }) => initialValue ?? "allowlist",
-      ) as never,
-    });
-
-    await expect(
-      runSetupWizardConfigure({
-        configure: feishuConfigure,
-        cfg: {
-          channels: {
-            feishu: {
-              appId: { source: "env", id: "FEISHU_APP_ID", provider: "default" },
-              appSecret: { source: "env", id: "FEISHU_APP_SECRET", provider: "default" },
-            },
-          },
-        } as never,
-        prompter,
-        runtime: createNonExitingTypedRuntimeEnv<FeishuConfigureRuntime>(),
-      }),
-    ).resolves.toBeTruthy();
-  });
-
-  it("writes selected-account credentials instead of overwriting the channel root", async () => {
-    const prompter = createTestWizardPrompter({
-      text: vi.fn(async ({ message }: { message: string }) => {
-        if (message === "Enter Feishu App Secret") {
-          return "work-secret"; // pragma: allowlist secret
-        }
-        if (message === "Enter Feishu App ID") {
-          return "work-app";
-        }
-        if (message === "Group chat allowlist (chat_ids)") {
-          return "";
-        }
-        throw new Error(`Unexpected prompt: ${message}`);
-      }) as WizardPrompter["text"],
-      select: vi.fn(
-        async ({ initialValue }: { initialValue?: string }) => initialValue ?? "websocket",
-      ) as never,
-    });
-
-    const result = await runSetupWizardConfigure({
-      configure: feishuConfigure,
-      cfg: {
-        channels: {
-          feishu: {
-            appId: "top-level-app",
-            appSecret: "top-level-secret", // pragma: allowlist secret
-            accounts: {
-              work: {
-                appId: "",
-              },
-            },
-          },
-        },
-      } as never,
-      prompter,
-      accountOverrides: {
-        feishu: "work",
-      },
-      runtime: createNonExitingTypedRuntimeEnv<FeishuConfigureRuntime>(),
-    });
-
-    expect(result.cfg.channels?.feishu?.appId).toBe("top-level-app");
-    expect(result.cfg.channels?.feishu?.appSecret).toBe("top-level-secret");
-    expect(result.cfg.channels?.feishu?.accounts?.work).toMatchObject({
-      enabled: true,
-      appId: "work-app",
-      appSecret: "work-secret",
-    });
-  });
-
-  it("uses configured defaultAccount for omitted finalize writes", async () => {
-    const prompter = createTestWizardPrompter({
-      text: vi.fn(async ({ message }: { message: string }) => {
-        if (message === "Enter Feishu App Secret") {
-          return "work-secret"; // pragma: allowlist secret
-        }
-        if (message === "Enter Feishu App ID") {
-          return "work-app";
-        }
-        if (message === "Feishu webhook path") {
-          return "/feishu/events";
-        }
-        if (message === "Group chat allowlist (chat_ids)") {
-          return "";
-        }
-        throw new Error(`Unexpected prompt: ${message}`);
-      }) as WizardPrompter["text"],
-      select: vi.fn(
-        async ({ message, initialValue }: { message: string; initialValue?: string }) => {
-          if (message === "Feishu connection mode") {
-            return initialValue ?? "websocket";
-          }
-          if (message === "Which Feishu domain?") {
-            return initialValue ?? "feishu";
-          }
-          if (message === "Group chat policy") {
-            return "disabled";
-          }
-          return initialValue ?? "websocket";
-        },
-      ) as never,
-      note: vi.fn(async () => {}),
-    });
-
-    const setupWizard = feishuSetupPlugin.setupWizard;
-    if (!setupWizard || !("finalize" in setupWizard) || !setupWizard.finalize) {
-      throw new Error("feishu setupWizard.finalize unavailable");
-    }
-
-    const result = await setupWizard.finalize({
-      cfg: {
-        channels: {
-          feishu: {
-            appId: "top-level-app",
-            appSecret: "top-level-secret", // pragma: allowlist secret
-            defaultAccount: "work",
-            accounts: {
-              work: {
-                appId: "",
-              },
-            },
-          },
-        },
-      } as never,
-      accountId: "work",
-      credentialValues: {},
-      forceAllowFrom: false,
-      prompter,
-      runtime: createNonExitingTypedRuntimeEnv<FeishuConfigureRuntime>(),
-      options: {},
-    });
-
-    expect(result && typeof result === "object" && "cfg" in result).toBe(true);
-    const nextCfg =
-      result && typeof result === "object" && "cfg" in result ? result.cfg : undefined;
-    expect(nextCfg?.channels?.feishu).toBeDefined();
-    expect(nextCfg?.channels?.feishu?.appId).toBe("top-level-app");
-    expect(nextCfg?.channels?.feishu?.appSecret).toBe("top-level-secret");
-    expect(nextCfg?.channels?.feishu?.accounts?.work).toMatchObject({
-      enabled: true,
-      appId: "work-app",
-      appSecret: "work-secret",
-    });
-  });
+  return result.cfg.channels?.feishu;
+}
+afterAll(() => {
+  vi.doUnmock("./probe.js");
+  vi.doUnmock("./app-registration.js");
+  vi.resetModules();
+});
+beforeEach(() => {
+  probe.mockReset().mockResolvedValue({ ok: false, error: "mocked" });
+  init.mockReset().mockRejectedValue(new Error("mocked: scan-to-create not available"));
+  begin.mockReset();
+  poll.mockReset();
+  qr.mockReset().mockResolvedValue(undefined);
+  owner.mockReset().mockResolvedValue(undefined);
 });
 
-describe("feishu setup wizard status", () => {
-  it("treats SecretRef appSecret as configured when appId is present", async () => {
-    const status = await feishuGetStatus({
-      cfg: {
-        channels: {
-          feishu: {
-            appId: "cli_a123456",
-            appSecret: {
-              source: "env",
-              provider: "default",
-              id: "FEISHU_APP_SECRET",
-            },
-          },
-        },
-      } as never,
-      accountOverrides: {},
-    });
-
-    expect(status.configured).toBe(true);
-  });
-
-  it("does not fallback to top-level appId when account explicitly sets empty appId", async () => {
-    const status = await feishuGetStatus({
-      cfg: {
-        channels: {
-          feishu: {
-            appId: "top_level_app",
-            accounts: {
-              main: {
-                appId: "",
-                appSecret: "sample-app-credential", // pragma: allowlist secret
-              },
-            },
-          },
-        },
-      } as never,
-      ...baseStatusContext,
-    });
-
-    expect(status.configured).toBe(false);
-  });
-
-  it("setup status honors the selected named account", async () => {
-    const status = await feishuGetStatus({
-      cfg: {
-        channels: {
-          feishu: {
-            appId: "top_level_app",
-            appSecret: "top-level-secret", // pragma: allowlist secret
-            accounts: {
-              work: {
-                appId: "",
-                appSecret: "work-secret", // pragma: allowlist secret
-              },
-            },
-          },
-        },
-      } as never,
-      accountOverrides: {
-        feishu: "work",
-      },
-    });
-
-    expect(status.configured).toBe(false);
-    expect(status.statusLines).toEqual(["Feishu: needs app credentials"]);
-  });
-
-  it("uses configured defaultAccount for omitted setup configured state", async () => {
-    const status = await feishuGetStatus({
-      cfg: {
-        channels: {
-          feishu: {
-            defaultAccount: "work",
-            appId: "top_level_app",
-            appSecret: "top-level-secret", // pragma: allowlist secret
-            accounts: {
-              alerts: {
-                appId: "alerts-app",
-                appSecret: "alerts-secret", // pragma: allowlist secret
-              },
-              work: {
-                appId: "",
-                appSecret: "work-secret", // pragma: allowlist secret
-              },
-            },
-          },
-        },
-      } as never,
-      accountOverrides: {},
-    });
-
-    expect(status.configured).toBe(false);
-    expect(status.statusLines).toEqual(["Feishu: needs app credentials"]);
-  });
-
-  it("uses configured defaultAccount for omitted DM policy account context", async () => {
-    const cfg = {
-      channels: {
-        feishu: {
-          allowFrom: ["ou_root"],
-          defaultAccount: "work",
-          accounts: {
-            work: {
-              appId: "work-app",
-              appSecret: "work-secret", // pragma: allowlist secret
-              dmPolicy: "allowlist",
-              allowFrom: ["ou_work"],
-            },
-          },
-        },
-      },
-    } as const;
-
-    expect(feishuSetupWizard.dmPolicy?.getCurrent?.(cfg as never)).toBe("allowlist");
-    expect(feishuSetupWizard.dmPolicy?.resolveConfigKeys?.(cfg as never)).toEqual({
-      policyKey: "channels.feishu.accounts.work.dmPolicy",
-      allowFromKey: "channels.feishu.accounts.work.allowFrom",
-    });
-
-    const next = feishuSetupWizard.dmPolicy?.setPolicy?.(cfg as never, "open");
-    const workAccount = next?.channels?.feishu?.accounts?.work as
-      | {
-          dmPolicy?: string;
-          allowFrom?: string[];
-        }
-      | undefined;
-
-    expect(next?.channels?.feishu?.dmPolicy).toBeUndefined();
-    expect(next?.channels?.feishu?.allowFrom).toEqual(["ou_root"]);
-    expect(workAccount?.dmPolicy).toBe("open");
-    expect(workAccount?.allowFrom).toEqual(["ou_work", "*"]);
-  });
-
-  it("treats env SecretRef appId as not configured when env var is missing", async () => {
-    const appIdKey = "FEISHU_APP_ID_STATUS_MISSING_TEST";
-    const appSecretKey = "FEISHU_APP_CREDENTIAL_STATUS_MISSING_TEST"; // pragma: allowlist secret
-    await withEnvVars(
-      {
-        [appIdKey]: undefined,
-        [appSecretKey]: "env-credential-456", // pragma: allowlist secret
-      },
-      async () => {
-        const status = await getStatusWithEnvRefs({ appIdKey, appSecretKey });
-        expect(status.configured).toBe(false);
-      },
+describe("feishu setup wizard", () => {
+  it("preserves the exact named-account key without enabling the channel", () => {
+    const accountId = " Alert Account ";
+    const accountConfig = (enabled: boolean) =>
+      withFeishu({
+        enabled: false,
+        accounts: { [accountId]: { appId: "kept", enabled }, sibling: { enabled: false } },
+      });
+    expect(setFeishuNamedAccountEnabled(accountConfig(false), accountId, true)).toEqual(
+      accountConfig(true),
     );
   });
 
-  it("treats env SecretRef appId/appSecret as configured in status", async () => {
-    const appIdKey = "FEISHU_APP_ID_STATUS_TEST";
-    const appSecretKey = "FEISHU_APP_CREDENTIAL_STATUS_TEST"; // pragma: allowlist secret
-    await withEnvVars(
+  it.each([
+    ["manual default", "cli_manual", "secret_manual"],
+    ["scan fallback", "cli_from_fallback", "secret_from_fallback"],
+    ["SecretRef replacement", "cli_from_prompt", "secret_from_prompt"],
+  ])("uses manual credentials via %s", async (mode, appId, appSecret) => {
+    const scan = mode === "scan fallback";
+    const refs = mode === "SecretRef replacement";
+    const result = await configure(
       {
-        [appIdKey]: "cli_env_123",
-        [appSecretKey]: "env-credential-456", // pragma: allowlist secret
+        text: answers(appId, appSecret),
+        ...(scan ? scanPrompts() : {}),
+        ...(refs
+          ? {
+              confirm: vi.fn(async () => true),
+              select: vi.fn(
+                async ({ initialValue }: { initialValue?: string }) => initialValue ?? "bot",
+              ) as never,
+            }
+          : {}),
+      },
+      refs ? credentialRefs() : undefined,
+    );
+    const expected = {
+      ...credentials(appId, appSecret),
+      connectionMode: "websocket",
+      domain: "feishu",
+    };
+    if (refs) {
+      expect(result).toEqual({ ...expected, enabled: true, groupPolicy: "allowlist" });
+    } else {
+      if (scan) {
+        expect(init).toHaveBeenCalledWith("feishu");
+      } else {
+        expect(init).not.toHaveBeenCalled();
+      }
+      expect(begin).not.toHaveBeenCalled();
+      expect(result).toMatchObject(expected);
+    }
+  });
+
+  it("passes selected domain through scan-to-create and poll", async () => {
+    init.mockResolvedValueOnce(undefined);
+    begin.mockResolvedValueOnce({
+      deviceCode: "device-code",
+      qrUrl: "https://accounts.larksuite.com/qr",
+      interval: 1,
+      expireIn: 10,
+    });
+    poll.mockResolvedValueOnce({
+      status: "success",
+      result: { ...credentials("cli_lark", "secret_lark"), domain: "lark", openId: "ou_owner" },
+    });
+    const beforePersistentEffect = vi.fn(async () => {});
+    const result = await configure(scanPrompts("lark", "open"), undefined, {
+      beforePersistentEffect,
+    });
+    expect(init).toHaveBeenCalledWith("lark");
+    expect(begin).toHaveBeenCalledWith("lark");
+    expect(beforePersistentEffect).toHaveBeenCalledTimes(1);
+    expect(beforePersistentEffect.mock.invocationCallOrder[0]).toBeLessThan(
+      begin.mock.invocationCallOrder[0]!,
+    );
+    expect(poll.mock.calls.at(0)?.[0]).toMatchObject({
+      deviceCode: "device-code",
+      initialDomain: "lark",
+      tp: "ob_cli_app",
+    });
+    expect(result).toMatchObject({
+      ...credentials("cli_lark", "secret_lark"),
+      domain: "lark",
+      groupPolicy: "open",
+      requireMention: true,
+    });
+  });
+
+  it("propagates the persistent-effect guard before scan-to-create begins", async () => {
+    init.mockResolvedValueOnce(undefined);
+    const guardError = new Error("verified inference changed");
+    const beforePersistentEffect = vi.fn(async () => {
+      throw guardError;
+    });
+    await expect(configure(scanPrompts(), undefined, { beforePersistentEffect })).rejects.toBe(
+      guardError,
+    );
+    expect(init).toHaveBeenCalledWith("feishu");
+    expect(beforePersistentEffect).toHaveBeenCalledTimes(1);
+    expect(begin).not.toHaveBeenCalled();
+    expect(poll).not.toHaveBeenCalled();
+  });
+
+  it("probes the resolved default account in multi-account config", async () => {
+    probe.mockResolvedValueOnce({ ok: true, botName: "Feishu Main" });
+    const account = { ...credentials("cli_main", "main-app-secret"), connectionMode: "websocket" };
+    expect(
+      await status({
+        enabled: true,
+        defaultAccount: "main-bot",
+        accounts: { "main-bot": account },
+      }),
+    ).toMatchObject({ configured: true, statusLines: ["Feishu: connected as Feishu Main"] });
+    expect(probe).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "main-bot",
+        ...credentials(account.appId, account.appSecret),
+      }),
+    );
+  });
+
+  it("localizes existing bot setup prompts and status lines", async () => {
+    await withEnvAsync({ OPENCLAW_LOCALE: "zh-CN" }, async () => {
+      const confirm = vi.fn(async () => true);
+      const note = vi.fn(async () => {});
+      await configure({ confirm, note }, credentials("cli_a123456", "sample-app-credential"));
+      expect(confirm).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: "发现已有 bot（App ID：cli_a123456）。用于本次设置？",
+        }),
+      );
+      expect(note).toHaveBeenCalledWith("Bot 已配置。", "");
+    });
+  });
+
+  it("does not fallback to top-level appId when account explicitly sets empty appId", async () => {
+    expect(
+      (
+        await status({
+          appId: "top_level_app",
+          accounts: { main: credentials("", "sample-app-credential") },
+        })
+      ).configured,
+    ).toBe(false);
+  });
+
+  it("treats env SecretRef appId/appSecret as configured in status", async () => {
+    const keys = ["FEISHU_APP_ID_STATUS_TEST", "FEISHU_APP_CREDENTIAL_STATUS_TEST"] as const;
+    await withEnvAsync(
+      {
+        [keys[0]]: "cli_env_123",
+        [keys[1]]: "env-credential-456",
       },
       async () => {
-        const status = await getStatusWithEnvRefs({ appIdKey, appSecretKey });
-        expect(status.configured).toBe(true);
+        expect((await status(credentialRefs(...keys))).configured).toBe(true);
       },
     );
   });

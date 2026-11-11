@@ -1,115 +1,129 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../../config/config.js";
 import {
-  COMMAND,
-  COMMAND_KILL,
-  COMMAND_STEER,
-  resolveHandledPrefix,
-  resolveRequesterSessionKey,
-  resolveSubagentsAction,
-  stopWithText,
-} from "./commands-subagents-dispatch.js";
+  getActivePluginRegistry,
+  resetPluginRuntimeStateForTest,
+  setActivePluginRegistry,
+} from "../../plugins/runtime.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
+import { resolveCommandAuthorization } from "../command-auth.js";
+import type { MsgContext } from "../templating.js";
+import { handleAcpCommand } from "./commands-acp.js";
+import { handleSubagentsCommand } from "./commands-subagents.js";
 import type { HandleCommandsParams } from "./commands-types.js";
+import { buildCommandTestParams } from "./commands.test-harness.js";
+
+const readContextMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../../agents/subagents/registry/subagent-control-scope.js", () => ({
+  buildControlledSubagentRunsReadContext: readContextMock,
+}));
+
+const formatAllowFrom = ({ allowFrom }: { allowFrom: Array<string | number> }) =>
+  allowFrom.map((entry) => String(entry).trim()).filter(Boolean);
+
+let previousPluginRegistry: ReturnType<typeof getActivePluginRegistry>;
+
+function registerOwnerEnforcingTelegramPlugin() {
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: "telegram",
+        plugin: {
+          ...createChannelTestPluginBase({ id: "telegram" }),
+          commands: { enforceOwnerForCommands: true },
+          config: {
+            listAccountIds: () => ["default"],
+            resolveAccount: () => ({}),
+            resolveAllowFrom: () => ["*"],
+            formatAllowFrom,
+          },
+        },
+        source: "test",
+      },
+    ]),
+  );
+}
 
 function buildParams(
   commandBody: string,
-  ctxOverrides?: Record<string, unknown>,
+  ctxOverrides?: Partial<MsgContext>,
 ): HandleCommandsParams {
-  const normalized = commandBody.trim();
-  const ctx = {
-    Provider: "whatsapp",
-    Surface: "whatsapp",
-    CommandSource: "text",
-    SessionKey: "agent:main:main",
-    ...ctxOverrides,
-  };
-  const surface = ctx.Surface ?? "whatsapp";
-  const sessionKey = ctx.SessionKey ?? "agent:main:main";
-  const provider = ctx.Provider ?? "whatsapp";
-
-  return {
-    cfg: {},
-    ctx,
-    command: {
-      commandBodyNormalized: normalized,
-      rawBodyNormalized: normalized,
-      isAuthorizedSender: true,
-      senderIsOwner: true,
-      senderId: "owner",
-      channel: surface,
-      channelId: surface,
-      surface,
-      ownerList: [],
-      from: "test-user",
-      to: "test-bot",
+  const params = buildCommandTestParams(
+    commandBody,
+    {},
+    {
+      SessionKey: "agent:main:main",
+      ...ctxOverrides,
     },
-    directives: {} as HandleCommandsParams["directives"],
-    elevated: { enabled: true, allowed: true, failures: [] },
-    sessionKey,
-    workspaceDir: "/tmp/openclaw-commands-subagents",
-    defaultGroupActivation: () => "mention",
-    resolvedVerboseLevel: "off",
-    resolvedReasoningLevel: "off",
-    resolveDefaultThinkingLevel: async () => undefined,
-    provider,
-    model: "test-model",
-    contextTokens: 0,
-    isGroup: false,
-  } as unknown as HandleCommandsParams;
+  );
+  Object.assign(params.command, {
+    isAuthorizedSender: true,
+    senderIsOwner: true,
+  });
+  params.sessionKey = params.ctx.SessionKey ?? "agent:main:main";
+  return params;
 }
 
 describe("subagents command dispatch", () => {
-  it("prefers native command target session keys", () => {
-    const params = buildParams("/subagents list", {
+  beforeEach(() => {
+    previousPluginRegistry = getActivePluginRegistry();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    if (previousPluginRegistry) {
+      setActivePluginRegistry(previousPluginRegistry);
+    } else {
+      resetPluginRuntimeStateForTest();
+    }
+  });
+
+  it("does not dispatch unrelated commands", async () => {
+    expect(await handleSubagentsCommand(buildParams("/unknown"), true)).toBeNull();
+    expect(readContextMock).not.toHaveBeenCalled();
+  });
+
+  it("shows steer help without reading session state", async () => {
+    const params = buildParams("/subagents steer 1 continue", { SessionKey: "" });
+    const result = await handleSubagentsCommand(params, true);
+    expect(result?.reply?.text).toContain("/subagents list");
+    expect(result?.reply?.text).toContain("/session unbind");
+    expect(readContextMock).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch ACP lookalikes", async () => {
+    expect(await handleAcpCommand(buildParams("/acpXYZ"), true)).toBeNull();
+  });
+
+  it("rejects native subagents commands from non-owner senders when the plugin enforces owner-only commands", async () => {
+    registerOwnerEnforcingTelegramPlugin();
+    const cfg = {
+      commands: { allowFrom: { "*": ["*"] } },
+      channels: { telegram: { allowFrom: ["*"] } },
+    } as OpenClawConfig;
+    const ctx = {
+      Provider: "telegram",
+      Surface: "telegram",
+      ChatType: "group",
+      From: "telegram:999",
+      SenderId: "999",
       CommandSource: "native",
-      CommandTargetSessionKey: "agent:main:main",
-      SessionKey: "agent:main:slack:slash:u1",
-    });
-    expect(resolveRequesterSessionKey(params)).toBe("agent:main:main");
-  });
+      SessionKey: "agent:main:telegram:slash-session",
+      CommandTargetSessionKey: "agent:main:telegram:target",
+    } as MsgContext;
+    const auth = resolveCommandAuthorization({ ctx, cfg, commandAuthorized: true });
+    const params = buildParams("/subagents list", ctx);
+    params.cfg = cfg;
+    Object.assign(params.command, auth);
 
-  it("falls back to the current session for text commands", () => {
-    const params = buildParams("/subagents list", {
-      CommandSource: "text",
-      SessionKey: "agent:main:whatsapp:direct:u1",
-      CommandTargetSessionKey: "agent:main:main",
-    });
-    expect(resolveRequesterSessionKey(params)).toBe("agent:main:whatsapp:direct:u1");
-  });
+    const result = await handleSubagentsCommand(params, true);
 
-  it("maps slash aliases to the right handled prefix", () => {
-    expect(resolveHandledPrefix("/subagents list")).toBe(COMMAND);
-    expect(resolveHandledPrefix("/kill 1")).toBe(COMMAND_KILL);
-    expect(resolveHandledPrefix("/steer 1 continue")).toBe(COMMAND_STEER);
-    expect(resolveHandledPrefix("/unknown")).toBeNull();
-  });
-
-  it("maps prefixes and args to subagent actions", () => {
-    const listTokens = ["list"];
-    expect(resolveSubagentsAction({ handledPrefix: COMMAND, restTokens: listTokens })).toBe("list");
-    expect(listTokens).toEqual([]);
-
-    const killTokens = ["1"];
-    expect(resolveSubagentsAction({ handledPrefix: COMMAND_KILL, restTokens: killTokens })).toBe(
-      "kill",
-    );
-    expect(killTokens).toEqual(["1"]);
-
-    const steerTokens = ["1", "continue"];
-    expect(resolveSubagentsAction({ handledPrefix: COMMAND_STEER, restTokens: steerTokens })).toBe(
-      "steer",
-    );
-  });
-
-  it("returns null for invalid /subagents actions", () => {
-    const restTokens = ["foo"];
-    expect(resolveSubagentsAction({ handledPrefix: COMMAND, restTokens })).toBeNull();
-    expect(restTokens).toEqual(["foo"]);
-  });
-
-  it("builds stop replies", () => {
-    expect(stopWithText("hello")).toEqual({
-      shouldContinue: false,
-      reply: { text: "hello" },
-    });
+    expect(auth).toMatchObject({ senderIsOwner: false, isAuthorizedSender: false });
+    expect(result).toEqual({ shouldContinue: false });
+    expect(readContextMock).not.toHaveBeenCalled();
   });
 });

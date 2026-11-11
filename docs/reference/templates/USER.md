@@ -1,24 +1,32 @@
 ---
-title: "USER Template"
-summary: "User profile record"
+summary: "Durable user preference and profile directives"
+title: "USER template"
 read_when:
   - Bootstrapping a workspace manually
 ---
 
-# USER.md - About Your Human
+# USER.md - User Model
 
-_Learn about the person you're helping. Update this as you go._
+Store stable user preferences and profile facts as directives that can guide future sessions.
 
-- **Name:**
-- **What to call them:**
-- **Pronouns:** _(optional)_
-- **Timezone:**
-- **Notes:**
+Use one directive per entry:
 
-## Context
+```md
+- Prefer concise progress updates during implementation work.
+```
 
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
+- Begin each directive with an imperative such as `Always`, `Never`, or `Prefer`.
+- Keep only current directives; no date or status metadata is required.
+- When a preference changes, replace the old directive in place. If history matters, record it with its observation date in `memory/YYYY-MM-DD.md`, not here.
+- Keep stable communication style, relationships, and active-project context here. Put durable non-profile facts and decisions in `MEMORY.md`.
+- Save this file at the workspace root as `USER.md`. It loads every session with a separate 4,000-character budget. All text counts, including comments and history; the loader does not filter them.
 
----
+## Directives
 
-The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.
+Replace the example below with a real directive before you save this file. Never leave a placeholder directive.
+
+- Prefer ...
+
+## Related
+
+- [Agent workspace](/concepts/agent-workspace)

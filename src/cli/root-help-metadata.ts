@@ -1,43 +1,55 @@
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  PRECOMPUTED_SUBCOMMAND_HELP_NAMES,
+  type PrecomputedCommandHelpName,
+  type PrecomputedSubcommandHelpName,
+} from "./precomputed-help-commands.js";
+import { readCliStartupMetadata } from "./startup-metadata.js";
 
-let precomputedRootHelpText: string | null | undefined;
+type PrecomputedHelpTextKey =
+  | "rootHelpText"
+  | "browserHelpText"
+  | "secretsHelpText"
+  | "nodesHelpText"
+  | PrecomputedSubcommandHelpName;
 
-export function loadPrecomputedRootHelpText(): string | null {
-  if (precomputedRootHelpText !== undefined) {
-    return precomputedRootHelpText;
-  }
-  try {
-    const metadataPath = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "..",
-      "cli-startup-metadata.json",
-    );
-    const raw = fs.readFileSync(metadataPath, "utf8");
-    const parsed = JSON.parse(raw) as { rootHelpText?: unknown };
-    if (typeof parsed.rootHelpText === "string" && parsed.rootHelpText.length > 0) {
-      precomputedRootHelpText = parsed.rootHelpText;
-      return precomputedRootHelpText;
+function outputPrecomputedHelpText(key: PrecomputedHelpTextKey): boolean {
+  const parsed = readCliStartupMetadata(import.meta.url);
+  let value: unknown;
+  if (isPrecomputedSubcommandHelpName(key)) {
+    const subcommandHelpText = parsed?.subcommandHelpText;
+    if (isSubcommandHelpTextRecord(subcommandHelpText)) {
+      value = subcommandHelpText[key];
     }
-  } catch {
-    // Fall back to live root-help rendering.
+  } else if (parsed) {
+    value = parsed[key];
   }
-  precomputedRootHelpText = null;
-  return null;
-}
-
-export function outputPrecomputedRootHelpText(): boolean {
-  const rootHelpText = loadPrecomputedRootHelpText();
-  if (!rootHelpText) {
+  const helpText = typeof value === "string" && value.length > 0 ? value : null;
+  if (!helpText) {
     return false;
   }
-  process.stdout.write(rootHelpText);
+  process.stdout.write(helpText);
   return true;
 }
 
-export const __testing = {
-  resetPrecomputedRootHelpTextForTests(): void {
-    precomputedRootHelpText = undefined;
-  },
-};
+export function outputPrecomputedRootHelpText(): boolean {
+  return outputPrecomputedHelpText("rootHelpText");
+}
+
+export function outputPrecomputedCommandHelpText(commandName: PrecomputedCommandHelpName): boolean {
+  const key: PrecomputedHelpTextKey = isPrecomputedSubcommandHelpName(commandName)
+    ? commandName
+    : `${commandName}HelpText`;
+  return outputPrecomputedHelpText(key);
+}
+
+function isPrecomputedSubcommandHelpName(
+  commandName: string,
+): commandName is PrecomputedSubcommandHelpName {
+  return PRECOMPUTED_SUBCOMMAND_HELP_NAMES.some((name) => name === commandName);
+}
+
+function isSubcommandHelpTextRecord(
+  value: unknown,
+): value is Partial<Record<PrecomputedSubcommandHelpName, unknown>> {
+  return typeof value === "object" && value !== null;
+}

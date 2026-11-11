@@ -1,19 +1,4 @@
-/**
- * Centralized relative-time formatting utilities.
- *
- * Consolidates 7+ scattered implementations (formatAge, formatAgeShort, formatAgo,
- * formatRelativeTime, formatElapsedTime) into two functions:
- *
- * - `formatTimeAgo(durationMs)` — format a duration as "5m ago" / "5m" (for known elapsed time)
- * - `formatRelativeTimestamp(epochMs)` — format an epoch timestamp relative to now (handles future)
- */
-
-export type FormatTimeAgoOptions = {
-  /** Append "ago" suffix. Default: true. When false, returns bare unit: "5m", "2h" */
-  suffix?: boolean;
-  /** Return value for invalid/null/negative input. Default: "unknown" */
-  fallback?: string;
-};
+import { bucketRelativeTimeMs } from "@openclaw/normalization-core";
 
 /**
  * Format a duration (in ms) as a human-readable relative time.
@@ -25,7 +10,12 @@ export type FormatTimeAgoOptions = {
  */
 export function formatTimeAgo(
   durationMs: number | null | undefined,
-  options?: FormatTimeAgoOptions,
+  options?: {
+    /** Append "ago" suffix. Default: true. When false, returns bare unit: "5m", "2h" */
+    suffix?: boolean;
+    /** Return value for invalid/null/negative input. Default: "unknown" */
+    fallback?: string;
+  },
 ): string {
   const suffix = options?.suffix !== false;
   const fallback = options?.fallback ?? "unknown";
@@ -34,79 +24,47 @@ export function formatTimeAgo(
     return fallback;
   }
 
-  const totalSeconds = Math.round(durationMs / 1000);
-  const minutes = Math.round(totalSeconds / 60);
+  const minutes = Math.round(durationMs / 60_000);
 
   if (minutes < 1) {
-    return suffix ? "just now" : `${totalSeconds}s`;
+    return suffix ? "just now" : `${Math.round(durationMs / 1000)}s`;
   }
-  if (minutes < 60) {
-    return suffix ? `${minutes}m ago` : `${minutes}m`;
-  }
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) {
-    return suffix ? `${hours}h ago` : `${hours}h`;
-  }
-  const days = Math.round(hours / 24);
-  return suffix ? `${days}d ago` : `${days}d`;
+  const { value, unit } = bucketRelativeTimeMs(durationMs);
+  // CLI ages promote to minutes before the localized timestamp's sub-minute cutoff.
+  const label = unit === "second" ? `${minutes}m` : `${value}${unit[0]}`;
+  return suffix ? `${label} ago` : label;
 }
-
-export type FormatRelativeTimestampOptions = {
-  /** If true, fall back to short date (e.g. "Oct 5") for timestamps >7 days. Default: false */
-  dateFallback?: boolean;
-  /** IANA timezone for date fallback display */
-  timezone?: string;
-  /** Return value for invalid/null input. Default: "n/a" */
-  fallback?: string;
-};
 
 /**
  * Format an epoch timestamp relative to now.
  *
  * Handles both past ("5m ago") and future ("in 5m") timestamps.
- * Optionally falls back to a short date for timestamps older than 7 days.
+ * Falls back to a short date for timestamps older than 7 days.
  */
-export function formatRelativeTimestamp(
-  timestampMs: number | null | undefined,
-  options?: FormatRelativeTimestampOptions,
-): string {
-  const fallback = options?.fallback ?? "n/a";
+export function formatRelativeTimestamp(timestampMs: number | null | undefined): string {
   if (timestampMs == null || !Number.isFinite(timestampMs)) {
-    return fallback;
+    return "";
   }
 
   const diff = Date.now() - timestampMs;
   const absDiff = Math.abs(diff);
   const isPast = diff >= 0;
 
-  const sec = Math.round(absDiff / 1000);
-  if (sec < 60) {
+  const { value, unit } = bucketRelativeTimeMs(absDiff);
+  if (unit === "second") {
     return isPast ? "just now" : "in <1m";
   }
-
-  const min = Math.round(sec / 60);
-  if (min < 60) {
-    return isPast ? `${min}m ago` : `in ${min}m`;
+  const relative = isPast ? `${value}${unit[0]} ago` : `in ${value}${unit[0]}`;
+  if (unit !== "day" || value <= 7) {
+    return relative;
   }
 
-  const hr = Math.round(min / 60);
-  if (hr < 48) {
-    return isPast ? `${hr}h ago` : `in ${hr}h`;
-  }
-
-  const day = Math.round(hr / 24);
-  if (!options?.dateFallback || day <= 7) {
-    return isPast ? `${day}d ago` : `in ${day}d`;
-  }
-
-  // Fall back to short date display for old timestamps
   try {
     return new Intl.DateTimeFormat("en-US", {
       month: "short",
       day: "numeric",
-      ...(options.timezone ? { timeZone: options.timezone } : {}),
     }).format(new Date(timestampMs));
   } catch {
-    return `${day}d ago`;
+    return relative;
   }
 }

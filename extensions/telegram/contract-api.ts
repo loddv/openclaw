@@ -1,8 +1,3 @@
-export { normalizeCompatibilityConfig, legacyConfigRules } from "./src/doctor-contract.js";
-export {
-  collectRuntimeConfigAssignments,
-  secretTargetRegistryEntries,
-} from "./src/secret-contract.js";
 export {
   TELEGRAM_COMMAND_NAME_PATTERN,
   normalizeTelegramCommandDescription,
@@ -16,9 +11,8 @@ export {
   buildCommandsPaginationKeyboard,
   buildTelegramModelsProviderChannelData,
 } from "./src/command-ui.js";
-export { createTelegramThreadBindingManager } from "./src/thread-bindings.js";
 export type {
   TelegramInteractiveHandlerContext,
   TelegramInteractiveHandlerRegistration,
+  TelegramInteractiveHandlerResult,
 } from "./src/interactive-dispatch.js";
-export { collectTelegramSecurityAuditFindings } from "./src/security-audit.js";

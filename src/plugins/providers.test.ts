@@ -1,355 +1,347 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../config/config.js";
-import type { PluginAutoEnableResult } from "../config/plugin-auto-enable.js";
+import { createDeferred } from "../../test/helpers/promise.js";
+import type { PluginAutoEnableResult } from "../config/plugin-auto-enable.types.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import {
+  createPluginManifestRecordFixture,
+  createPluginMetadataSnapshotFixture,
+} from "./plugin-metadata.test-support.js";
+import type { PluginRegistrySnapshot } from "./plugin-registry.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
+import { createIndexFixture } from "./test-helpers/installed-plugin-index-fixture.js";
 import type { ProviderPlugin } from "./types.js";
 
 type ResolveRuntimePluginRegistry = typeof import("./loader.js").resolveRuntimePluginRegistry;
 type LoadOpenClawPlugins = typeof import("./loader.js").loadOpenClawPlugins;
 type IsPluginRegistryLoadInFlight = typeof import("./loader.js").isPluginRegistryLoadInFlight;
 type LoadPluginManifestRegistry =
-  typeof import("./manifest-registry.js").loadPluginManifestRegistry;
+  typeof import("./manifest-registry.js").loadPluginManifestRegistryCore;
+type LoadPluginMetadataSnapshot =
+  typeof import("./plugin-metadata-snapshot.js").loadPluginMetadataSnapshot;
+type LoadPluginRegistrySnapshot = typeof import("./plugin-registry.js").loadPluginRegistrySnapshot;
+type LoadPluginRegistrySnapshotWithMetadata =
+  typeof import("./plugin-registry.js").loadPluginRegistrySnapshotWithMetadata;
 type ApplyPluginAutoEnable = typeof import("../config/plugin-auto-enable.js").applyPluginAutoEnable;
 type SetActivePluginRegistry = typeof import("./runtime.js").setActivePluginRegistry;
 
-const resolveRuntimePluginRegistryMock = vi.fn<ResolveRuntimePluginRegistry>();
-const loadOpenClawPluginsMock = vi.fn<LoadOpenClawPlugins>();
-const isPluginRegistryLoadInFlightMock = vi.fn<IsPluginRegistryLoadInFlight>((_) => false);
-const loadPluginManifestRegistryMock = vi.fn<LoadPluginManifestRegistry>();
-const applyPluginAutoEnableMock = vi.fn<ApplyPluginAutoEnable>();
+const runtimeLoader = vi.fn<ResolveRuntimePluginRegistry>();
+const setupLoader = vi.fn<LoadOpenClawPlugins>();
+const setupInspection = vi.fn<typeof import("./loader.js").acquirePluginRegistryForInspection>();
+const isPluginRegistryLoadInFlightMock = vi.fn<IsPluginRegistryLoadInFlight>((_options) => false);
+const manifestLoader = vi.fn<LoadPluginManifestRegistry>();
+const metadataLoader = vi.fn<LoadPluginMetadataSnapshot>();
+const indexLoader = vi.fn<LoadPluginRegistrySnapshot>();
+const indexWithMetadataLoader = vi.fn<LoadPluginRegistrySnapshotWithMetadata>();
+const currentMetadata = vi.fn();
+const autoEnable = vi.fn<ApplyPluginAutoEnable>();
+const prepareAutoEnable =
+  vi.fn<typeof import("../config/plugin-auto-enable.shared.js").preparePluginAutoEnableSetup>();
 
-let resolveOwningPluginIdsForProvider: typeof import("./providers.js").resolveOwningPluginIdsForProvider;
-let resolveOwningPluginIdsForModelRef: typeof import("./providers.js").resolveOwningPluginIdsForModelRef;
-let resolveActivatableProviderOwnerPluginIds: typeof import("./providers.js").resolveActivatableProviderOwnerPluginIds;
-let resolveEnabledProviderPluginIds: typeof import("./providers.js").resolveEnabledProviderPluginIds;
-let resolveDiscoveredProviderPluginIds: typeof import("./providers.js").resolveDiscoveredProviderPluginIds;
-let resolveDiscoverableProviderOwnerPluginIds: typeof import("./providers.js").resolveDiscoverableProviderOwnerPluginIds;
-let resolvePluginProviders: typeof import("./providers.runtime.js").resolvePluginProviders;
+let owners: typeof import("./providers.js");
+let resolvePluginProviders: typeof import("./providers.runtime.js").resolvePluginProvidersCore;
+let withPluginProviders: typeof import("./providers.runtime.js").withPluginProviders;
 let setActivePluginRegistry: SetActivePluginRegistry;
 
-function createManifestProviderPlugin(params: {
-  id: string;
-  providerIds: string[];
-  cliBackends?: string[];
-  origin?: "bundled" | "workspace";
-  enabledByDefault?: boolean;
-  modelSupport?: { modelPrefixes?: string[]; modelPatterns?: string[] };
-  activation?: PluginManifestRecord["activation"];
-  setup?: PluginManifestRecord["setup"];
-}): PluginManifestRecord {
-  return {
-    id: params.id,
-    enabledByDefault: params.enabledByDefault,
-    channels: [],
-    providers: params.providerIds,
-    cliBackends: params.cliBackends ?? [],
-    modelSupport: params.modelSupport,
-    activation: params.activation,
-    setup: params.setup,
-    skills: [],
-    hooks: [],
-    origin: params.origin ?? "bundled",
-    rootDir: `/tmp/${params.id}`,
-    source: params.origin ?? "bundled",
-    manifestPath: `/tmp/${params.id}/openclaw.plugin.json`,
-  };
+function manifest(id: string, overrides: Partial<PluginManifestRecord> = {}): PluginManifestRecord {
+  return createPluginManifestRecordFixture({
+    id,
+    providers: [id],
+    rootDir: `/tmp/${id}`,
+    source: overrides.origin ?? "bundled",
+    manifestPath: `/tmp/${id}/openclaw.plugin.json`,
+    ...overrides,
+  });
 }
 
 function setManifestPlugins(plugins: PluginManifestRecord[]) {
-  loadPluginManifestRegistryMock.mockReturnValue({
-    plugins,
-    diagnostics: [],
-  });
+  manifestLoader.mockReturnValue({ plugins, diagnostics: [] });
+}
+
+function setManifest(id: string, overrides: Partial<PluginManifestRecord> = {}) {
+  setManifestPlugins([manifest(id, overrides)]);
 }
 
 function setOwningProviderManifestPlugins() {
   setManifestPlugins([
-    createManifestProviderPlugin({
-      id: "minimax",
-      providerIds: ["minimax", "minimax-portal"],
+    manifest("minimax", { providers: ["minimax", "minimax-portal"] }),
+    manifest("openai", {
+      providers: ["openai", "openai"],
+      modelSupport: { modelPrefixes: ["gpt-", "o1", "o3", "o4"] },
     }),
-    createManifestProviderPlugin({
-      id: "openai",
-      providerIds: ["openai", "openai-codex"],
-      cliBackends: ["codex-cli"],
-      modelSupport: {
-        modelPrefixes: ["gpt-", "o1", "o3", "o4"],
-      },
-    }),
-    createManifestProviderPlugin({
-      id: "anthropic",
-      providerIds: ["anthropic"],
+    manifest("anthropic", {
       cliBackends: ["claude-cli"],
-      modelSupport: {
-        modelPrefixes: ["claude-"],
-      },
+      modelSupport: { modelPrefixes: ["claude-"] },
     }),
   ]);
 }
 
-function setOwningProviderManifestPluginsWithWorkspace() {
-  setManifestPlugins([
-    createManifestProviderPlugin({
-      id: "minimax",
-      providerIds: ["minimax", "minimax-portal"],
-    }),
-    createManifestProviderPlugin({
-      id: "openai",
-      providerIds: ["openai", "openai-codex"],
-      cliBackends: ["codex-cli"],
-      modelSupport: {
-        modelPrefixes: ["gpt-", "o1", "o3", "o4"],
-      },
-    }),
-    createManifestProviderPlugin({
-      id: "anthropic",
-      providerIds: ["anthropic"],
-      cliBackends: ["claude-cli"],
-      modelSupport: {
-        modelPrefixes: ["claude-"],
-      },
-    }),
-    createManifestProviderPlugin({
-      id: "workspace-provider",
-      providerIds: ["workspace-provider"],
-      origin: "workspace",
-      modelSupport: {
-        modelPrefixes: ["workspace-model-"],
-      },
-    }),
-  ]);
-}
-
-function getLastRuntimeRegistryCall(): Record<string, unknown> {
-  const call = resolveRuntimePluginRegistryMock.mock.calls.at(-1)?.[0];
-  expect(call).toBeDefined();
-  return (call ?? {}) as Record<string, unknown>;
-}
-
-function cloneOptions<T>(value: T): T {
-  return structuredClone(value);
-}
-
-function expectResolvedProviders(providers: unknown, expected: unknown[]) {
-  expect(providers).toEqual(expected);
-}
-
-function expectLastRuntimeRegistryLoad(params?: {
-  env?: NodeJS.ProcessEnv;
-  onlyPluginIds?: readonly string[];
-}) {
-  expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-    expect.objectContaining({
-      cache: false,
-      activate: false,
-      ...(params?.env ? { env: params.env } : {}),
-      ...(params?.onlyPluginIds !== undefined ? { onlyPluginIds: params.onlyPluginIds } : {}),
-    }),
-  );
-}
-
-function expectLastSetupRegistryLoad(params?: {
-  env?: NodeJS.ProcessEnv;
-  onlyPluginIds?: readonly string[];
-}) {
-  expect(loadOpenClawPluginsMock).toHaveBeenCalledWith(
-    expect.objectContaining({
-      cache: false,
-      activate: false,
-      ...(params?.env ? { env: params.env } : {}),
-      ...(params?.onlyPluginIds !== undefined ? { onlyPluginIds: params.onlyPluginIds } : {}),
-    }),
-  );
-}
-
-function getLastResolvedPluginConfig() {
-  return getLastRuntimeRegistryCall().config as
-    | {
-        plugins?: {
-          allow?: string[];
-          entries?: Record<string, { enabled?: boolean }>;
-        };
-      }
-    | undefined;
-}
-
-function getLastSetupLoadedPluginConfig() {
-  const call = loadOpenClawPluginsMock.mock.calls.at(-1)?.[0];
-  expect(call).toBeDefined();
-  return (call?.config ?? undefined) as
-    | {
-        plugins?: {
-          allow?: string[];
-          entries?: Record<string, { enabled?: boolean }>;
-        };
-      }
-    | undefined;
-}
-
-function createBundledProviderCompatOptions(params?: { onlyPluginIds?: readonly string[] }) {
-  return {
-    config: {
-      plugins: {
-        allow: ["openrouter"],
-      },
-    },
-    bundledProviderAllowlistCompat: true,
-    ...(params?.onlyPluginIds !== undefined ? { onlyPluginIds: params.onlyPluginIds } : {}),
-  };
-}
-
-function createAutoEnabledProviderConfig() {
-  const rawConfig: OpenClawConfig = {
-    plugins: {},
-  };
-  const autoEnabledConfig: OpenClawConfig = {
-    ...rawConfig,
-    plugins: {
-      entries: {
-        google: { enabled: true },
-      },
-    },
-  };
-  return { rawConfig, autoEnabledConfig };
-}
-
-function expectAutoEnabledProviderLoad(params: { rawConfig: unknown; autoEnabledConfig: unknown }) {
-  expect(applyPluginAutoEnableMock).toHaveBeenCalledWith({
-    config: params.rawConfig,
-    env: process.env,
+function createProviderRegistrySnapshotFixture(): PluginRegistrySnapshot {
+  const plugins = manifestLoader().plugins.map((plugin) => {
+    const snapshotPlugin = {
+      pluginId: plugin.id,
+      manifestPath: plugin.manifestPath,
+      manifestHash: `test-${plugin.id}`,
+      source: plugin.source,
+      rootDir: plugin.rootDir,
+      origin: plugin.origin,
+      enabled: plugin.enabledByDefault !== false,
+      syntheticAuthRefs: plugin.syntheticAuthRefs,
+      startup: { sidecar: false, memory: false, agentHarnesses: [] },
+      compat: [],
+    };
+    if (plugin.enabledByDefault === true) {
+      Object.assign(snapshotPlugin, { enabledByDefault: true });
+    }
+    return snapshotPlugin;
   });
-  expectProviderRuntimeRegistryLoad({ config: params.autoEnabledConfig });
-}
 
-function expectResolvedAllowlistState(params?: {
-  expectedAllow?: readonly string[];
-  unexpectedAllow?: readonly string[];
-  expectedEntries?: Record<string, { enabled?: boolean }>;
-  expectedOnlyPluginIds?: readonly string[];
-}) {
-  expectLastRuntimeRegistryLoad(
-    params?.expectedOnlyPluginIds ? { onlyPluginIds: params.expectedOnlyPluginIds } : undefined,
-  );
-
-  const config = getLastResolvedPluginConfig();
-  const allow = config?.plugins?.allow ?? [];
-
-  if (params?.expectedAllow) {
-    expect(allow).toEqual(expect.arrayContaining([...params.expectedAllow]));
-  }
-  if (params?.expectedEntries) {
-    expect(config?.plugins?.entries).toEqual(expect.objectContaining(params.expectedEntries));
-  }
-  params?.unexpectedAllow?.forEach((disallowedPluginId) => {
-    expect(allow).not.toContain(disallowedPluginId);
+  return createIndexFixture({
+    generatedAtMs: 0,
+    plugins,
   });
 }
 
-function expectOwningPluginIds(provider: string, expectedPluginIds?: readonly string[]) {
-  expect(resolveOwningPluginIdsForProvider({ provider })).toEqual(expectedPluginIds);
+function providerRegistry(provider: ProviderPlugin, pluginId = provider.id) {
+  const registry = createEmptyPluginRegistry();
+  registry.providers.push({ pluginId, provider, source: "bundled" });
+  return registry;
+}
+
+function getLastRuntimeRegistryCall() {
+  const call = runtimeLoader.mock.calls.at(-1)?.[0];
+  expect(call).toBeDefined();
+  return call;
+}
+
+function expectActivatedOwner(
+  id: string,
+  mode: "runtime" | "setup" = "runtime",
+  activate?: boolean,
+) {
+  const call =
+    mode === "runtime" ? getLastRuntimeRegistryCall() : setupLoader.mock.calls.at(-1)?.[0];
+  expect(call?.onlyPluginIds).toEqual([id]);
+  if (activate !== undefined) {
+    expect(call?.activate).toBe(activate);
+  }
+  expect(call?.config?.plugins?.allow).toContain(id);
+  expect(call?.config?.plugins?.entries?.[id]).toEqual({ enabled: true });
 }
 
 function expectModelOwningPluginIds(model: string, expectedPluginIds?: readonly string[]) {
-  expect(resolveOwningPluginIdsForModelRef({ model })).toEqual(expectedPluginIds);
-}
-
-function expectProviderRuntimeRegistryLoad(params?: { config?: unknown; env?: NodeJS.ProcessEnv }) {
-  expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-    expect.objectContaining({
-      ...(params?.config ? { config: params.config } : {}),
-      ...(params?.env ? { env: params.env } : {}),
-    }),
-  );
+  expect(owners.resolveOwningPluginIdsForModelRef({ model })).toEqual(expectedPluginIds);
 }
 
 describe("resolvePluginProviders", () => {
   beforeAll(async () => {
     vi.resetModules();
-    loadPluginManifestRegistryMock.mockReturnValue({
-      plugins: [],
-      diagnostics: [],
-    });
+    setManifestPlugins([]);
+    // mock-isolation: Provider selection uses fixture registries without acquiring live plugin generations.
     vi.doMock("./loader.js", () => ({
-      loadOpenClawPlugins: (...args: Parameters<LoadOpenClawPlugins>) =>
-        loadOpenClawPluginsMock(...args),
-      isPluginRegistryLoadInFlight: (...args: Parameters<IsPluginRegistryLoadInFlight>) =>
-        isPluginRegistryLoadInFlightMock(...args),
-      resolveRuntimePluginRegistry: (...args: Parameters<ResolveRuntimePluginRegistry>) =>
-        resolveRuntimePluginRegistryMock(...args),
+      loadOpenClawPlugins: setupLoader,
+      acquirePluginRegistryForInspection: setupInspection,
+      isPluginRegistryLoadInFlight: isPluginRegistryLoadInFlightMock,
+      resolveRuntimePluginRegistry: runtimeLoader,
     }));
+    vi.doMock("./providers.runtime.js", async () => {
+      const { createProviderRegistryResolver } = await import("./providers.runtime-core.js");
+      const loader = await import("./loader.js");
+      return createProviderRegistryResolver(loader);
+    });
     vi.doMock("../config/plugin-auto-enable.js", () => ({
-      applyPluginAutoEnable: (...args: Parameters<ApplyPluginAutoEnable>) =>
-        applyPluginAutoEnableMock(...args),
+      applyPluginAutoEnable: autoEnable,
+    }));
+    vi.doMock("../config/plugin-auto-enable.shared.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../config/plugin-auto-enable.shared.js")>()),
+      preparePluginAutoEnableSetup: prepareAutoEnable,
     }));
     vi.doMock("./manifest-registry.js", () => ({
-      loadPluginManifestRegistry: (...args: Parameters<LoadPluginManifestRegistry>) =>
-        loadPluginManifestRegistryMock(...args),
+      loadPluginManifestRegistryCore: manifestLoader,
     }));
-    ({
-      resolveActivatableProviderOwnerPluginIds,
-      resolveOwningPluginIdsForProvider,
-      resolveOwningPluginIdsForModelRef,
-      resolveEnabledProviderPluginIds,
-      resolveDiscoveredProviderPluginIds,
-      resolveDiscoverableProviderOwnerPluginIds,
-    } = await import("./providers.js"));
-    ({ resolvePluginProviders } = await import("./providers.runtime.js"));
+    vi.doMock("./plugin-metadata-snapshot.js", () => {
+      const loadSnapshot = (params: Parameters<LoadPluginMetadataSnapshot>[0]) => {
+        metadataLoader(params);
+        return {
+          manifestRegistry: manifestLoader(),
+          index: createProviderRegistrySnapshotFixture(),
+        };
+      };
+      return {
+        loadPluginMetadataSnapshot: loadSnapshot,
+        resolvePluginMetadataSnapshot: loadSnapshot,
+      };
+    });
+    vi.doMock("./current-plugin-metadata-snapshot.js", () => ({
+      getCurrentPluginMetadataSnapshot: currentMetadata,
+    }));
+    vi.doMock("./plugin-registry.js", async () => {
+      const actual =
+        await vi.importActual<typeof import("./plugin-registry.js")>("./plugin-registry.js");
+      return {
+        ...actual,
+        loadPluginRegistrySnapshot: indexLoader,
+        loadPluginRegistrySnapshotWithMetadata: indexWithMetadataLoader,
+      };
+    });
+    vi.doMock("./installed-plugin-index-store.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("./installed-plugin-index-store.js")>();
+      return {
+        ...actual,
+        readPersistedInstalledPluginIndexSync: () => null,
+      };
+    });
+    owners = await import("./providers.js");
+    ({ resolvePluginProvidersCore: resolvePluginProviders, withPluginProviders } =
+      await import("./providers.runtime.js"));
     ({ setActivePluginRegistry } = await import("./runtime.js"));
   });
 
-  it("maps cli backend ids to owning plugin ids via manifests", () => {
+  it("offers only opted-in personal methods under the installed plugin policy", async () => {
+    const { listPersonalAccountAuthChoices, resolvePersonalAccountAuthMethod } =
+      await import("./personal-account-auth.js");
+    const bundled = manifest("personal-provider");
+    bundled.providerAuthChoices = [
+      {
+        provider: "personal-provider",
+        method: "api-key",
+        choiceId: "personal-key",
+        personalAccount: true,
+      },
+      { provider: "personal-provider", method: "host-import", choiceId: "host-import" },
+    ];
+    const workspace = manifest("workspace-provider", { origin: "workspace" });
+    workspace.providerAuthChoices = [
+      {
+        provider: "workspace-provider",
+        method: "api-key",
+        choiceId: "workspace-key",
+        personalAccount: true,
+      },
+    ];
+    setManifestPlugins([bundled, workspace]);
+    expect(listPersonalAccountAuthChoices({}).map((choice) => choice.choiceId)).toEqual([
+      "personal-key",
+    ]);
+    for (const plugins of [
+      { enabled: false },
+      { deny: ["personal-provider"] },
+      { allow: ["unrelated"] },
+      { entries: { "personal-provider": { enabled: false } } },
+    ]) {
+      expect(listPersonalAccountAuthChoices({ plugins })).toEqual([]);
+      expect(
+        await resolvePersonalAccountAuthMethod({ plugins }, "personal-provider", "api-key"),
+      ).toBeUndefined();
+    }
+    expect(
+      await resolvePersonalAccountAuthMethod({}, "personal-provider", "host-import"),
+    ).toBeUndefined();
+    expect(setupLoader).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "resolves installed owners with prepared manifest metadata: %s",
+    (prepared) => {
+      const plugins = [
+        manifest("first-owner", { providers: ["direct-provider"], cliBackends: ["shared-cli"] }),
+        manifest("second-owner", {
+          providers: [],
+          setup: { cliBackends: ["SHARED-CLI"] },
+          enabledByDefault: false,
+        }),
+      ];
+      setManifestPlugins(plugins);
+      const snapshot = createProviderRegistrySnapshotFixture();
+      indexLoader.mockReturnValue(snapshot);
+      indexWithMetadataLoader.mockReturnValue({
+        snapshot,
+        source: "derived",
+        diagnostics: [],
+        ...(prepared
+          ? {
+              manifestRegistry: {
+                plugins: [
+                  ...plugins,
+                  manifest("not-installed", {
+                    providers: ["direct-provider"],
+                    cliBackends: ["shared-cli"],
+                  }),
+                ],
+                diagnostics: [],
+              },
+            }
+          : {}),
+      });
+      manifestLoader.mockClear();
+
+      expect(owners.resolveProviderRefOwnership({ provider: " DIRECT-PROVIDER " })).toEqual({
+        status: "owned",
+        pluginIds: ["first-owner"],
+      });
+      expect(owners.resolveProviderRefOwnership({ provider: " Shared-CLI " })).toEqual({
+        status: "ambiguous",
+        pluginIds: ["first-owner", "second-owner"],
+      });
+      expect(manifestLoader).toHaveBeenCalledTimes(prepared ? 0 : 2);
+    },
+  );
+
+  it("reuses one registry snapshot across explicit model ownership lookups", () => {
     setOwningProviderManifestPlugins();
 
-    expectOwningPluginIds("claude-cli", ["anthropic"]);
-    expectOwningPluginIds("codex-cli", ["openai"]);
+    expect(
+      owners.resolveOwningPluginIdsForModelRefs({
+        models: ["openai/gpt-5.6-luna", "claude-cli/claude-sonnet-4-6"],
+      }),
+    ).toEqual(["anthropic", "openai"]);
+    expect(metadataLoader).not.toHaveBeenCalled();
+    expect(indexLoader).toHaveBeenCalledOnce();
   });
 
   beforeEach(() => {
     setActivePluginRegistry(createEmptyPluginRegistry());
-    resolveRuntimePluginRegistryMock.mockReset();
-    loadOpenClawPluginsMock.mockReset();
+    runtimeLoader.mockReset();
+    setupLoader.mockReset();
+    setupInspection.mockReset();
+    prepareAutoEnable.mockReset().mockResolvedValue(undefined);
     isPluginRegistryLoadInFlightMock.mockReset();
     isPluginRegistryLoadInFlightMock.mockReturnValue(false);
-    const provider: ProviderPlugin = {
-      id: "demo-provider",
-      label: "Demo Provider",
-      auth: [],
-    };
-    const registry = createEmptyPluginRegistry();
-    registry.providers.push({ pluginId: "google", provider, source: "bundled" });
-    resolveRuntimePluginRegistryMock.mockReturnValue(registry);
-    loadOpenClawPluginsMock.mockReturnValue(registry);
-    loadPluginManifestRegistryMock.mockReset();
-    applyPluginAutoEnableMock.mockReset();
-    applyPluginAutoEnableMock.mockImplementation(
-      (params): PluginAutoEnableResult => ({
-        config: params.config ?? ({} as OpenClawConfig),
-        changes: [],
-        autoEnabledReasons: {},
-      }),
+    metadataLoader.mockReset();
+    indexLoader.mockReset();
+    indexLoader.mockImplementation(() => createProviderRegistrySnapshotFixture());
+    indexWithMetadataLoader.mockReset();
+    indexWithMetadataLoader.mockImplementation(() => ({
+      snapshot: createProviderRegistrySnapshotFixture(),
+      source: "derived",
+      diagnostics: [],
+    }));
+    currentMetadata.mockReset();
+    currentMetadata.mockReturnValue(undefined);
+    const registry = providerRegistry(
+      {
+        id: "demo-provider",
+        label: "Demo Provider",
+        auth: [],
+      },
+      "google",
     );
+    runtimeLoader.mockReturnValue(registry);
+    setupLoader.mockReturnValue(registry);
+    setupInspection.mockResolvedValue({ registry, release: async () => {} });
+    manifestLoader.mockReset();
+    autoEnable.mockReset();
+    autoEnable.mockImplementation((params): PluginAutoEnableResult => ({
+      config: params.config ?? {},
+      changes: [],
+      autoEnabledReasons: {},
+    }));
     setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "google",
-        providerIds: ["google"],
-        enabledByDefault: true,
-      }),
-      createManifestProviderPlugin({ id: "browser", providerIds: [] }),
-      createManifestProviderPlugin({
-        id: "kilocode",
-        providerIds: ["kilocode"],
-        enabledByDefault: true,
-      }),
-      createManifestProviderPlugin({
-        id: "moonshot",
-        providerIds: ["moonshot"],
-        enabledByDefault: true,
-      }),
-      createManifestProviderPlugin({ id: "google-gemini-cli-auth", providerIds: [] }),
-      createManifestProviderPlugin({
-        id: "workspace-provider",
-        providerIds: ["workspace-provider"],
+      manifest("google", { enabledByDefault: true }),
+      manifest("browser", { providers: [] }),
+      manifest("kilocode", { enabledByDefault: true }),
+      manifest("moonshot", { enabledByDefault: true }),
+      manifest("google-gemini-cli-auth", { providers: [] }),
+      manifest("workspace-provider", {
         origin: "workspace",
         modelSupport: {
           modelPrefixes: ["workspace-model-"],
@@ -358,333 +350,65 @@ describe("resolvePluginProviders", () => {
     ]);
   });
 
-  it("forwards an explicit env to plugin loading", () => {
-    const env = { OPENCLAW_HOME: "/srv/openclaw-home" } as NodeJS.ProcessEnv;
-
-    const providers = resolvePluginProviders({
-      workspaceDir: "/workspace/explicit",
-      env,
-    });
-
-    expectResolvedProviders(providers, [
-      { id: "demo-provider", label: "Demo Provider", auth: [], pluginId: "google" },
-    ]);
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/workspace/explicit",
-        env,
-        cache: false,
-        activate: false,
+  it("loads catalog augment hooks only for declarative runtime catalog manifests", () => {
+    setManifestPlugins([
+      manifest("static-bundled", {
+        enabledByDefault: true,
+        modelCatalog: {
+          providers: {
+            "static-bundled": {
+              models: [{ id: "static-model" }],
+            },
+          },
+        },
       }),
-    );
+      manifest("runtime-bundled", {
+        enabledByDefault: true,
+        modelCatalog: {
+          runtimeAugment: true,
+        },
+      }),
+      manifest("workspace-runtime", { enabledByDefault: true, origin: "workspace" }),
+    ]);
+
+    expect(owners.resolveCatalogHookProviderPluginIds({ config: {}, env: {} })).toEqual([
+      "runtime-bundled",
+    ]);
   });
 
-  it("keeps bundled provider plugins enabled when they default on outside Vitest compat", () => {
-    expect(resolveEnabledProviderPluginIds({ config: {}, env: {} as NodeJS.ProcessEnv })).toEqual([
-      "google",
-      "kilocode",
-      "moonshot",
+  it("resolves external auth hook plugin ids from manifest contracts without runtime loading", () => {
+    setManifestPlugins([
+      manifest("external-auth-owner", {
+        providers: ["demo"],
+        contracts: { externalAuthProviders: ["demo"] },
+      }),
+      manifest("regular-provider", { providers: ["regular"] }),
     ]);
+
+    expect(
+      owners.resolveExternalAuthProfileProviderPluginIds({
+        config: {},
+        env: {},
+      }),
+    ).toEqual(["external-auth-owner"]);
+    expect(runtimeLoader).not.toHaveBeenCalled();
   });
 
   it("treats explicit empty provider scopes as scoped-empty in provider helpers", () => {
     expect(
-      resolveEnabledProviderPluginIds({
+      owners.resolveEnabledProviderPluginIds({
         config: {},
-        env: {} as NodeJS.ProcessEnv,
+        env: {},
         onlyPluginIds: [],
       }),
-    ).toEqual([]);
+    ).toStrictEqual([]);
     expect(
-      resolveDiscoveredProviderPluginIds({
+      owners.resolveDiscoveredProviderPluginIds({
         config: {},
-        env: {} as NodeJS.ProcessEnv,
+        env: {},
         onlyPluginIds: [],
       }),
-    ).toEqual([]);
-  });
-
-  it.each([
-    {
-      name: "can augment restrictive allowlists for bundled provider compatibility",
-      options: createBundledProviderCompatOptions(),
-      expectedAllow: ["openrouter", "google", "kilocode", "moonshot"],
-      expectedEntries: {
-        google: { enabled: true },
-        kilocode: { enabled: true },
-        moonshot: { enabled: true },
-      },
-    },
-    {
-      name: "does not reintroduce the retired google auth plugin id into compat allowlists",
-      options: createBundledProviderCompatOptions(),
-      expectedAllow: ["google"],
-      unexpectedAllow: ["google-gemini-cli-auth"],
-    },
-    {
-      name: "does not inject non-bundled provider plugin ids into compat allowlists",
-      options: createBundledProviderCompatOptions(),
-      unexpectedAllow: ["workspace-provider"],
-    },
-    {
-      name: "scopes bundled provider compat expansion to the requested plugin ids",
-      options: createBundledProviderCompatOptions({
-        onlyPluginIds: ["moonshot"],
-      }),
-      expectedAllow: ["openrouter", "moonshot"],
-      unexpectedAllow: ["google", "kilocode"],
-      expectedOnlyPluginIds: ["moonshot"],
-    },
-  ] as const)(
-    "$name",
-    ({ options, expectedAllow, expectedEntries, expectedOnlyPluginIds, unexpectedAllow }) => {
-      resolvePluginProviders(
-        cloneOptions(options) as unknown as Parameters<typeof resolvePluginProviders>[0],
-      );
-
-      expectResolvedAllowlistState({
-        expectedAllow,
-        expectedEntries,
-        expectedOnlyPluginIds,
-        unexpectedAllow,
-      });
-    },
-  );
-
-  it("can enable bundled provider plugins under Vitest when no explicit plugin config exists", () => {
-    resolvePluginProviders({
-      env: { VITEST: "1" } as NodeJS.ProcessEnv,
-      bundledProviderVitestCompat: true,
-    });
-
-    expectLastRuntimeRegistryLoad();
-    expect(getLastResolvedPluginConfig()).toEqual(
-      expect.objectContaining({
-        plugins: expect.objectContaining({
-          enabled: true,
-          allow: expect.arrayContaining(["google", "moonshot"]),
-          entries: expect.objectContaining({
-            google: { enabled: true },
-            moonshot: { enabled: true },
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("uses process env for Vitest compat when no explicit env is passed", () => {
-    const previousVitest = process.env.VITEST;
-    process.env.VITEST = "1";
-    try {
-      resolvePluginProviders({
-        bundledProviderVitestCompat: true,
-        onlyPluginIds: ["google"],
-      });
-
-      expectLastRuntimeRegistryLoad({
-        onlyPluginIds: ["google"],
-      });
-      expect(getLastResolvedPluginConfig()).toEqual(
-        expect.objectContaining({
-          plugins: expect.objectContaining({
-            enabled: true,
-            allow: ["google"],
-            entries: {
-              google: { enabled: true },
-            },
-          }),
-        }),
-      );
-    } finally {
-      if (previousVitest === undefined) {
-        delete process.env.VITEST;
-      } else {
-        process.env.VITEST = previousVitest;
-      }
-    }
-  });
-
-  it("does not leak host Vitest env into an explicit non-Vitest env", () => {
-    const previousVitest = process.env.VITEST;
-    process.env.VITEST = "1";
-    try {
-      resolvePluginProviders({
-        env: {} as NodeJS.ProcessEnv,
-        bundledProviderVitestCompat: true,
-      });
-
-      expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          config: undefined,
-          env: {},
-        }),
-      );
-    } finally {
-      if (previousVitest === undefined) {
-        delete process.env.VITEST;
-      } else {
-        process.env.VITEST = previousVitest;
-      }
-    }
-  });
-
-  it("loads only provider plugins on the provider runtime path", () => {
-    resolvePluginProviders({
-      bundledProviderAllowlistCompat: true,
-    });
-
-    expectLastRuntimeRegistryLoad({
-      onlyPluginIds: ["google", "kilocode", "moonshot"],
-    });
-  });
-
-  it("loads all discovered provider plugins in setup mode", () => {
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["openrouter"],
-          entries: {
-            google: { enabled: false },
-          },
-        },
-      },
-      mode: "setup",
-    });
-
-    expectLastSetupRegistryLoad({
-      onlyPluginIds: ["google", "kilocode", "moonshot", "workspace-provider"],
-    });
-    expect(getLastSetupLoadedPluginConfig()).toEqual(
-      expect.objectContaining({
-        plugins: expect.objectContaining({
-          allow: expect.arrayContaining([
-            "openrouter",
-            "google",
-            "kilocode",
-            "moonshot",
-            "workspace-provider",
-          ]),
-          entries: expect.objectContaining({
-            google: { enabled: false },
-            kilocode: { enabled: true },
-            moonshot: { enabled: true },
-            "workspace-provider": { enabled: true },
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("excludes untrusted workspace provider plugins from setup discovery when requested", () => {
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["openrouter"],
-        },
-      },
-      mode: "setup",
-      includeUntrustedWorkspacePlugins: false,
-    });
-
-    expectLastSetupRegistryLoad({
-      onlyPluginIds: ["google", "kilocode", "moonshot"],
-    });
-  });
-
-  it("keeps trusted but disabled workspace provider plugins eligible in setup discovery", () => {
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["openrouter", "workspace-provider"],
-          entries: {
-            "workspace-provider": { enabled: false },
-          },
-        },
-      },
-      mode: "setup",
-      includeUntrustedWorkspacePlugins: false,
-    });
-
-    expectLastSetupRegistryLoad({
-      onlyPluginIds: ["google", "kilocode", "moonshot", "workspace-provider"],
-    });
-  });
-
-  it("does not include trusted-but-disabled workspace providers when denylist blocks them", () => {
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["openrouter", "workspace-provider"],
-          deny: ["workspace-provider"],
-          entries: {
-            "workspace-provider": { enabled: false },
-          },
-        },
-      },
-      mode: "setup",
-      includeUntrustedWorkspacePlugins: false,
-    });
-
-    expectLastSetupRegistryLoad({
-      onlyPluginIds: ["google", "kilocode", "moonshot"],
-    });
-  });
-
-  it("does not include workspace providers blocked by allowlist gating", () => {
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["openrouter"],
-          entries: {
-            "workspace-provider": { enabled: true },
-          },
-        },
-      },
-      mode: "setup",
-      includeUntrustedWorkspacePlugins: false,
-    });
-
-    expectLastSetupRegistryLoad({
-      onlyPluginIds: ["google", "kilocode", "moonshot"],
-    });
-  });
-
-  it("loads provider plugins from the auto-enabled config snapshot", () => {
-    const { rawConfig, autoEnabledConfig } = createAutoEnabledProviderConfig();
-    applyPluginAutoEnableMock.mockReturnValue({
-      config: autoEnabledConfig,
-      changes: [],
-      autoEnabledReasons: {
-        google: ["google auth configured"],
-      },
-    });
-
-    resolvePluginProviders({ config: rawConfig });
-
-    expectAutoEnabledProviderLoad({
-      rawConfig,
-      autoEnabledConfig,
-    });
-  });
-
-  it("routes provider runtime resolution through the compatible active-registry seam", () => {
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["google"],
-        },
-      },
-      onlyPluginIds: ["google"],
-      workspaceDir: "/workspace/runtime",
-    });
-
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/workspace/runtime",
-        cache: false,
-        activate: false,
-      }),
-    );
+    ).toStrictEqual([]);
   });
 
   it("inherits workspaceDir from the active registry when provider resolution omits it", () => {
@@ -696,161 +420,24 @@ describe("resolvePluginProviders", () => {
     );
 
     resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["google"],
-        },
-      },
+      config: { plugins: { allow: ["google"] } },
       onlyPluginIds: ["google"],
     });
 
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/workspace/runtime",
-        cache: false,
-        activate: false,
-      }),
-    );
-  });
-  it("activates owning plugins for explicit provider refs", () => {
-    setOwningProviderManifestPlugins();
-
-    resolvePluginProviders({
-      config: {},
-      providerRefs: ["openai-codex"],
-      activate: true,
+    expect(getLastRuntimeRegistryCall()).toMatchObject({
+      workspaceDir: "/workspace/runtime",
+      cache: true,
+      activate: false,
     });
-
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        onlyPluginIds: ["openai"],
-        activate: true,
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            allow: ["openai"],
-            entries: {
-              openai: { enabled: true },
-            },
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("uses activation.onProviders to keep explicit provider owners on the runtime path", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "activation-owned-provider",
-        providerIds: [],
-        activation: {
-          onProviders: ["activation-owned"],
-        },
-      }),
-    ]);
-
-    resolvePluginProviders({
-      config: {},
-      providerRefs: ["activation-owned"],
-      activate: true,
-    });
-
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        onlyPluginIds: ["activation-owned-provider"],
-        activate: true,
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            allow: ["activation-owned-provider"],
-            entries: {
-              "activation-owned-provider": { enabled: true },
-            },
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("does not activate explicit runtime owners when plugins are globally disabled", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "activation-owned-provider",
-        providerIds: [],
-        activation: {
-          onProviders: ["activation-owned"],
-        },
-      }),
-    ]);
-
-    expect(
-      resolveActivatableProviderOwnerPluginIds({
-        pluginIds: ["activation-owned-provider"],
-        config: {
-          plugins: {
-            enabled: false,
-          },
-        },
-      }),
-    ).toEqual([]);
-  });
-
-  it("does not activate explicit runtime owners disabled in config", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "activation-owned-provider",
-        providerIds: [],
-        activation: {
-          onProviders: ["activation-owned"],
-        },
-      }),
-    ]);
-
-    expect(
-      resolveActivatableProviderOwnerPluginIds({
-        pluginIds: ["activation-owned-provider"],
-        config: {
-          plugins: {
-            entries: {
-              "activation-owned-provider": { enabled: false },
-            },
-          },
-        },
-      }),
-    ).toEqual([]);
-  });
-
-  it("does not activate explicit runtime owners outside the allowlist", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "activation-owned-provider",
-        providerIds: [],
-        activation: {
-          onProviders: ["activation-owned"],
-        },
-      }),
-    ]);
-
-    expect(
-      resolveActivatableProviderOwnerPluginIds({
-        pluginIds: ["activation-owned-provider"],
-        config: {
-          plugins: {
-            allow: ["other-plugin"],
-          },
-        },
-      }),
-    ).toEqual([]);
   });
 
   it("uses setup.providers to keep explicit provider owners on the setup path", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "setup-owned-provider",
-        providerIds: [],
-        setup: {
-          providers: [{ id: "setup-owned" }],
-        },
-      }),
-    ]);
+    setManifest("setup-owned-provider", {
+      providers: [],
+      setup: {
+        providers: [{ id: "setup-owned" }],
+      },
+    });
 
     resolvePluginProviders({
       config: {},
@@ -859,159 +446,36 @@ describe("resolvePluginProviders", () => {
       mode: "setup",
     });
 
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        onlyPluginIds: ["setup-owned-provider"],
-        activate: true,
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            allow: ["setup-owned-provider"],
-            entries: {
-              "setup-owned-provider": { enabled: true },
-            },
-          }),
-        }),
-      }),
-    );
+    expectActivatedOwner("setup-owned-provider", "setup", true);
   });
 
   it("does not override global plugin disable during setup owner loading", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "setup-owned-provider",
-        providerIds: [],
-        setup: {
-          providers: [{ id: "setup-owned" }],
-        },
-      }),
-    ]);
+    setManifest("setup-owned-provider", {
+      providers: [],
+      setup: {
+        providers: [{ id: "setup-owned" }],
+      },
+    });
 
     resolvePluginProviders({
-      config: {
-        plugins: {
-          enabled: false,
-        },
-      },
+      config: { plugins: { enabled: false } },
       providerRefs: ["setup-owned"],
       activate: true,
       mode: "setup",
     });
 
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            enabled: false,
-            allow: ["setup-owned-provider"],
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("does not override explicitly disabled setup owners", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "setup-owned-provider",
-        providerIds: [],
-        setup: {
-          providers: [{ id: "setup-owned" }],
-        },
-      }),
-    ]);
-
-    resolvePluginProviders({
-      config: {
-        plugins: {
-          entries: {
-            "setup-owned-provider": { enabled: false },
-          },
-        },
-      },
-      providerRefs: ["setup-owned"],
-      activate: true,
-      mode: "setup",
-    });
-
-    expect(loadOpenClawPluginsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            allow: ["setup-owned-provider"],
-            entries: {
-              "setup-owned-provider": { enabled: false },
-            },
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("filters explicit setup owners through the untrusted workspace discovery gate", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "workspace-activation-owner",
-        providerIds: [],
-        origin: "workspace",
-        activation: {
-          onProviders: ["workspace-activation"],
-        },
-      }),
-    ]);
-
-    const providers = resolvePluginProviders({
-      config: {},
-      providerRefs: ["workspace-activation"],
-      activate: true,
-      mode: "setup",
-      includeUntrustedWorkspacePlugins: false,
-    });
-
-    expect(providers).toEqual([]);
-    expect(loadOpenClawPluginsMock).not.toHaveBeenCalled();
-  });
-
-  it("does not auto-activate untrusted workspace runtime owners when requested", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "workspace-activation-owner",
-        providerIds: [],
-        origin: "workspace",
-        activation: {
-          onProviders: ["workspace-activation"],
-        },
-      }),
-    ]);
-    resolveRuntimePluginRegistryMock.mockReturnValue(createEmptyPluginRegistry());
-
-    const providers = resolvePluginProviders({
-      config: {},
-      providerRefs: ["workspace-activation"],
-      activate: true,
-      includeUntrustedWorkspacePlugins: false,
-    });
-
-    expect(providers).toEqual([]);
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        config: {},
-        onlyPluginIds: [],
-      }),
-    );
+    expect(setupLoader).not.toHaveBeenCalled();
   });
 
   it("does not auto-activate workspace runtime owners by default", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "workspace-activation-owner",
-        providerIds: [],
-        origin: "workspace",
-        activation: {
-          onProviders: ["workspace-activation"],
-        },
-      }),
-    ]);
-    resolveRuntimePluginRegistryMock.mockReturnValue(createEmptyPluginRegistry());
+    setManifest("workspace-activation-owner", {
+      providers: [],
+      origin: "workspace",
+      activation: {
+        onProviders: ["workspace-activation"],
+      },
+    });
+    runtimeLoader.mockReturnValue(createEmptyPluginRegistry());
 
     const providers = resolvePluginProviders({
       config: {},
@@ -1019,210 +483,14 @@ describe("resolvePluginProviders", () => {
       activate: true,
     });
 
-    expect(providers).toEqual([]);
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        config: {},
-        onlyPluginIds: [],
-      }),
-    );
-  });
-
-  it("keeps explicit provider requests scoped when runtime owner activation resolves nothing", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "activation-owned-provider",
-        providerIds: [],
-        activation: {
-          onProviders: ["activation-owned"],
-        },
-      }),
-    ]);
-    resolveRuntimePluginRegistryMock.mockReturnValue(createEmptyPluginRegistry());
-
-    const providers = resolvePluginProviders({
-      config: {
-        plugins: {
-          allow: ["other-plugin"],
-        },
-      },
-      providerRefs: ["activation-owned"],
-      activate: true,
-    });
-
-    expect(providers).toEqual([]);
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        config: {
-          plugins: {
-            allow: ["other-plugin"],
-          },
-        },
-        onlyPluginIds: [],
-      }),
-    );
-  });
-
-  it("keeps explicitly trusted disabled workspace setup owners discoverable", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "workspace-activation-owner",
-        providerIds: [],
-        origin: "workspace",
-        activation: {
-          onProviders: ["workspace-activation"],
-        },
-      }),
-    ]);
-
-    expect(
-      resolveDiscoverableProviderOwnerPluginIds({
-        pluginIds: ["workspace-activation-owner"],
-        config: {
-          plugins: {
-            enabled: true,
-            allow: ["workspace-activation-owner"],
-            entries: {
-              "workspace-activation-owner": { enabled: false },
-            },
-          },
-        },
-        includeUntrustedWorkspacePlugins: false,
-      }),
-    ).toEqual(["workspace-activation-owner"]);
-  });
-
-  it("does not auto-activate explicitly disabled trusted workspace runtime owners", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "workspace-activation-owner",
-        providerIds: [],
-        origin: "workspace",
-        activation: {
-          onProviders: ["workspace-activation"],
-        },
-      }),
-    ]);
-
-    expect(
-      resolveActivatableProviderOwnerPluginIds({
-        pluginIds: ["workspace-activation-owner"],
-        config: {
-          plugins: {
-            allow: ["workspace-activation-owner"],
-            entries: {
-              "workspace-activation-owner": { enabled: false },
-            },
-          },
-        },
-        includeUntrustedWorkspacePlugins: false,
-      }),
-    ).toEqual([]);
-  });
-
-  it("keeps legacy CLI backend ownership as the explicit provider fallback", () => {
-    setOwningProviderManifestPlugins();
-
-    resolvePluginProviders({
-      config: {},
-      providerRefs: ["claude-cli"],
-      activate: true,
-    });
-
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        onlyPluginIds: ["anthropic"],
-        activate: true,
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            allow: ["anthropic"],
-            entries: {
-              anthropic: { enabled: true },
-            },
-          }),
-        }),
-      }),
-    );
-  });
-  it.each([
-    {
-      provider: "minimax-portal",
-      expectedPluginIds: ["minimax"],
-    },
-    {
-      provider: "openai-codex",
-      expectedPluginIds: ["openai"],
-    },
-    {
-      provider: "gemini-cli",
-      expectedPluginIds: undefined,
-    },
-  ] as const)(
-    "maps $provider to owning plugin ids via manifests",
-    ({ provider, expectedPluginIds }) => {
-      setOwningProviderManifestPlugins();
-
-      expectOwningPluginIds(provider, expectedPluginIds);
-    },
-  );
-
-  it.each([
-    {
-      model: "gpt-5.4",
-      expectedPluginIds: ["openai"],
-    },
-    {
-      model: "claude-sonnet-4-6",
-      expectedPluginIds: ["anthropic"],
-    },
-    {
-      model: "openai/gpt-5.4",
-      expectedPluginIds: ["openai"],
-    },
-    {
-      model: "workspace-model-fast",
-      expectedPluginIds: ["workspace-provider"],
-    },
-    {
-      model: "unknown-model",
-      expectedPluginIds: undefined,
-    },
-  ] as const)(
-    "maps $model to owning plugin ids via modelSupport",
-    ({ model, expectedPluginIds }) => {
-      setOwningProviderManifestPluginsWithWorkspace();
-
-      expectModelOwningPluginIds(model, expectedPluginIds);
-    },
-  );
-
-  it("refuses ambiguous bundled shorthand model ownership", () => {
-    setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "openai",
-        providerIds: ["openai"],
-        modelSupport: { modelPrefixes: ["gpt-"] },
-      }),
-      createManifestProviderPlugin({
-        id: "proxy-openai",
-        providerIds: ["proxy-openai"],
-        modelSupport: { modelPrefixes: ["gpt-"] },
-      }),
-    ]);
-
-    expectModelOwningPluginIds("gpt-5.4", undefined);
+    expect(providers).toStrictEqual([]);
+    expect(runtimeLoader).not.toHaveBeenCalled();
   });
 
   it("prefers non-bundled shorthand model ownership over bundled matches", () => {
     setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "openai",
-        providerIds: ["openai"],
-        modelSupport: { modelPrefixes: ["gpt-"] },
-      }),
-      createManifestProviderPlugin({
-        id: "workspace-openai",
-        providerIds: ["workspace-openai"],
+      manifest("openai", { modelSupport: { modelPrefixes: ["gpt-"] } }),
+      manifest("workspace-openai", {
         origin: "workspace",
         modelSupport: { modelPrefixes: ["gpt-"] },
       }),
@@ -1231,46 +499,257 @@ describe("resolvePluginProviders", () => {
     expectModelOwningPluginIds("gpt-5.4", ["workspace-openai"]);
   });
 
-  it("auto-loads a model-owned provider plugin from shorthand model refs", () => {
+  it("rejects unsafe model patterns that would match the model", () => {
+    setManifest("malicious", {
+      modelSupport: {
+        modelPatterns: ["(a+)+$"],
+      },
+    });
+
+    // An unguarded pattern would match and incorrectly claim the model.
+    expectModelOwningPluginIds("a", undefined);
+  });
+
+  it("preserves LM Studio @iq* quant suffixes when resolving model-owned provider plugins", () => {
     setManifestPlugins([
-      createManifestProviderPlugin({
-        id: "openai",
-        providerIds: ["openai", "openai-codex"],
+      manifest("lmstudio", {
+        modelSupport: {
+          modelPatterns: ["^qwen3\\.6-27b@iq3_xxs$"],
+        },
+      }),
+      manifest("workspace-prefix", {
+        origin: "workspace",
+        modelSupport: { modelPrefixes: ["qwen3.6-27b@"] },
+      }),
+    ]);
+    const registry = providerRegistry(
+      {
+        id: "lmstudio",
+        label: "LM Studio",
+        auth: [],
+      },
+      "lmstudio",
+    );
+    runtimeLoader.mockReturnValue(registry);
+
+    expectModelOwningPluginIds("qwen3.6-27b@iq3_xxs", ["lmstudio"]);
+    expectModelOwningPluginIds("qwen3.6-27b", undefined);
+
+    const providers = resolvePluginProviders({
+      config: {},
+      modelRefs: ["qwen3.6-27b@iq3_xxs"],
+    });
+
+    expect(providers).toEqual([
+      { id: "lmstudio", label: "LM Studio", auth: [], pluginId: "lmstudio" },
+    ]);
+    expectActivatedOwner("lmstudio");
+  });
+
+  it("prepares activated auto-enable owners before acquiring the runtime inspection", async () => {
+    const prepared = createDeferred();
+    prepareAutoEnable.mockReturnValue(prepared.promise);
+    const consume = vi.fn(async () => {});
+    const operation = withPluginProviders(
+      { config: {}, mode: "runtime", providerRefs: ["google"] },
+      consume,
+    );
+    expect(prepareAutoEnable).toHaveBeenCalledOnce();
+    expect(prepareAutoEnable.mock.calls[0]?.[0].config.plugins?.entries?.google?.enabled).toBe(
+      true,
+    );
+    expect(setupInspection).not.toHaveBeenCalled();
+    prepared.resolve();
+    await operation;
+    expect(setupInspection).toHaveBeenCalledOnce();
+    expect(consume).toHaveBeenCalledOnce();
+  });
+
+  it("keeps provider hints on their retained generation without acquiring a new inspection", async () => {
+    const { createProviderHookRuntime } = await import("./provider-hook-runtime-core.js");
+    const { createProviderRegistryResolver } = await import("./providers.runtime-core.js");
+    const { withPluginRuntimeGenerationRegistryScope } =
+      await import("./runtime/generation-state.js");
+    const registry = providerRegistry({ id: "google", label: "Retained Google", auth: [] });
+    currentMetadata.mockReturnValue(
+      createPluginMetadataSnapshotFixture({ plugins: manifestLoader().plugins }),
+    );
+    const hooks = createProviderHookRuntime(
+      createProviderRegistryResolver({
+        loadOpenClawPlugins: setupLoader,
+        acquirePluginRegistryForInspection: setupInspection,
+        resolveRuntimePluginRegistry: runtimeLoader,
+        isPluginRegistryLoadInFlight: isPluginRegistryLoadInFlightMock,
+      }),
+    );
+    const label = await withPluginRuntimeGenerationRegistryScope(registry, () =>
+      hooks.withProviderRuntimePlugin(
+        { provider: "google", config: {} },
+        async (plugin) => plugin?.label,
+      ),
+    );
+    expect(label).toBe("Retained Google");
+    expect(setupInspection).not.toHaveBeenCalled();
+    expect(prepareAutoEnable).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { mode: "runtime", empty: false, expected: ["Retained Google"], acquired: 0 },
+    { mode: "runtime", empty: true, expected: [], acquired: 0 },
+    { mode: "setup", empty: false, expected: ["Setup Google"], acquired: 1 },
+  ] as const)(
+    "preserves $mode provider ownership for a retained generation (empty=$empty)",
+    async ({ mode, empty, expected, acquired }) => {
+      const { withPluginRuntimeGenerationRegistryScope } =
+        await import("./runtime/generation-state.js");
+      const registry = empty
+        ? createEmptyPluginRegistry()
+        : providerRegistry({ id: "google", label: "Retained Google", auth: [] });
+      currentMetadata.mockReturnValue(
+        createPluginMetadataSnapshotFixture({ plugins: manifestLoader().plugins }),
+      );
+      setupInspection.mockResolvedValue({
+        registry: providerRegistry({ id: "google", label: "Setup Google", auth: [] }),
+        release: async () => {},
+      });
+      const labels = await withPluginRuntimeGenerationRegistryScope(registry, () =>
+        withPluginProviders({ config: {}, mode, providerRefs: ["google"] }, async (providers) =>
+          providers.map((provider) => provider.label),
+        ),
+      );
+      expect(labels).toEqual(expected);
+      expect(setupInspection).toHaveBeenCalledTimes(acquired);
+      expect(prepareAutoEnable).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps selected providers alive until asynchronous repair failure settles", async () => {
+    const admitted = createDeferred();
+    const entered = createDeferred();
+    const finished = createDeferred();
+    const events: string[] = [];
+    const failure = new Error("repair failed");
+    const registry = providerRegistry({ id: "google", label: "Google", auth: [] });
+    registry.providers.push({
+      pluginId: "kilocode",
+      provider: { id: "kilocode", label: "Kilo", auth: [] },
+      source: "bundled",
+    });
+    setupInspection.mockImplementation(async () => {
+      await admitted.promise;
+      return {
+        registry,
+        release: async () => {
+          events.push("released");
+        },
+      };
+    });
+    const operation = withPluginProviders(
+      { config: {}, mode: "runtime", providerRefs: ["google"] },
+      async (providers) => {
+        expect(providers.map((provider) => provider.id)).toEqual(["google"]);
+        events.push("consuming");
+        entered.resolve();
+        await finished.promise;
+        throw failure;
+      },
+    );
+    expect(events).toEqual([]);
+    admitted.resolve();
+    await entered.promise;
+    expect(events).toEqual(["consuming"]);
+    finished.resolve();
+    await expect(operation).rejects.toBe(failure);
+    expect(events).toEqual(["consuming", "released"]);
+  });
+
+  it.each(["cancellation", "retirement", "metadata invalidation"])(
+    "releases a prepared inspection after %s",
+    async (cause) => {
+      const { AsyncWorkScope } = await import("../shared/async-work-scope.js");
+      const {
+        createPluginCache,
+        invalidatePluginCacheMetadata,
+        retirePluginCache,
+        withPluginCache,
+      } = await import("./plugin-cache.js");
+      const cache = createPluginCache();
+      const work = new AsyncWorkScope();
+      const acquired = createDeferred<Awaited<ReturnType<typeof setupInspection>>>();
+      const released = vi.fn(async () => {});
+      const consume = vi.fn(async () => {});
+      setupInspection.mockReturnValue(acquired.promise);
+      const operation = withPluginCache(cache, () =>
+        work.track(() => withPluginProviders({ config: {}, mode: "setup" }, consume)),
+      );
+      const rejected = expect(operation).rejects.toThrow();
+      if (cause === "cancellation") {
+        work.beginClose();
+      } else if (cause === "retirement") {
+        void retirePluginCache(cache);
+      } else {
+        invalidatePluginCacheMetadata(cache);
+      }
+      acquired.resolve({ registry: createEmptyPluginRegistry(), release: released });
+      await rejected;
+      expect(consume).not.toHaveBeenCalled();
+      expect(released).toHaveBeenCalledOnce();
+      await work.drain();
+      await retirePluginCache(cache);
+    },
+  );
+
+  it("rejects a completed provider inspection after metadata invalidation", async () => {
+    const { createPluginCache, invalidatePluginCacheMetadata, retirePluginCache, withPluginCache } =
+      await import("./plugin-cache.js");
+    const cache = createPluginCache();
+    const released = vi.fn(async () => {});
+    setupInspection.mockResolvedValue({ registry: createEmptyPluginRegistry(), release: released });
+    try {
+      await expect(
+        withPluginCache(cache, () =>
+          withPluginProviders({ config: {}, mode: "setup" }, async () => {
+            invalidatePluginCacheMetadata(cache);
+            return "stale";
+          }),
+        ),
+      ).rejects.toThrow("retired");
+      expect(released).toHaveBeenCalledOnce();
+    } finally {
+      await retirePluginCache(cache);
+    }
+  });
+
+  it("auto-loads a same-id prefix record after ambiguous pattern matches", () => {
+    setManifestPlugins([
+      manifest("openai", {
+        providers: ["openai", "openai"],
         modelSupport: {
           modelPrefixes: ["gpt-", "o1", "o3", "o4"],
         },
       }),
+      ...["openai", "second-pattern"].map((id) =>
+        manifest(id, {
+          modelSupport: { modelPatterns: ["^gpt-"], modelPrefixes: ["gpt-"] },
+        }),
+      ),
     ]);
-    const provider: ProviderPlugin = {
-      id: "openai",
-      label: "OpenAI",
-      auth: [],
-    };
-    const registry = createEmptyPluginRegistry();
-    registry.providers.push({ pluginId: "openai", provider, source: "bundled" });
-    resolveRuntimePluginRegistryMock.mockReturnValue(registry);
+    const registry = providerRegistry(
+      {
+        id: "openai",
+        label: "OpenAI",
+        auth: [],
+      },
+      "openai",
+    );
+    runtimeLoader.mockReturnValue(registry);
 
     const providers = resolvePluginProviders({
       config: {},
       modelRefs: ["gpt-5.4"],
-      bundledProviderAllowlistCompat: true,
     });
 
-    expectResolvedProviders(providers, [
-      { id: "openai", label: "OpenAI", auth: [], pluginId: "openai" },
-    ]);
-    expect(resolveRuntimePluginRegistryMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        onlyPluginIds: ["openai"],
-        config: expect.objectContaining({
-          plugins: expect.objectContaining({
-            allow: ["openai"],
-            entries: {
-              openai: { enabled: true },
-            },
-          }),
-        }),
-      }),
-    );
+    expect(providers).toEqual([{ id: "openai", label: "OpenAI", auth: [], pluginId: "openai" }]);
+    expectActivatedOwner("openai");
   });
 });

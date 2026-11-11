@@ -1,463 +1,365 @@
 import { describe, expect, it } from "vitest";
 import {
+  assistantTraceTextFilter,
+  assistantVisibleTextFilters,
+  plainToolCallTextFilter,
   sanitizeAssistantVisibleText,
   sanitizeAssistantVisibleTextWithProfile,
   stripAssistantInternalScaffolding,
+  stripToolCallXmlTags,
+  type AssistantVisibleTextSanitizerProfile,
 } from "./assistant-visible-text.js";
-import { stripModelSpecialTokens } from "./model-special-tokens.js";
+import { regexWork, streamChunks } from "./streaming.test-support.js";
+import { createTextProjection, type TextFilter } from "./text-projection.js";
+
+function expectBoundedWork(filter: TextFilter, source: string, expected: string, budget: number) {
+  const projection = createTextProjection([filter]);
+  const testedCharacters = regexWork(() => streamChunks(source, 4, projection));
+  expect(projection.text).toBe(expected);
+  expect(testedCharacters).toBeGreaterThan(0);
+  expect(testedCharacters).toBeLessThan(source.length * budget);
+}
+
+function expectChunkedProjection(source: string, size: number, expected: string) {
+  const projection = createTextProjection(assistantVisibleTextFilters("delivery", true));
+  streamChunks(source, size, projection, (result, end) => {
+    expect(result.text).toBe(
+      sanitizeAssistantVisibleTextWithProfile(source.slice(0, end), "delivery", true),
+    );
+  });
+  expect(projection.text).toBe(expected);
+}
+
+it("keeps plain-tool code protection independent across interleaved streams and replacements", () => {
+  const literal = createTextProjection([plainToolCallTextFilter]);
+  const hidden = createTextProjection([plainToolCallTextFilter]);
+  const opening = "```text\n[tool:read] ";
+  literal.append(opening);
+  hidden.append("Before\n[tool:read] ");
+  const payload = "{}\n";
+  expect(literal.append(payload).text).toBe(opening + payload);
+  expect(hidden.append(payload + "After").text).toBe("Before\nAfter");
+
+  expect(hidden.replace("[tool:read] {}\n").text).toBe("");
+  expect(literal.append("```\n").text).toBe(opening + payload + "```\n");
+  expect(hidden.append("Fresh").text).toBe("Fresh");
+});
+
+it.each([1, 7, 32])(
+  "preserves Markdown and strips bracket payloads in %i-character chunks",
+  (size) => {
+    const literal = '[read]\n{"path":"example.txt"}\n[/read]';
+    const visible = `[guide](https://example.test)\n\n\`\`\`text\n${literal}\n\`\`\`\n\nAfter`;
+    const raw = `${visible}\n[tool:read]{"path":"hidden.txt"}\nDone`;
+    expectChunkedProjection(raw, size, `${visible}\nDone`);
+  },
+);
+
+it.each([" \t\n", "\u0085\u200b \u200c\u200d\u2060\ufeff \u200e\u2066\u2069\ufe0f"])(
+  "does not present invisible-only assistant output %j as an answer",
+  (text) => {
+    expect(sanitizeAssistantVisibleText(text)).toBe("");
+    expect(sanitizeAssistantVisibleTextWithProfile(text, "final-answer-delivery")).toBe("");
+  },
+);
+
+it.each(["word\u200bbreak", "👩‍💻", "می‌روم"])(
+  "preserves Unicode formatting within visible answers %j",
+  (text) => expect(sanitizeAssistantVisibleText(text)).toBe(text),
+);
 
 describe("stripAssistantInternalScaffolding", () => {
-  function expectVisibleText(input: string, expected: string) {
+  it.each([
+    ["Hello\n<relevant-memories>\ninternal-only", "Hello\n"],
+    [
+      "<thinking>\nsecret\n</thinking>\n   \n<relevant-memories>\ninternal note\n</relevant-memories>\n  Visible",
+      "  Visible",
+    ],
+    ['Prefix\n<tool_result> {"output": "data"} </tool_call>\nSuffix', "Prefix\n\nSuffix"],
+    ['Before\n[TOOL_CALL]{tool => "web_search", args => {"query":"NET stock price"}', "Before\n"],
+    ['<tool_call><parameter name="token">secret</parameter>', ""],
+    ['Prefix\n<tool_call>{"name":"x"}</tool_result>LEAK</tool_call>\nSuffix', "Prefix\n\nSuffix"],
+    [
+      'Use <tool_call to invoke tools.\n<tool_call>{"name":"find"}</tool_call>',
+      "Use <tool_call to invoke tools.\n",
+    ],
+    [
+      'Use </tool_call to explain tags.\n<tool_call>{"name":"find"}</tool_call>',
+      "Use </tool_call to explain tags.\n",
+    ],
+    ['prefix\n<function_calls id="x"\n[{"name":"find"}]', "prefix\n"],
+    [
+      "prefix\n<tool_call>\n" +
+        JSON.stringify({ html: '"</tool_call>', tail: "</tool_call> still hidden" }) +
+        "\n</tool_call>\nsuffix",
+      "prefix\n\nsuffix",
+    ],
+    ["prefix </tool_call> suffix", "prefix  suffix"],
+    ['Before\n[TOOL_RESULT]{"output":"secret result"}[/TOOL_RESULT]\nAfter', "Before\n\nAfter"],
+  ] as const)("strips internal scaffolding: %j", (input, expected) => {
     expect(stripAssistantInternalScaffolding(input)).toBe(expected);
-  }
+  });
 
-  function createLiteralRelevantMemoriesCodeBlock() {
-    return [
-      "```xml",
-      "<relevant-memories>",
-      "sample",
-      "</relevant-memories>",
-      "```",
-      "",
-      "Visible text",
-    ].join("\n");
-  }
-
-  function expectLiteralVisibleText(input: string) {
-    expectVisibleText(input, input);
-  }
+  const parameter = '<parameter name="path">/tmp</parameter>';
+  it.each([
+    "```xml\n<relevant-memories>\nsample\n</relevant-memories>\n```\n\nVisible text",
+    'prefix\n<function name="spawn">\n<parameter name="key">value</parameter>',
+    "Use <function_response>ok</function_response> to describe the response wrapper.",
+    '```text\n[TOOL_CALL]{tool => "web_search", args => {"query":"x"}}[/TOOL_CALL]\n```\nVisible',
+    `Use \`${parameter}\`.`,
+    `Use <function name="read">${parameter}</function> in docs.`,
+    `<schema>${parameter}</schema>`,
+    '<schema><parameter name="path"/></schema>',
+  ])("preserves literal markup: %j", (input) =>
+    expect(stripAssistantInternalScaffolding(input)).toBe(input),
+  );
 
   it.each([
-    {
-      name: "strips reasoning tags",
-      input: ["<thinking>", "secret", "</thinking>", "Visible"].join("\n"),
-      expected: "Visible",
+    [
+      'Results: <parameter name="assumptions">some content</parameter> after.',
+      "Results: some content after.",
+    ],
+    ['<parameter name="assumptions">\nline 1\nline 2\n</parameter>', "line 1\nline 2"],
+    ['Results:<parameter name="x">\nline\n</parameter>after', "Results:\nline\nafter"],
+    [`<br>${parameter}`, "<br>/tmp"],
+    [`Use <function> declarations. ${parameter}`, "Use <function> declarations. /tmp"],
+    [`<schema><other data="</schema>">${parameter}`, '<schema><other data="</schema>">/tmp'],
+    ['`<schema data="` <parameter>x</parameter> "></schema>', '`<schema data="` x "></schema>'],
+    ["<schema>`</schema>`<parameter>x</parameter>", "<schema>`</schema>`x"],
+  ])(
+    "unwraps standalone parameters without disturbing surrounding text (#98557): %j",
+    (input, expected) => {
+      expect(stripAssistantInternalScaffolding(input)).toBe(expected);
     },
-    {
-      name: "strips relevant-memories scaffolding blocks",
-      input: [
-        "<relevant-memories>",
-        "The following memories may be relevant to this conversation:",
-        "- Internal memory note",
-        "</relevant-memories>",
-        "",
-        "User-visible answer",
-      ].join("\n"),
-      expected: "User-visible answer",
+  );
+});
+
+describe("stripToolCallXmlTags", () => {
+  it.each(["<tool_call>", " \n<tool_call>\n ", "<TOOL_CALL>"])(
+    "hides a bare unfinished tool-call transport marker: %j",
+    (text) => {
+      expect(stripToolCallXmlTags(text)).toBe("");
     },
-    {
-      name: "supports relevant_memories tag variants",
-      input: [
-        "<relevant_memories>",
-        "Internal memory note",
-        "</relevant_memories>",
-        "Visible",
-      ].join("\n"),
-      expected: "Visible",
-    },
-    {
-      name: "hides unfinished relevant-memories blocks",
-      input: ["Hello", "<relevant-memories>", "internal-only"].join("\n"),
-      expected: "Hello\n",
-    },
-    {
-      name: "trims leading whitespace after stripping scaffolding",
-      input: [
-        "<thinking>",
-        "secret",
-        "</thinking>",
-        "   ",
-        "<relevant-memories>",
-        "internal note",
-        "</relevant-memories>",
-        "  Visible",
-      ].join("\n"),
-      expected: "Visible",
-    },
-    {
-      name: "preserves unfinished reasoning text while still stripping memory blocks",
-      input: [
-        "Before",
-        "<thinking>",
-        "secret",
-        "<relevant-memories>",
-        "internal note",
-        "</relevant-memories>",
-        "After",
-      ].join("\n"),
-      expected: "Before\n\nsecret\n\nAfter",
-    },
-    {
-      name: "keeps relevant-memories tags inside fenced code",
-      input: createLiteralRelevantMemoriesCodeBlock(),
-      expected: undefined,
-    },
-    {
-      name: "keeps literal relevant-memories prose",
-      input: "Use `<relevant-memories>example</relevant-memories>` literally.",
-      expected: undefined,
-    },
-  ] as const)("$name", ({ input, expected }) => {
-    if (expected === undefined) {
-      expectLiteralVisibleText(input);
-      return;
-    }
-    expectVisibleText(input, expected);
+  );
+
+  it.each([
+    'Use `<minimax:tool_call><invoke name="exec">x</invoke></minimax:tool_call>`.',
+    '```xml\n<minimax:tool_call><invoke name="exec">x</invoke></minimax:tool_call>\n```',
+    "`<tool_call>`",
+    "```xml\n<tool_call>\n```",
+    "    <tool_call>",
+    "\t<tool_call>",
+    "The marker is <tool_call>.",
+    "<tool_call> is a transport marker.",
+  ])("preserves literal tool-call documentation: %j", (text) => {
+    expect(stripToolCallXmlTags(text)).toBe(text);
+    expect(sanitizeAssistantVisibleTextWithProfile(text, "delivery")).toBe(text);
   });
 
-  describe("tool-call XML stripping", () => {
-    it("strips closed <tool_call> blocks", () => {
-      expectVisibleText(
-        'Let me check.\n\n<tool_call> {"name": "read", "arguments": {"file_path": "test.md"}} </tool_call> after',
-        "Let me check.\n\n after",
-      );
-    });
-
-    it("strips closed <function_calls> blocks", () => {
-      expectVisibleText(
-        'Checking now. <function_calls>{"name": "exec", "args": {"cmd": "ls"}}</function_calls> Done.',
-        "Checking now.  Done.",
-      );
-    });
-
-    it("strips closed <tool_result> blocks", () => {
-      expectVisibleText(
-        'Prefix\n<tool_result> {"output": "file contents"} </tool_result>\nSuffix',
-        "Prefix\n\nSuffix",
-      );
-    });
-
-    it("strips dangling <tool_result> content to end-of-string", () => {
-      expectVisibleText('Result:\n<tool_result>\n{"output": "data"}\n', "Result:\n");
-    });
-
-    it("strips <tool_result> closed with mismatched </tool_call> and preserves trailing text", () => {
-      expectVisibleText(
-        'Prefix\n<tool_result> {"output": "data"} </tool_call>\nSuffix',
-        "Prefix\n\nSuffix",
-      );
-    });
-
-    it("does not let </tool_result> close a <tool_call> block", () => {
-      expectVisibleText(
-        'Prefix\n<tool_call>{"name":"x"}</tool_result>LEAK</tool_call>\nSuffix',
-        "Prefix\n\nSuffix",
-      );
-    });
-
-    it("hides dangling <tool_call> content to end-of-string", () => {
-      expectVisibleText(
-        'Let me run.\n<tool_call>\n{"name": "find", "arguments": {}}\n',
-        "Let me run.\n",
-      );
-    });
-
-    it("strips Qwen-style <tool_call> with nested <function=...> XML", () => {
-      expectVisibleText(
-        "prefix\n<tool_call><function=read><parameter=path>/home/user</parameter></function></tool_call>\nsuffix",
-        "prefix\n\nsuffix",
-      );
-    });
-
-    it("strips Qwen-style <tool_call> with whitespace before nested XML", () => {
-      expectVisibleText(
-        "prefix\n<tool_call>\n<function=search><parameter=query>test</parameter></function>\n</tool_call>\nsuffix",
-        "prefix\n\nsuffix",
-      );
-    });
-
-    it("strips dangling Qwen-style <tool_call> with nested XML to end", () => {
-      expectVisibleText("prefix\n<tool_call><function=read><parameter=path>/home", "prefix\n");
-    });
-
-    it("does not close early on </tool_call> text inside JSON strings", () => {
-      expectVisibleText(
-        [
-          "prefix",
-          "<tool_call>",
-          '{"name":"x","arguments":{"html":"<div></tool_call><span>leak</span>"}}',
-          "</tool_call>",
-          "suffix",
-        ].join("\n"),
-        "prefix\n\nsuffix",
-      );
-    });
-
-    it("does not close early on </tool_call> text inside single-quoted payload strings", () => {
-      expectVisibleText(
-        [
-          "prefix",
-          "<tool_call>",
-          "{'html':'</tool_call> leak','tail':'still hidden'}",
-          "</tool_call>",
-          "suffix",
-        ].join("\n"),
-        "prefix\n\nsuffix",
-      );
-    });
-
-    it("does not close early on mismatched closing tool tags", () => {
-      expectVisibleText(
-        [
-          "prefix",
-          "<tool_call>",
-          '{"name":"read",',
-          "</function_calls>",
-          "still-hidden",
-          "</tool_call>",
-          "suffix",
-        ].join("\n"),
-        "prefix\n\nsuffix",
-      );
-    });
-
-    it("hides truncated <tool_call openings that never reach >", () => {
-      expectVisibleText('prefix\n<tool_call\n{"name":"find","arguments":{}}', "prefix\n");
-    });
-
-    it("hides truncated <tool_call openings with attributes before JSON payload", () => {
-      expectVisibleText('prefix\n<tool_call name="find"\n{"arguments":{}}', "prefix\n");
-    });
-
-    it("preserves lone <tool_call> mentions in normal prose", () => {
-      expectVisibleText("Use <tool_call> to invoke tools.", "Use <tool_call> to invoke tools.");
-    });
-
-    it("strips self-closing <tool_call/> tags", () => {
-      expectVisibleText("prefix <tool_call/> suffix", "prefix  suffix");
-    });
-
-    it("strips self-closing <function_calls .../> tags", () => {
-      expectVisibleText('prefix <function_calls name="x"/> suffix', "prefix  suffix");
-    });
-
-    it("strips lone closing tool-call tags", () => {
-      expectVisibleText("prefix </tool_call> suffix", "prefix  suffix");
-      expectVisibleText("prefix </function_calls> suffix", "prefix  suffix");
-    });
-
-    it("preserves XML-style explanations after lone <tool_call> tags", () => {
-      expectVisibleText("Use <tool_call><arg> literally.", "Use <tool_call><arg> literally.");
-    });
-
-    it("preserves literal XML-style paired tool_call examples in prose", () => {
-      expectVisibleText(
-        "prefix <tool_call><arg>secret</arg></tool_call> suffix",
-        "prefix <tool_call><arg>secret</arg></tool_call> suffix",
-      );
-    });
-
-    it("preserves machine-style XML payload examples in prose", () => {
-      expectVisibleText(
-        'prefix <function_calls><invoke name="find">secret</invoke></function_calls> suffix',
-        'prefix <function_calls><invoke name="find">secret</invoke></function_calls> suffix',
-      );
-    });
-
-    it("preserves non-tool tag names that share the tool_call prefix", () => {
-      expectVisibleText(
-        'prefix <tool_call-example>{"name":"read"}</tool_call-example> suffix',
-        'prefix <tool_call-example>{"name":"read"}</tool_call-example> suffix',
-      );
-    });
-
-    it("preserves truncated <tool_call mentions in prose", () => {
-      expectVisibleText("Use <tool_call to invoke tools.", "Use <tool_call to invoke tools.");
-    });
-
-    it("preserves truncated <tool_call mentions with prose attributes", () => {
-      expectVisibleText(
-        'Use <tool_call name="find" to invoke tools.',
-        'Use <tool_call name="find" to invoke tools.',
-      );
-    });
-
-    it("still strips later JSON payloads after a truncated prose mention", () => {
-      expectVisibleText(
-        'Use <tool_call to invoke tools.\n<tool_call>{"name":"find"}</tool_call>',
-        "Use <tool_call to invoke tools.\n",
-      );
-    });
-
-    it("still strips later JSON payloads after a truncated closing-tag mention", () => {
-      expectVisibleText(
-        'Use </tool_call to explain tags.\n<tool_call>{"name":"find"}</tool_call>',
-        "Use </tool_call to explain tags.\n",
-      );
-    });
-
-    it("still closes a tool-call block when malformed payload opens a fenced code region", () => {
-      expectVisibleText(
-        [
-          "prefix",
-          "<tool_call>",
-          '{"name":"read",',
-          "```xml",
-          "<note>hi</note>",
-          "</tool_call>",
-          "suffix",
-        ].join("\n"),
-        "prefix\n\nsuffix",
-      );
-    });
-
-    it("preserves truncated XML payload openings in prose", () => {
-      expectVisibleText(
-        'prefix\n<function_calls\n<invoke name="find">',
-        'prefix\n<function_calls\n<invoke name="find">',
-      );
-    });
-
-    it("hides truncated <function_calls openings with attributes before array payload", () => {
-      expectVisibleText('prefix\n<function_calls id="x"\n[{"name":"find"}]', "prefix\n");
-    });
-
-    it("preserves tool-call tags inside fenced code blocks", () => {
-      const input = [
-        "```xml",
-        '<tool_call> {"name": "find"} </tool_call>',
-        "```",
-        "",
-        "Visible text",
-      ].join("\n");
-      expectVisibleText(input, input);
-    });
-
-    it("preserves inline code references to tool_call tags", () => {
-      expectVisibleText("Use `<tool_call>` to invoke tools.", "Use `<tool_call>` to invoke tools.");
-    });
+  it("strips compact function_response after a newline-separated stripped function_calls block", () => {
+    const input =
+      'Checking. <function_calls><invoke name="exec">internal</invoke></function_calls>\n<function_response>ok</function_response>\nAfter';
+    expect(stripToolCallXmlTags(input, { stripFunctionCallsXmlPayloads: true })).toBe(
+      "Checking. \n\nAfter",
+    );
   });
 
-  describe("model special token stripping", () => {
-    it("strips Kimi/GLM special tokens in isolation", () => {
-      expectVisibleText("<|assistant|>Here is the answer<|end|>", "Here is the answer");
-    });
-
-    it("strips full-width pipe DeepSeek tokens", () => {
-      expectVisibleText("<｜begin▁of▁sentence｜>Hello world", "Hello world");
-    });
-
-    it("strips special tokens mixed with normal text", () => {
-      expectVisibleText(
-        "Start <|tool_call_result_begin|>middle<|tool_call_result_end|> end",
-        "Start middle end",
-      );
-    });
-
-    it("preserves special-token-like syntax inside code blocks", () => {
-      expectVisibleText("Use <div>hello</div> in HTML", "Use <div>hello</div> in HTML");
-    });
-
-    it("strips special tokens combined with reasoning tags", () => {
-      const input = [
-        "<thinking>",
-        "internal reasoning",
-        "</thinking>",
-        "<|assistant|>Visible response",
-      ].join("\n");
-      expectVisibleText(input, "Visible response");
-    });
-
-    it("preserves indentation in code blocks", () => {
-      const input = [
-        "<|assistant|>Here is the code:",
-        "",
-        "```python",
-        "def foo():",
-        "    if True:",
-        "        return 42",
-        "```",
-      ].join("\n");
-      const expected = [
-        "Here is the code:",
-        "",
-        "```python",
-        "def foo():",
-        "    if True:",
-        "        return 42",
-        "```",
-      ].join("\n");
-      expectVisibleText(input, expected);
-    });
-
-    it("preserves special tokens inside fenced code blocks", () => {
-      const input = [
-        "Here are the model tokens:",
-        "",
-        "```",
-        "<|assistant|>Hello<|end|>",
-        "```",
-        "",
-        "As you can see above.",
-      ].join("\n");
-      expectVisibleText(input, input);
-    });
-
-    it("preserves special tokens inside inline code spans", () => {
-      expectVisibleText(
-        "The token `<|assistant|>` marks the start.",
-        "The token `<|assistant|>` marks the start.",
-      );
-    });
-
-    it("preserves malformed tokens that end inside inline code spans", () => {
-      expectVisibleText("Before <|token `code|>` after", "Before <|token `code|>` after");
-    });
-
-    it("preserves malformed tokens that end inside fenced code blocks", () => {
-      const input = ["Before <|token", "```js", "const x = 1;|>", "```", "after"].join("\n");
-      expectVisibleText(input, input);
-    });
-
-    it("resets special-token regex state between calls", () => {
-      expect(stripModelSpecialTokens("prefix <|assistant|>")).toBe("prefix ");
-      expect(stripModelSpecialTokens("<|assistant|>short")).toBe("short");
-    });
+  it.each([
+    [
+      'prefix <antml:invoke name="exec"><function_call>test</function_call></antml:invoke> suffix',
+      "prefix  suffix",
+    ],
+    ["<parameter note=unquoted <span>visible</span></parameter>"],
+    ['<parameter note="<>">next</parameter>', "next"],
+    [
+      '\ud800🦊<parameter note="<>"/>one<parameter note=\'><\'>two</parameter><tool_call note=">"/>🦊\udfff',
+      "\ud800🦊onetwo🦊\udfff",
+    ],
+  ])("handles nested, malformed and self-closing XML: %j", (input, expected = input) => {
+    expect(stripToolCallXmlTags(input)).toBe(expected);
   });
 });
 
 describe("sanitizeAssistantVisibleText", () => {
-  it("strips minimax, tool XML, downgraded tool markers, and think tags in one pass", () => {
-    const input = [
-      '<invoke name="read">payload</invoke></minimax:tool_call>',
-      '<tool_result>{"output":"hidden"}</tool_result>',
-      "[Tool Call: read (ID: toolu_1)]",
-      'Arguments: {"path":"/tmp/x"}',
-      "<think>secret</think>",
-      "Visible answer",
-    ].join("\n");
-
-    expect(sanitizeAssistantVisibleText(input)).toBe("Visible answer");
+  it.each([
+    ["Tool Result", "[Tool Result for ID abc]\nstdout: hello"],
+    ["Tool Call and Arguments", '[Tool Call: bash (ID: 7)]\nArguments: {"cmd":"ls"}'],
+  ])("preserves fenced %s logs", (_name, log) => {
+    const input = "Log format explainer:\n\n```text\n" + log + "\n```\n\nThen we continue.";
+    expect(sanitizeAssistantVisibleText(input)).toBe(input);
   });
 
-  it("strips relevant-memories blocks on the canonical user-visible path", () => {
-    const input = [
-      "<relevant-memories>",
-      "internal note",
-      "</relevant-memories>",
-      "Visible answer",
-    ].join("\n");
+  it.each([
+    ['prefix <function_calls><invoke name="find">secret</invoke></function_calls> suffix'],
+    ["[Tool Result for ID abc]\nstdout: hello", ""],
+    [
+      [
+        '<invoke name="read">payload</invoke></minimax:tool_call>',
+        '<tool_result>{"output":"hidden"}</tool_result>',
+        "[Tool Call: read (ID: toolu_1)]",
+        'Arguments: {"path":"/tmp/x"}',
+        "<think>secret</think>",
+        "OK",
+      ].join("\n"),
+      "OK",
+    ],
+    [
+      '<function_calls><invoke name="exec">internal</invoke></function_calls><function_response>\nSearching for: "what skills matter most in the age of AI"\n</function_response>\nOK',
+      "OK",
+    ],
+  ])("sanitizes delivery text: %j", (input, expected = input) => {
+    expect(sanitizeAssistantVisibleText(input)).toBe(expected);
+  });
+});
 
-    expect(sanitizeAssistantVisibleText(input)).toBe("Visible answer");
+describe("assistantTraceTextFilter streamed projection", () => {
+  const prose = "An ordinary explanation continues with a function call and a tool call.\n";
+  const code = 'const value = { label: "example", nested: { count: 42 } };\n';
+
+  it.each([
+    ["a real trace head", "", prose, "", true],
+    ["a citation paragraph", "See [1] and use `foo`.\n\n", prose, "", true],
+    ["an image paragraph", "See ![photo][id] and use `foo`.\n\n", prose, "", true],
+    ["fenced payload markers", "```ts\n", code, "```\n", false],
+    ["indented fenced payload markers", "   ~~~ts\n", code, "   ~~~\n", false],
+    ["a reference before fenced markers", "[id]: /url\n\n```ts\n", code, "```\n", false],
+  ] as const)("bounds canonical work after %s", (_name, prefix, line, closing, trace) => {
+    const expected = prefix + line.repeat(256) + closing + "Done.";
+    expectBoundedWork(
+      trace ? assistantTraceTextFilter : plainToolCallTextFilter,
+      (trace ? "tool call: x\n" : "") + expected,
+      expected,
+      128,
+    );
+  });
+
+  it.each([" ", "\n"])("bounds trace work for prose separated by %j", (separator) => {
+    const source = Array(256)
+      .fill("A helper function call returns the tool call payload for the value.")
+      .join(separator);
+    expectBoundedWork(assistantTraceTextFilter, source, source, 8);
+  });
+
+  it.each([
+    [
+      [
+        "A",
+        "⚠️ 🛠️ `run openclaw definitely-not-a-real-subcommand (agent)` failed",
+        "⚠️ 🛠️ gh search issues --repo openclaw/openclaw --state open --no-search-pages.jsonl /tmp/openclaw_open_unlabeled_current.json (agent) failed",
+        "⚠️ 🛠️ gh search issues --repo openclaw/openclaw --state open (agent) failed: command timed out",
+        "⚠️ 🛠️ Exec failed: `python3 /path/to/daily-cost-audit.py` (exit 1)",
+        "⚠️ 🛠️ Bash failed: `git status` (workspace) (exit 1)",
+        "⚠️ 🛠️ Exec failed (exit 1)",
+        "⚠️ 🛠️ Bash failed",
+        "🛠️ run git status",
+        "Z",
+      ].join("\n"),
+      "A\nZ",
+    ],
+    ['A\ntool call: read {"path":"a.ts"}\nZ', "A\nZ"],
+    ["A\n⚠️ 🛠️ Exec failed: `x` (exit 1)\nZ", "A\nZ"],
+    ["A\n> 📊 Session Status: ok\nZ", "A\nZ"],
+    ["A\n   📊 Session Status: ok\nZ", "A\nZ"],
+    ["A\n📊 Summary of results\nZ", "A\n📊 Summary of results\nZ"],
+    [
+      "A\n```text\n> ⚠️ 🛠️ Exec failed\nfunction_call: example\n```\ntool-result: hidden\nZ",
+      "A\n```text\n> ⚠️ 🛠️ Exec failed\nfunction_call: example\n```\nZ",
+    ],
+    ["~~~\ntool call: example\n~~~\nZ", "~~~\ntool call: example\n~~~\nZ"],
+    [`A\nFUNCTION_CALL${"\t".repeat(80)}= hidden\nZ`, "A\nZ"],
+    [
+      "tool call: x\n```ts\nconst x = { value: 1 };\ntool call: y\n```\n~~~text\n[tool:read] {}\n~~~\nfunction call: z\nDone.",
+      "```ts\nconst x = { value: 1 };\ntool call: y\n```\n~~~text\n[tool:read] {}\n~~~\nDone.",
+    ],
+    [
+      "tool call: x\n````text\ntool call: y\n````not a close\ntool call: still y\n````\ntool call: x\nDone.",
+      "````text\ntool call: y\n````not a close\ntool call: still y\n````\nDone.",
+    ],
+    [
+      "tool call: x\nAn open `example\ntool call: y\nends here`.\nDone.",
+      "An open `example\ntool call: y\nends here`.\nDone.",
+    ],
+    [
+      "tool call: x\n> ```text\n> tool call: y\n> { value: 1 }\n> ```\n\nDone.",
+      "> ```text\n> tool call: y\n> { value: 1 }\n> ```\n\nDone.",
+    ],
+    [
+      "tool call: x\r\n```ts\r\nconst x = {};\r\ntool call: y\r\n```\r\nDone.",
+      "```ts\r\nconst x = {};\r\ntool call: y\r\n```\r\nDone.",
+    ],
+    [
+      "Intro.\ntool call: x\n   ~~~text\ntool call: y\n   ~~~\ntool call: x\nDone.",
+      "Intro.\n   ~~~text\ntool call: y\n   ~~~\nDone.",
+    ],
+    [
+      "tool call: x\n![example `x\ntool call: y\nx`][id]\n\nAfter\n\n[id]: /url",
+      "![example `x\nx`][id]\n\nAfter\n\n[id]: /url",
+    ],
+    [
+      "tool call: x\n![a \\[b `]x\ntool call: y\nx`][id]\n\nAfter\n\n[id]: /url",
+      "![a \\[b `]x\nx`][id]\n\nAfter\n\n[id]: /url",
+    ],
+    [
+      "tool call: x\n\n[id]: /url\n\nIntro.\n\n![example `x\ntool call: y\nx`][id]\n",
+      "[id]: /url\n\nIntro.\n\n![example `x\nx`][id]",
+    ],
+    [
+      "tool call: x\n\n[id]: /url\n\n![a [b]\nmore\n`x\ntool call: y\nx`][id]",
+      "[id]: /url\n\n![a [b]\nmore\n`x\nx`][id]",
+    ],
+    [
+      'tool call: x\n[label](/url "title\nmore\n`x\ntool call: y\nx`")',
+      '[label](/url "title\nmore\n`x\nx`")',
+    ],
+    [
+      'tool call: x\n\n[id]: /url\n"title\nmore\n`x\ntool call: y\nx`"',
+      '[id]: /url\n"title\nmore\n`x\nx`"',
+    ],
+  ])("projects %j in token-sized chunks", (source, expected) => {
+    for (const size of [1, 3, 7]) {
+      expectChunkedProjection(source, size, expected);
+    }
+  });
+
+  it("resets rejected line heads when an upstream stage replaces text", () => {
+    const projection = createTextProjection([assistantTraceTextFilter]);
+    expect(projection.append("A tool call in prose.").text).toBe("A tool call in prose.");
+    expect(projection.replace("tool call: x\nVisible").text).toBe("Visible");
+    expect(projection.replace("```\ntool call: y\n```").text).toBe("```\ntool call: y\n```");
+    expect(projection.append("\ntool call: x\nFresh").text).toBe("```\ntool call: y\n```\nFresh");
+    expect(projection.replace("").text).toBe("");
+    expect(projection.append("tool call: x\nReset").text).toBe("Reset");
   });
 });
 
 describe("sanitizeAssistantVisibleTextWithProfile", () => {
-  it("uses the history profile to preserve block-boundary whitespace", () => {
-    const input = ["Hi ", '<tool_result>{"output":"hidden"}</tool_result>', "there"].join("");
-
-    expect(sanitizeAssistantVisibleTextWithProfile(input, "history")).toBe("Hi there");
-  });
-
-  it("uses the internal-scaffolding profile to preserve downgraded tool text behavior", () => {
-    const input = [
-      "[Tool Call: read (ID: toolu_1)]",
-      'Arguments: {"path":"/tmp/x"}',
-      "Visible answer",
-    ].join("\n");
-
-    expect(sanitizeAssistantVisibleTextWithProfile(input, "internal-scaffolding")).toContain(
-      "[Tool Call: read (ID: toolu_1)]",
-    );
-  });
+  it.each([
+    [
+      "delivery",
+      "(**bold<|assistant|>**). First<|user|><|assistant|>second `x<|assistant|>y`",
+      "(**bold**). First second `x<|assistant|>y`",
+    ],
+    ["history", "private chain of thought </think> OK", " OK"],
+    [
+      "tool-progress",
+      '<think>private reasoning</think>\n<tool_call>{"name":"x"}</tool_call>\n🛠️ run git status',
+      "🛠️ run git status",
+    ],
+    [
+      "final-answer-delivery",
+      "<think>hidden</think>Use <think> literally here",
+      "Use <think> literally here",
+    ],
+    ["final-answer-delivery", "Before <think>literal tag text after"],
+    [
+      "final-answer-delivery",
+      "Visible prefix <thinking><internal>private reflection",
+      "Visible prefix",
+    ],
+  ] satisfies ReadonlyArray<readonly [AssistantVisibleTextSanitizerProfile, string, string?]>)(
+    "sanitizes %s text: %j",
+    (profile, input, expected = input) => {
+      expect(sanitizeAssistantVisibleTextWithProfile(input, profile)).toBe(expected);
+    },
+  );
 });

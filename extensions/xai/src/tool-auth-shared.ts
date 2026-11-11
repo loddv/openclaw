@@ -1,19 +1,48 @@
-import type { OpenClawConfig } from "@openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { resolveProviderWebSearchPluginConfig } from "openclaw/plugin-sdk/provider-web-search-config-contract";
 import {
   coerceSecretRef,
-  resolveNonEnvSecretRefApiKeyMarker,
-} from "@openclaw/plugin-sdk/provider-auth";
-import {
+  normalizeSecretInputString,
   readProviderEnvValue,
-  readConfiguredSecretString,
-  resolveProviderWebSearchPluginConfig,
-} from "@openclaw/plugin-sdk/provider-web-search";
-import { normalizeSecretInputString } from "@openclaw/plugin-sdk/secret-input";
+  resolveNonEnvSecretRefApiKeyMarker,
+} from "openclaw/plugin-sdk/secret-input";
+import {
+  resolveReadOnlyEnvSecretRef,
+  type ReadOnlyEnvSecretRefResolution,
+} from "openclaw/plugin-sdk/secret-ref-readonly";
 
-export type XaiFallbackAuth = {
+type XaiFallbackAuth = {
   apiKey: string;
   source: string;
 };
+const XAI_API_KEY_ENV_VAR = "XAI_API_KEY";
+const XAI_PROVIDER_ID = "xai";
+
+type XaiToolAuthQuery = { credentialType?: "api_key" | "oauth" | "token" };
+
+export type XaiToolAuthContext = {
+  hasAuthForProvider?: (providerId: string, query?: XaiToolAuthQuery) => boolean;
+  resolveApiKeyForProvider?: (
+    providerId: string,
+    query?: XaiToolAuthQuery,
+  ) => Promise<string | undefined>;
+};
+
+const XAI_SUBSCRIPTION_AUTH_QUERY: XaiToolAuthQuery = { credentialType: "oauth" };
+
+/** Grok OAuth signs in with the user's SuperGrok/X Premium subscription, not Console API credits. */
+export function hasXaiSubscriptionToolAuth(auth?: XaiToolAuthContext): boolean {
+  return auth?.hasAuthForProvider?.(XAI_PROVIDER_ID, XAI_SUBSCRIPTION_AUTH_QUERY) === true;
+}
+
+/** Resolves only a Grok OAuth credential; configured keys, API-key profiles and env never substitute. */
+export async function resolveXaiSubscriptionToolApiKey(
+  auth?: XaiToolAuthContext,
+): Promise<string | undefined> {
+  return normalizeSecretInputString(
+    await auth?.resolveApiKeyForProvider?.(XAI_PROVIDER_ID, XAI_SUBSCRIPTION_AUTH_QUERY),
+  );
+}
 
 function readConfiguredOrManagedApiKey(value: unknown): string | undefined {
   const literal = normalizeSecretInputString(value);
@@ -24,35 +53,30 @@ function readConfiguredOrManagedApiKey(value: unknown): string | undefined {
   return ref ? resolveNonEnvSecretRefApiKeyMarker(ref.source) : undefined;
 }
 
-function readLegacyGrokFallbackAuth(cfg?: OpenClawConfig): XaiFallbackAuth | undefined {
-  const search = cfg?.tools?.web?.search;
-  if (!search || typeof search !== "object") {
-    return undefined;
-  }
-  const grok = (search as Record<string, unknown>).grok;
-  const apiKey = readConfiguredOrManagedApiKey(
-    grok && typeof grok === "object" ? (grok as Record<string, unknown>).apiKey : undefined,
-  );
-  return apiKey ? { apiKey, source: "tools.web.search.grok.apiKey" } : undefined;
+function readPluginXaiWebSearchApiKeyResult(cfg?: OpenClawConfig): ReadOnlyEnvSecretRefResolution {
+  return resolveReadOnlyEnvSecretRef({
+    value: resolveProviderWebSearchPluginConfig(cfg as Record<string, unknown> | undefined, "xai")
+      ?.apiKey,
+    path: "plugins.entries.xai.config.webSearch.apiKey",
+    cfg,
+    expectedEnvId: XAI_API_KEY_ENV_VAR,
+    normalizeValue: normalizeSecretInputString,
+  });
 }
 
-export function readLegacyGrokApiKey(cfg?: OpenClawConfig): string | undefined {
-  const search = cfg?.tools?.web?.search;
-  if (!search || typeof search !== "object") {
-    return undefined;
-  }
-  const grok = (search as Record<string, unknown>).grok;
-  return readConfiguredSecretString(
-    grok && typeof grok === "object" ? (grok as Record<string, unknown>).apiKey : undefined,
-    "tools.web.search.grok.apiKey",
-  );
+function resolveConfiguredXaiToolApiKeyResult(params: {
+  runtimeConfig?: OpenClawConfig;
+  sourceConfig?: OpenClawConfig;
+}): ReadOnlyEnvSecretRefResolution {
+  const runtimePlugin = readPluginXaiWebSearchApiKeyResult(params.runtimeConfig);
+  return runtimePlugin.status === "missing"
+    ? readPluginXaiWebSearchApiKeyResult(params.sourceConfig)
+    : runtimePlugin;
 }
 
-export function readPluginXaiWebSearchApiKey(cfg?: OpenClawConfig): string | undefined {
-  return readConfiguredSecretString(
-    resolveProviderWebSearchPluginConfig(cfg as Record<string, unknown> | undefined, "xai")?.apiKey,
-    "plugins.entries.xai.config.webSearch.apiKey",
-  );
+async function resolveXaiAuthProfileApiKey(auth?: XaiToolAuthContext): Promise<string | undefined> {
+  const value = await auth?.resolveApiKeyForProvider?.(XAI_PROVIDER_ID);
+  return normalizeSecretInputString(value);
 }
 
 export function resolveFallbackXaiAuth(cfg?: OpenClawConfig): XaiFallbackAuth | undefined {
@@ -65,21 +89,23 @@ export function resolveFallbackXaiAuth(cfg?: OpenClawConfig): XaiFallbackAuth | 
       source: "plugins.entries.xai.config.webSearch.apiKey",
     };
   }
-  return readLegacyGrokFallbackAuth(cfg);
+  return undefined;
 }
 
-export function resolveFallbackXaiApiKey(cfg?: OpenClawConfig): string | undefined {
-  return readPluginXaiWebSearchApiKey(cfg) ?? readLegacyGrokApiKey(cfg);
-}
-
-export function resolveXaiToolApiKey(params: {
+export async function resolveXaiToolApiKeyWithAuth(params: {
   runtimeConfig?: OpenClawConfig;
   sourceConfig?: OpenClawConfig;
-}): string | undefined {
+  auth?: XaiToolAuthContext;
+}): Promise<string | undefined> {
+  const configured = resolveConfiguredXaiToolApiKeyResult(params);
+  if (configured.status === "available") {
+    return configured.value;
+  }
+  if (configured.status === "blocked") {
+    return undefined;
+  }
   return (
-    resolveFallbackXaiApiKey(params.runtimeConfig) ??
-    resolveFallbackXaiApiKey(params.sourceConfig) ??
-    readProviderEnvValue(["XAI_API_KEY"])
+    (await resolveXaiAuthProfileApiKey(params.auth)) ?? readProviderEnvValue([XAI_API_KEY_ENV_VAR])
   );
 }
 
@@ -87,9 +113,20 @@ export function isXaiToolEnabled(params: {
   enabled?: boolean;
   runtimeConfig?: OpenClawConfig;
   sourceConfig?: OpenClawConfig;
+  auth?: XaiToolAuthContext;
 }): boolean {
   if (params.enabled === false) {
     return false;
   }
-  return Boolean(resolveXaiToolApiKey(params));
+  const configured = resolveConfiguredXaiToolApiKeyResult(params);
+  if (configured.status === "available") {
+    return true;
+  }
+  if (configured.status === "blocked") {
+    return false;
+  }
+  return (
+    params.auth?.hasAuthForProvider?.(XAI_PROVIDER_ID) === true ||
+    Boolean(readProviderEnvValue([XAI_API_KEY_ENV_VAR]))
+  );
 }

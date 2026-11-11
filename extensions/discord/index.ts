@@ -1,13 +1,9 @@
-import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
-
-type DiscordSubagentHooksModule = typeof import("./subagent-hooks-api.js");
-
-let discordSubagentHooksPromise: Promise<DiscordSubagentHooksModule> | null = null;
-
-function loadDiscordSubagentHooksModule() {
-  discordSubagentHooksPromise ??= import("./subagent-hooks-api.js");
-  return discordSubagentHooksPromise;
-}
+import {
+  defineBundledChannelEntry,
+  loadBundledEntryExportSync,
+  type OpenClawPluginApi,
+} from "openclaw/plugin-sdk/channel-entry-contract";
+import { registerDiscordSubagentHooks } from "./subagent-hooks-api.js";
 
 export default defineBundledChannelEntry({
   id: "discord",
@@ -19,21 +15,25 @@ export default defineBundledChannelEntry({
     exportName: "discordPlugin",
   },
   runtime: {
-    specifier: "./runtime-api.js",
+    specifier: "./runtime-setter-api.js",
     exportName: "setDiscordRuntime",
   },
+  accountInspect: {
+    specifier: "./account-inspect-api.js",
+    exportName: "inspectDiscordReadOnlyAccount",
+  },
   registerFull(api) {
-    api.on("subagent_spawning", async (event) => {
-      const { handleDiscordSubagentSpawning } = await loadDiscordSubagentHooksModule();
-      return await handleDiscordSubagentSpawning(api, event);
-    });
-    api.on("subagent_ended", async (event) => {
-      const { handleDiscordSubagentEnded } = await loadDiscordSubagentHooksModule();
-      handleDiscordSubagentEnded(event);
-    });
-    api.on("subagent_delivery_target", async (event) => {
-      const { handleDiscordSubagentDeliveryTarget } = await loadDiscordSubagentHooksModule();
-      return handleDiscordSubagentDeliveryTarget(event);
-    });
+    // Account inspection loads this entry too; runtime registration must stay behind its owner mode.
+    loadBundledEntryExportSync<(api: OpenClawPluginApi) => void>(import.meta.url, {
+      specifier: "./activities-api.js",
+      exportName: "registerDiscordActivities",
+    })(api);
+    registerDiscordSubagentHooks(api);
+  },
+  registerCapabilities(api) {
+    loadBundledEntryExportSync<(api: OpenClawPluginApi) => void>(import.meta.url, {
+      specifier: "./transcripts-source-api.js",
+      exportName: "registerDiscordTranscriptSourceProvider",
+    })(api);
   },
 });

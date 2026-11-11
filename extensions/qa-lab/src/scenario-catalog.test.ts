@@ -1,126 +1,173 @@
-import { describe, expect, it } from "vitest";
-import { QA_AGENTIC_PARITY_SCENARIO_IDS } from "./agentic-parity.js";
+import { expect, it } from "vitest";
 import {
-  listQaScenarioMarkdownPaths,
-  readQaBootstrapScenarioCatalog,
+  QA_AGENTIC_PARITY_SCENARIO_TITLES,
+  resolveQaParityPackScenarioIds,
+} from "./agentic-parity.js";
+import { resolveQaRepoPath } from "./repo-path.js";
+import { resolveQaRuntimePairLaneScenarioIds } from "./runtime-pair-lane-selection.js";
+import {
   readQaScenarioById,
   readQaScenarioExecutionConfig,
   readQaScenarioPack,
-  validateQaScenarioExecutionConfig,
+  resolveQaScenarioRequiredProviderMode,
 } from "./scenario-catalog.js";
+import {
+  flowContainsCall,
+  isFlowScenario,
+  listScenarioMarkdownPaths,
+  requireFlowScenario,
+} from "./scenario-catalog.test-utils.js";
+import { selectQaFlowSuiteScenarios } from "./suite-planning.js";
 
-describe("qa scenario catalog", () => {
-  it("loads the markdown pack as the canonical source of truth", () => {
-    const pack = readQaScenarioPack();
+it("keeps repo-backed scenarios YAML-only", () => {
+  expect(listScenarioMarkdownPaths()).toStrictEqual([]);
+});
 
-    expect(pack.version).toBe(1);
-    expect(pack.agent.identityMarkdown).toContain("Dev C-3PO");
-    expect(pack.kickoffTask).toContain("Lobster Invaders");
-    expect(listQaScenarioMarkdownPaths().length).toBe(pack.scenarios.length);
-    expect(pack.scenarios.some((scenario) => scenario.id === "image-generation-roundtrip")).toBe(
-      true,
-    );
-    expect(pack.scenarios.some((scenario) => scenario.id === "character-vibes-gollum")).toBe(true);
-    expect(pack.scenarios.some((scenario) => scenario.id === "character-vibes-c3po")).toBe(true);
-    expect(pack.scenarios.every((scenario) => scenario.execution?.kind === "flow")).toBe(true);
-    expect(pack.scenarios.some((scenario) => scenario.execution.flow?.steps.length)).toBe(true);
+it("contains the apply-patch parity probe to its QA workspace", () => {
+  expect(readQaScenarioById("runtime-tool-apply-patch").gatewayConfigPatch).toMatchObject({
+    tools: {
+      fs: { workspaceOnly: true },
+      exec: { applyPatch: { workspaceOnly: true } },
+    },
   });
+});
 
-  it("exposes bootstrap data from the markdown pack", () => {
-    const catalog = readQaBootstrapScenarioCatalog();
+it("keeps scenario documentation and code references backed by the repository", () => {
+  for (const scenario of readQaScenarioPack().scenarios) {
+    for (const kind of ["docsRefs", "codeRefs"] as const) {
+      for (const reference of scenario[kind] ?? []) {
+        const resolvedReference =
+          resolveQaRepoPath(import.meta.dirname, reference, "file") ??
+          resolveQaRepoPath(import.meta.dirname, reference, "directory");
+        expect(resolvedReference, `${scenario.id} ${kind} ${reference} exists`).not.toBeNull();
+      }
+    }
+  }
+});
 
-    expect(catalog.agentIdentityMarkdown).toContain("protocol-minded");
-    expect(catalog.kickoffTask).toContain("Track what worked");
-    expect(catalog.scenarios.some((scenario) => scenario.id === "subagent-fanout-synthesis")).toBe(
-      true,
+it("keeps the audited parallel script allowlist exact", () => {
+  const expected =
+    "active-talk-agent-run-status agent-run-identity-inspection channel-health-monitor-lifecycle cli-status-health-snapshots diagnostic-events-boundary gateway-smoke gateway-ssh-tunnels gateway-stability-runtime gateway-support-export gateway-tls-pinning gateway-websocket-protocol-contracts logging-file-boundary mcp-plugin-tools-call otel-generation-config-watcher qa-otel-smoke remote-log-tailing subagent-lineage-inspection tui-command-surfaces-pty tui-editor-input-pty tui-gateway-boundary-pty tui-local-runtime-recovery-pty tui-pty-evidence-producer-contract tui-streaming-tool-cards-pty".split(
+      " ",
     );
-    expect(
-      QA_AGENTIC_PARITY_SCENARIO_IDS.every((scenarioId) =>
-        catalog.scenarios.some((scenario) => scenario.id === scenarioId),
-      ),
-    ).toBe(true);
+  const marked = readQaScenarioPack().scenarios.filter(
+    (scenario) => scenario.execution.kind === "script" && scenario.execution.parallelSafe === true,
+  );
+
+  expect(marked.map((scenario) => scenario.id).toSorted()).toEqual(expected);
+  expect(readQaScenarioById("gateway-ssh-tunnels").execution).toMatchObject({
+    kind: "script",
+    parallelSafe: true,
+    allowBlockedEvidence: true,
   });
+  for (const scenarioId of [
+    "cached-health-snapshot-boundaries",
+    "gateway-rpc-account-health",
+    "mcp-gateway-connect-startup-retry",
+    "voice-call-cli-rpc-agent-tool",
+    "tui-local-shell-pty",
+    "tui-entrypoints-pty",
+    "tui-terminal-safety-pty",
+  ]) {
+    expect(readQaScenarioById(scenarioId).execution).toMatchObject({
+      kind: "script",
+      parallelSafe: false,
+    });
+  }
+});
 
-  it("loads scenario-specific execution config from per-scenario markdown", () => {
-    const discovery = readQaScenarioById("source-docs-discovery-report");
-    const discoveryConfig = readQaScenarioExecutionConfig("source-docs-discovery-report");
-    const codexLeak = readQaScenarioById("codex-harness-no-meta-leak");
-    const codexLeakConfig = readQaScenarioExecutionConfig("codex-harness-no-meta-leak") as
-      | {
-          harnessRuntime?: string;
-          harnessFallback?: string;
-          expectedReply?: string;
-          forbiddenReplySubstrings?: string[];
-        }
-      | undefined;
-    const fallbackConfig = readQaScenarioExecutionConfig("memory-failure-fallback");
-    const bundledSkill = readQaScenarioById("bundled-plugin-skill-runtime");
-    const bundledSkillConfig = readQaScenarioExecutionConfig("bundled-plugin-skill-runtime") as
-      | { pluginId?: string; expectedSkillName?: string }
-      | undefined;
-    const fanoutConfig = readQaScenarioExecutionConfig("subagent-fanout-synthesis") as
-      | { expectedReplyGroups?: unknown[][] }
-      | undefined;
+it("rejects invalid provider metadata at the catalog boundary", () => {
+  const scenario = structuredClone(
+    requireFlowScenario(readQaScenarioById("subagent-completion-direct-fallback")),
+  );
+  scenario.execution.config = {
+    ...scenario.execution.config,
+    requiredProviderMode: "live-frontier",
+  };
 
-    expect(discovery.title).toBe("Source and docs discovery report");
-    expect((discoveryConfig?.requiredFiles as string[] | undefined)?.[0]).toBe(
-      "repo/qa/scenarios/index.md",
-    );
-    expect(codexLeak.title).toBe("Codex harness no meta leak");
-    expect(codexLeakConfig?.harnessRuntime).toBe("codex");
-    expect(codexLeakConfig?.harnessFallback).toBe("none");
-    expect(codexLeakConfig?.expectedReply).toBe("QA_LEAK_OK");
-    expect(codexLeakConfig?.forbiddenReplySubstrings).toContain("checking thread context");
-    expect(fallbackConfig?.gracefulFallbackAny as string[] | undefined).toContain(
-      "will not reveal",
-    );
-    expect(bundledSkill.title).toBe("Bundled plugin skill runtime");
-    expect(bundledSkillConfig?.pluginId).toBe("open-prose");
-    expect(bundledSkillConfig?.expectedSkillName).toBe("prose");
-    expect(fanoutConfig?.expectedReplyGroups?.flat()).toContain("subagent-1: ok");
-    expect(fanoutConfig?.expectedReplyGroups?.flat()).toContain("subagent-2: ok");
-  });
+  expect(() => resolveQaScenarioRequiredProviderMode(scenario)).toThrow(
+    "QA scenario subagent-completion-direct-fallback declares conflicting provider modes: execution.providerMode=mock-openai, execution.config.requiredProviderMode=live-frontier",
+  );
 
-  it("keeps the character eval scenario natural and task-shaped", () => {
-    const characterConfig = readQaScenarioExecutionConfig("character-vibes-gollum") as
-      | {
-          workspaceFiles?: Record<string, string>;
-          turns?: Array<{ text?: string; expectFile?: { path?: string } }>;
-        }
-      | undefined;
+  scenario.execution.config.requiredProviderMode = "mock-ish";
+  expect(() => resolveQaScenarioRequiredProviderMode(scenario)).toThrow(
+    "QA scenario subagent-completion-direct-fallback declares unknown provider mode: mock-ish",
+  );
+});
 
-    const turnTexts = characterConfig?.turns?.map((turn) => turn.text ?? "") ?? [];
-
-    expect(characterConfig?.workspaceFiles?.["SOUL.md"]).toContain("# This is your character");
-    expect(turnTexts.join("\n")).toContain("precious-status.html");
-    expect(turnTexts.join("\n")).not.toContain("How would you react");
-    expect(turnTexts.join("\n")).not.toContain("character check");
-    expect(
-      characterConfig?.turns?.some((turn) => turn.expectFile?.path === "precious-status.html"),
-    ).toBe(true);
-  });
-
-  it("includes the codex leak scenario in the markdown pack", () => {
-    const pack = readQaScenarioPack();
-    const scenario = pack.scenarios.find(
-      (candidate) => candidate.id === "codex-harness-no-meta-leak",
+it("requires explicit suite isolation for gateway state restart scenarios", () => {
+  const scenarios = readQaScenarioPack()
+    .scenarios.filter(isFlowScenario)
+    .filter((scenario) =>
+      flowContainsCall(scenario.execution.flow, "env.gateway.restartAfterStateMutation"),
     );
 
-    expect(scenario?.sourcePath).toBe("qa/scenarios/codex-harness-no-meta-leak.md");
-    expect(scenario?.execution.flow?.steps.map((step) => step.name)).toContain(
-      "keeps codex coordination chatter out of the visible reply",
-    );
+  expect(scenarios.length).toBeGreaterThan(0);
+  for (const scenario of scenarios) {
+    expect(scenario.execution.suiteIsolation, scenario.id).toBe("isolated");
+  }
+});
+
+it("declares every release agentic scenario in the core lane", () => {
+  const scenarioIds = resolveQaParityPackScenarioIds({ parityPack: "agentic" });
+
+  expect(scenarioIds).toHaveLength(12);
+  expect(scenarioIds.map((scenarioId) => readQaScenarioById(scenarioId).title)).toEqual(
+    QA_AGENTIC_PARITY_SCENARIO_TITLES,
+  );
+  expect(scenarioIds.map((scenarioId) => readQaScenarioById(scenarioId).runtimePairLane)).toEqual(
+    scenarioIds.map(() => "core"),
+  );
+});
+
+it("keeps the pinned gateway restart scenario owned by the OpenClaw runtime", () => {
+  const scenarioId = "gateway-restart-multi-live";
+  const scenario = readQaScenarioById(scenarioId);
+  const scenarios = readQaScenarioPack().scenarios;
+  const lane = { providerMode: "live-frontier" as const, primaryModel: "openai/gpt-5.4" };
+
+  expect(scenario.runtimePairLane).toBeUndefined();
+  expect(scenario.execution).toMatchObject({ kind: "flow", runtime: "openclaw" });
+  expect(readQaScenarioExecutionConfig(scenarioId)).toMatchObject({
+    requiredProviderMode: "live-frontier",
+    requiredProvider: "openai",
+    requiredModel: "gpt-5.4",
   });
 
-  it("rejects malformed string matcher lists before running a flow", () => {
-    expect(() =>
-      validateQaScenarioExecutionConfig({
-        gracefulFallbackAny: [{ confirmed: "the hidden fact is present" }],
-      }),
-    ).toThrow(/gracefulFallbackAny entries must be strings/);
+  const selectIds = (scenarioIds?: string[]) =>
+    selectQaFlowSuiteScenarios({ scenarios, scenarioIds, ...lane }).map((selected) => selected.id);
+  const runtimePairLane = resolveQaRuntimePairLaneScenarioIds({
+    scenarios,
+    scenarioIds: [],
+    runtimePairLanes: ["core"],
+    runtimePair: true,
+    ...lane,
   });
 
-  it("returns undefined execution config for an unknown scenario id", () => {
-    expect(readQaScenarioExecutionConfig("missing-scenario-id")).toBeUndefined();
-  });
+  expect(selectIds([scenarioId])).toEqual([scenarioId]);
+  expect(selectIds()).toContain(scenarioId);
+  expect(runtimePairLane.scenarioIds).not.toContain(scenarioId);
+  for (const excluded of [
+    runtimePairLane.excludedLaneScenarios,
+    runtimePairLane.excludedNonFlowScenarios,
+  ]) {
+    expect(excluded.map((entry) => entry.id)).not.toContain(scenarioId);
+  }
+});
+
+it("rejects the native web-search probe from matching-provider mock lanes", () => {
+  const scenario = readQaScenarioById("openai-native-web-search-live");
+  const mockLane = {
+    scenarios: [scenario],
+    providerMode: "mock-openai" as const,
+    primaryModel: "openai/gpt-5.6-luna",
+  };
+
+  expect(selectQaFlowSuiteScenarios({ ...mockLane, providerMode: "live-frontier" })).toEqual([
+    scenario,
+  ]);
+  expect(selectQaFlowSuiteScenarios(mockLane)).toEqual([]);
+  expect(() => selectQaFlowSuiteScenarios({ ...mockLane, scenarioIds: [scenario.id] })).toThrow(
+    "providerMode=live-frontier",
+  );
 });

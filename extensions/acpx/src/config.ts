@@ -1,30 +1,30 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
-import type { z } from "openclaw/plugin-sdk/zod";
-import { AcpxPluginConfigSchema, DEFAULT_ACPX_TIMEOUT_SECONDS } from "./config-schema.js";
+import { formatPluginConfigIssue } from "openclaw/plugin-sdk/extension-shared";
+import {
+  resolvePackageRuntimeProcessEntrypointUrl,
+  resolveRuntimeWorkerArgv,
+} from "openclaw/plugin-sdk/process-runtime";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
+import {
+  isRecord,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { splitCommandParts } from "./command-line.js";
+import { AcpxPluginConfigSchema } from "./config-schema.js";
 import type {
-  AcpxPluginConfig,
   AcpxPermissionMode,
   AcpxNonInteractivePermissionPolicy,
   McpServerConfig,
-  AcpxMcpServer,
   ResolvedAcpxPluginConfig,
 } from "./config-schema.js";
-export {
-  ACPX_NON_INTERACTIVE_POLICIES,
-  ACPX_PERMISSION_MODES,
-  type AcpxMcpServer,
-  type AcpxNonInteractivePermissionPolicy,
-  type AcpxPermissionMode,
-  type AcpxPluginConfig,
-  type McpServerConfig,
-  type ResolvedAcpxPluginConfig,
-  createAcpxPluginConfigSchema,
-} from "./config-schema.js";
+export { type ResolvedAcpxPluginConfig } from "./config-schema.js";
 
-export const ACPX_PLUGIN_TOOLS_MCP_SERVER_NAME = "openclaw-plugin-tools";
+const MANAGED_MCP_BRIDGES = [
+  ["pluginToolsMcpBridge", "openclaw-plugin-tools", "pluginToolsServe"],
+  ["openClawToolsMcpBridge", "openclaw-tools", "openclawToolsServe"],
+] as const;
 
 function isAcpxPluginRoot(dir: string): boolean {
   return (
@@ -87,6 +87,7 @@ function resolveAcpxPluginRootFromOpenClawLayout(moduleUrl: string): string | nu
   }
   return null;
 }
+/** Resolve the ACPX plugin root across source, dist, and dist-runtime layouts. */
 export function resolveAcpxPluginRoot(moduleUrl: string = import.meta.url): string {
   const resolvedRoot = resolveNearestAcpxPluginRoot(moduleUrl);
   // In a live repo checkout, dist/ can be rebuilt out from under the running gateway.
@@ -101,45 +102,10 @@ export function resolveAcpxPluginRoot(moduleUrl: string = import.meta.url): stri
   );
 }
 
-export const ACPX_PLUGIN_ROOT = resolveAcpxPluginRoot();
-
 const DEFAULT_PERMISSION_MODE: AcpxPermissionMode = "approve-reads";
 const DEFAULT_NON_INTERACTIVE_POLICY: AcpxNonInteractivePermissionPolicy = "fail";
-const DEFAULT_QUEUE_OWNER_TTL_SECONDS = 0.1;
-const DEFAULT_STRICT_WINDOWS_CMD_WRAPPER = true;
 
-type ParseResult =
-  | { ok: true; value: AcpxPluginConfig | undefined }
-  | { ok: false; message: string };
-
-function formatAcpxConfigIssue(issue: z.ZodIssue | undefined): string {
-  if (!issue) {
-    return "invalid config";
-  }
-  if (issue.code === "unrecognized_keys" && issue.keys.length > 0) {
-    return `unknown config key: ${issue.keys[0]}`;
-  }
-  if (issue.code === "invalid_type" && issue.path.length === 0) {
-    return "expected config object";
-  }
-  return issue.message;
-}
-
-function parseAcpxPluginConfig(value: unknown): ParseResult {
-  if (value === undefined) {
-    return { ok: true, value: undefined };
-  }
-  const parsed = AcpxPluginConfigSchema.safeParse(value);
-  if (!parsed.success) {
-    return { ok: false, message: formatAcpxConfigIssue(parsed.error.issues[0]) };
-  }
-  return {
-    ok: true,
-    value: parsed.data as AcpxPluginConfig,
-  };
-}
-
-function resolveOpenClawRoot(currentRoot: string): string {
+export function resolveOpenClawRoot(currentRoot: string): string {
   if (
     path.basename(currentRoot) === "acpx" &&
     path.basename(path.dirname(currentRoot)) === "extensions"
@@ -150,47 +116,73 @@ function resolveOpenClawRoot(currentRoot: string): string {
     }
     return parent;
   }
-  return path.resolve(currentRoot, "..");
+  // An externally installed acpx package sits outside the host tree, so locate the host from its launcher.
+  return resolveHostPackageRoot(process.argv[1]) ?? path.resolve(currentRoot, "..");
 }
 
-export function resolvePluginToolsMcpServerConfig(
+function resolveHostPackageRoot(argv1: string | undefined): string | null {
+  if (!argv1) {
+    return null;
+  }
+  let cursor: string;
+  try {
+    cursor = path.dirname(fs.realpathSync(argv1));
+  } catch {
+    return null;
+  }
+  for (;;) {
+    try {
+      const manifest: unknown = JSON.parse(
+        fs.readFileSync(path.join(cursor, "package.json"), "utf8"),
+      );
+      if (isRecord(manifest) && manifest.name === "openclaw") {
+        return cursor;
+      }
+    } catch {
+      // Directories without a readable package.json are not the host root.
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) {
+      return null;
+    }
+    cursor = parent;
+  }
+}
+
+function resolveManagedToolsMcpServerConfig(
+  entryPoint: "pluginToolsServe" | "openclawToolsServe",
   moduleUrl: string = import.meta.url,
 ): McpServerConfig {
   const pluginRoot = resolveAcpxPluginRoot(moduleUrl);
   const openClawRoot = resolveOpenClawRoot(pluginRoot);
-  const distEntry = path.join(openClawRoot, "dist", "mcp", "plugin-tools-serve.js");
-  if (fs.existsSync(distEntry)) {
-    return {
-      command: process.execPath,
-      args: [distEntry],
-    };
-  }
-  const sourceEntry = path.join(openClawRoot, "src", "mcp", "plugin-tools-serve.ts");
+  const entry = resolvePackageRuntimeProcessEntrypointUrl(entryPoint, openClawRoot);
   return {
     command: process.execPath,
-    args: ["--import", "tsx", sourceEntry],
+    args: resolveRuntimeWorkerArgv(entry),
   };
 }
 
 function resolveConfiguredMcpServers(params: {
   mcpServers?: Record<string, McpServerConfig>;
   pluginToolsMcpBridge: boolean;
+  openClawToolsMcpBridge: boolean;
   moduleUrl?: string;
 }): Record<string, McpServerConfig> {
   const resolved = { ...params.mcpServers };
-  if (!params.pluginToolsMcpBridge) {
-    return resolved;
+  for (const [flag, name] of MANAGED_MCP_BRIDGES) {
+    if (params[flag] && resolved[name]) {
+      throw new Error(`mcpServers.${name} is reserved when ${flag}=true`);
+    }
   }
-  if (resolved[ACPX_PLUGIN_TOOLS_MCP_SERVER_NAME]) {
-    throw new Error(
-      `mcpServers.${ACPX_PLUGIN_TOOLS_MCP_SERVER_NAME} is reserved when pluginToolsMcpBridge=true`,
-    );
+  for (const [flag, name, entryPoint] of MANAGED_MCP_BRIDGES) {
+    if (params[flag]) {
+      resolved[name] = resolveManagedToolsMcpServerConfig(entryPoint, params.moduleUrl);
+    }
   }
-  resolved[ACPX_PLUGIN_TOOLS_MCP_SERVER_NAME] = resolvePluginToolsMcpServerConfig(params.moduleUrl);
   return resolved;
 }
 
-export function toAcpMcpServers(mcpServers: Record<string, McpServerConfig>): AcpxMcpServer[] {
+export function toAcpMcpServers(mcpServers: Record<string, McpServerConfig>) {
   return Object.entries(mcpServers).map(([name, server]) => ({
     name,
     command: server.command,
@@ -205,45 +197,50 @@ export function toAcpMcpServers(mcpServers: Record<string, McpServerConfig>): Ac
 export function resolveAcpxPluginConfig(params: {
   rawConfig: unknown;
   workspaceDir?: string;
+  stateDir?: string;
   moduleUrl?: string;
 }): ResolvedAcpxPluginConfig {
-  const parsed = parseAcpxPluginConfig(params.rawConfig);
-  if (!parsed.ok) {
-    throw new Error(parsed.message);
+  const { rawConfig } = params;
+  const parsed = AcpxPluginConfigSchema.safeParse(rawConfig === undefined ? {} : rawConfig);
+  if (!parsed.success) {
+    throw new Error(formatPluginConfigIssue(parsed.error.issues[0]));
   }
-  const normalized = parsed.value ?? {};
+  const normalized = parsed.data;
   const workspaceDir = params.workspaceDir?.trim() || process.cwd();
-  const fallbackCwd = workspaceDir;
-  const cwd = path.resolve(normalized.cwd?.trim() || fallbackCwd);
-  const stateDir = path.resolve(normalized.stateDir?.trim() || path.join(workspaceDir, "state"));
+  const cwd = path.resolve(normalized.cwd ?? workspaceDir);
+  const stateDir = path.resolve(
+    normalized.stateDir ?? path.join(params.stateDir ?? resolveStateDir(), "acpx"),
+  );
   const pluginToolsMcpBridge = normalized.pluginToolsMcpBridge === true;
+  const openClawToolsMcpBridge = normalized.openClawToolsMcpBridge === true;
   const mcpServers = resolveConfiguredMcpServers({
     mcpServers: normalized.mcpServers,
     pluginToolsMcpBridge,
+    openClawToolsMcpBridge,
     moduleUrl: params.moduleUrl,
   });
   const agents = Object.fromEntries(
-    Object.entries(normalized.agents ?? {}).map(([name, entry]) => [
-      normalizeLowercaseStringOrEmpty(name),
-      entry.command.trim(),
-    ]),
+    Object.entries(normalized.agents ?? {}).map(([name, entry]) => {
+      const cmd = entry.command;
+      // Only explicit absolute paths bypass parsing; workspace files must not
+      // reinterpret a configured command prefix as a different executable.
+      const command = path.isAbsolute(cmd) && fs.existsSync(cmd) ? [cmd] : splitCommandParts(cmd);
+      return [normalizeLowercaseStringOrEmpty(name), [...command, ...(entry.args ?? [])]];
+    }),
   );
 
   return {
     cwd,
     stateDir,
+    probeAgent: normalized.probeAgent,
     permissionMode: normalized.permissionMode ?? DEFAULT_PERMISSION_MODE,
     nonInteractivePermissions:
       normalized.nonInteractivePermissions ?? DEFAULT_NON_INTERACTIVE_POLICY,
     pluginToolsMcpBridge,
-    strictWindowsCmdWrapper:
-      normalized.strictWindowsCmdWrapper ?? DEFAULT_STRICT_WINDOWS_CMD_WRAPPER,
-    timeoutSeconds: normalized.timeoutSeconds ?? DEFAULT_ACPX_TIMEOUT_SECONDS,
-    queueOwnerTtlSeconds: normalized.queueOwnerTtlSeconds ?? DEFAULT_QUEUE_OWNER_TTL_SECONDS,
-    legacyCompatibilityConfig: {
-      strictWindowsCmdWrapper: normalized.strictWindowsCmdWrapper,
-      queueOwnerTtlSeconds: normalized.queueOwnerTtlSeconds,
-    },
+    openClawToolsMcpBridge,
+    timeoutSeconds: normalized.timeoutSeconds,
+    agentProcessEnvAllow: normalized.agentProcessEnvAllow,
+    agentProcessEnvBlock: normalized.agentProcessEnvBlock,
     mcpServers,
     agents,
   };

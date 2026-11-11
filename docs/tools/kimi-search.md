@@ -3,23 +3,33 @@ summary: "Kimi web search via Moonshot web search"
 read_when:
   - You want to use Kimi for web_search
   - You need a KIMI_API_KEY or MOONSHOT_API_KEY
-title: "Kimi Search"
+title: "Kimi search"
 ---
 
-# Kimi Search
+Kimi is a `web_search` provider backed by Moonshot's `POST /tools/search`
+endpoint. It returns a structured list of results with titles, URLs,
+descriptions, and source metadata. No chat model is used to synthesize an answer.
 
-OpenClaw supports Kimi as a `web_search` provider, using Moonshot web search
-to produce AI-synthesized answers with citations.
+## Setup
 
-## Get an API key
+The `moonshot` plugin does not ship with OpenClaw; install it first.
 
 <Steps>
+  <Step title="Install the plugin">
+    ```bash
+    openclaw plugins install @openclaw/moonshot-provider
+    ```
+
+    Installation applies to a running Gateway automatically; otherwise it takes effect
+    on the next startup. See [Apply changes and inspect](/plugins/manage-plugins#apply-changes-and-inspect).
+
+  </Step>
   <Step title="Create a key">
     Get an API key from [Moonshot AI](https://platform.moonshot.cn/).
   </Step>
   <Step title="Store the key">
-    Set `KIMI_API_KEY` or `MOONSHOT_API_KEY` in the Gateway environment, or
-    configure via:
+    Set `KIMI_API_KEY` or `MOONSHOT_API_KEY` in the Gateway environment (for a
+    gateway install, add it to `~/.openclaw/.env`), or configure via:
 
     ```bash
     openclaw configure --section web
@@ -28,13 +38,9 @@ to produce AI-synthesized answers with citations.
   </Step>
 </Steps>
 
-When you choose **Kimi** during `openclaw onboard` or
-`openclaw configure --section web`, OpenClaw can also ask for:
-
-- the Moonshot API region:
-  - `https://api.moonshot.ai/v1`
-  - `https://api.moonshot.cn/v1`
-- the default Kimi web-search model (defaults to `kimi-k2.5`)
+Choosing **Kimi** during `openclaw onboard` or `openclaw configure --section web`
+also prompts for the Moonshot API region: `https://api.moonshot.ai/v1` or
+`https://api.moonshot.cn/v1`.
 
 ## Config
 
@@ -47,7 +53,6 @@ When you choose **Kimi** during `openclaw onboard` or
           webSearch: {
             apiKey: "sk-...", // optional if KIMI_API_KEY or MOONSHOT_API_KEY is set
             baseUrl: "https://api.moonshot.ai/v1",
-            model: "kimi-k2.5",
           },
         },
       },
@@ -63,36 +68,55 @@ When you choose **Kimi** during `openclaw onboard` or
 }
 ```
 
-If you use the China API host for chat (`models.providers.moonshot.baseUrl`:
-`https://api.moonshot.cn/v1`), OpenClaw reuses that same host for Kimi
-`web_search` when `tools.web.search.kimi.baseUrl` is omitted, so keys from
-[platform.moonshot.cn](https://platform.moonshot.cn/) do not hit the
-international endpoint by mistake (which often returns HTTP 401). Override
-with `tools.web.search.kimi.baseUrl` when you need a different search base URL.
+`tools.web.search.provider` is auto-detected from available API keys when omitted;
+set it to `kimi` explicitly if multiple search credentials are configured.
 
-**Environment alternative:** set `KIMI_API_KEY` or `MOONSHOT_API_KEY` in the
-Gateway environment. For a gateway install, put it in `~/.openclaw/.env`.
+Configure Kimi-specific `apiKey` and `baseUrl` values under
+`plugins.entries.moonshot.config.webSearch`.
 
-If you omit `baseUrl`, OpenClaw defaults to `https://api.moonshot.ai/v1`.
-If you omit `model`, OpenClaw defaults to `kimi-k2.5`.
+The `baseUrl` defaults to `https://api.moonshot.ai/v1` when omitted.
 
-## How it works
+`plugins.entries.moonshot.config.webSearch.model` is deprecated and ignored.
+Existing configurations containing it remain valid; you can remove the key
+manually. Doctor does not remove it automatically. The older
+`tools.web.search.kimi` block is already legacy config: `openclaw doctor --fix`
+moves it into the plugin config, where its `model` key is likewise ignored.
 
-Kimi uses Moonshot web search to synthesize answers with inline citations,
-similar to Gemini and Grok's grounded response approach.
+If chat traffic uses the China host (`models.providers.moonshot.baseUrl`:
+`https://api.moonshot.cn/v1`), Kimi `web_search` reuses that host automatically
+when its own `baseUrl` is unset, so `.cn` keys do not accidentally hit the
+international endpoint (which returns HTTP 401 for those keys). Set an explicit
+Kimi `baseUrl` to override this inheritance.
 
-## Supported parameters
+<a id="grounding-requirement" />
 
-Kimi search supports `query`.
+## Search results
 
-`count` is accepted for shared `web_search` compatibility, but Kimi still
-returns one synthesized answer with citations rather than an N-result list.
+OpenClaw sends `{ "text_query": "your query", "limit": 5 }` to
+`<baseUrl>/tools/search`. The requested `count` becomes `limit`. Results expose
+`title`, `url`, `description` (from the search snippet), `siteName`, and
+`published` when available. Titles and descriptions are wrapped as untrusted
+web content. An empty result list is a successful search with `count: 0`.
 
-Provider-specific filters are not currently supported.
+This replaces Moonshot's chat-completions search builtin, which retires on
+October 20, 2026. Search billing follows Moonshot's
+[web-search pricing](https://platform.kimi.ai/docs/pricing/websearch), rather
+than the selected chat model.
+
+## Tool parameters
+
+| Parameter                                                       | Supported                            |
+| --------------------------------------------------------------- | ------------------------------------ |
+| `query`                                                         | Yes                                  |
+| `count`                                                         | Number of results (1–10, default: 5) |
+| `country`, `language`, `freshness`, `date_after`, `date_before` | No                                   |
+
+When `count` is omitted, `tools.web.search.maxResults` applies. If neither is
+set, Kimi returns up to five results.
 
 ## Related
 
-- [Web Search overview](/tools/web) -- all providers and auto-detection
-- [Moonshot AI](/providers/moonshot) -- Moonshot model + Kimi Coding provider docs
-- [Gemini Search](/tools/gemini-search) -- AI-synthesized answers via Google grounding
-- [Grok Search](/tools/grok-search) -- AI-synthesized answers via xAI grounding
+- [Web Search overview](/tools/web) - all providers and auto-detection
+- [Moonshot AI](/providers/moonshot) - Moonshot model + Kimi Coding provider docs
+- [Gemini Search](/tools/gemini-search) - AI-synthesized answers via Google grounding
+- [Grok Search](/tools/grok-search) - AI-synthesized answers via xAI grounding

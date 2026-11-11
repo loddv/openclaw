@@ -3,49 +3,48 @@ import Foundation
 import OpenClawKit
 
 final class CalendarService: CalendarServicing {
+    private let eventAuthorizationStatus: @Sendable () -> EKAuthorizationStatus
+
+    init(
+        eventAuthorizationStatus: @escaping @Sendable () -> EKAuthorizationStatus = {
+            EKEventStore.authorizationStatus(for: .event)
+        })
+    {
+        self.eventAuthorizationStatus = eventAuthorizationStatus
+    }
+
     func events(params: OpenClawCalendarEventsParams) async throws -> OpenClawCalendarEventsPayload {
-        let store = EKEventStore()
-        let status = EKEventStore.authorizationStatus(for: .event)
-        let authorized = EventKitAuthorization.allowsRead(status: status)
-        guard authorized else {
+        let status = self.eventAuthorizationStatus()
+        guard DevicePermissionStatusMap.eventKitRead(status) == .granted else {
             throw NSError(domain: "Calendar", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "CALENDAR_PERMISSION_REQUIRED: grant Calendar permission",
             ])
         }
 
+        let store = EKEventStore()
         let (start, end) = Self.resolveRange(
             startISO: params.startISO,
             endISO: params.endISO)
         let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
         let events = store.events(matching: predicate)
         let limit = max(1, min(params.limit ?? 50, 500))
-        let selected = Array(events.prefix(limit))
-
         let formatter = ISO8601DateFormatter()
-        let payload = selected.map { event in
-            OpenClawCalendarEventPayload(
-                identifier: event.eventIdentifier ?? UUID().uuidString,
-                title: event.title ?? "(untitled)",
-                startISO: formatter.string(from: event.startDate),
-                endISO: formatter.string(from: event.endDate),
-                isAllDay: event.isAllDay,
-                location: event.location,
-                calendarTitle: event.calendar.title)
+        let payload = events.prefix(limit).map { event in
+            Self.payload(from: event, fallbackTitle: "(untitled)", formatter: formatter)
         }
 
         return OpenClawCalendarEventsPayload(events: payload)
     }
 
     func add(params: OpenClawCalendarAddParams) async throws -> OpenClawCalendarAddPayload {
-        let store = EKEventStore()
-        let status = EKEventStore.authorizationStatus(for: .event)
-        let authorized = EventKitAuthorization.allowsWrite(status: status)
-        guard authorized else {
+        let status = self.eventAuthorizationStatus()
+        guard DevicePermissionStatusMap.eventKitWrite(status) == .granted else {
             throw NSError(domain: "Calendar", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "CALENDAR_PERMISSION_REQUIRED: grant Calendar permission",
             ])
         }
 
+        let store = EKEventStore()
         let title = params.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else {
             throw NSError(domain: "Calendar", code: 3, userInfo: [
@@ -53,13 +52,12 @@ final class CalendarService: CalendarServicing {
             ])
         }
 
-        let formatter = ISO8601DateFormatter()
-        guard let start = formatter.date(from: params.startISO) else {
+        guard let start = OpenClawISO8601.date(from: params.startISO) else {
             throw NSError(domain: "Calendar", code: 4, userInfo: [
                 NSLocalizedDescriptionKey: "CALENDAR_INVALID: startISO required",
             ])
         }
-        guard let end = formatter.date(from: params.endISO) else {
+        guard let end = OpenClawISO8601.date(from: params.endISO) else {
             throw NSError(domain: "Calendar", code: 5, userInfo: [
                 NSLocalizedDescriptionKey: "CALENDAR_INVALID: endISO required",
             ])
@@ -83,16 +81,23 @@ final class CalendarService: CalendarServicing {
 
         try store.save(event, span: .thisEvent)
 
-        let payload = OpenClawCalendarEventPayload(
+        return OpenClawCalendarAddPayload(
+            event: Self.payload(from: event, fallbackTitle: title, formatter: ISO8601DateFormatter()))
+    }
+
+    private static func payload(
+        from event: EKEvent,
+        fallbackTitle: String,
+        formatter: ISO8601DateFormatter) -> OpenClawCalendarEventPayload
+    {
+        OpenClawCalendarEventPayload(
             identifier: event.eventIdentifier ?? UUID().uuidString,
-            title: event.title ?? title,
+            title: event.title ?? fallbackTitle,
             startISO: formatter.string(from: event.startDate),
             endISO: formatter.string(from: event.endDate),
             isAllDay: event.isAllDay,
             location: event.location,
             calendarTitle: event.calendar.title)
-
-        return OpenClawCalendarAddPayload(event: payload)
     }
 
     private static func resolveCalendar(
@@ -127,9 +132,8 @@ final class CalendarService: CalendarServicing {
     }
 
     private static func resolveRange(startISO: String?, endISO: String?) -> (Date, Date) {
-        let formatter = ISO8601DateFormatter()
-        let start = startISO.flatMap { formatter.date(from: $0) } ?? Date()
-        let end = endISO.flatMap { formatter.date(from: $0) } ?? start.addingTimeInterval(7 * 24 * 3600)
+        let start = startISO.flatMap(OpenClawISO8601.date(from:)) ?? Date()
+        let end = endISO.flatMap(OpenClawISO8601.date(from:)) ?? start.addingTimeInterval(7 * 24 * 3600)
         return (start, end)
     }
 }

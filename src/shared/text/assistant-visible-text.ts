@@ -1,573 +1,292 @@
-import { normalizeLowercaseStringOrEmpty } from "../string-coerce.js";
-import { findCodeRegions, isInsideCode } from "./code-regions.js";
-import { stripModelSpecialTokens } from "./model-special-tokens.js";
+// Assistant visible text helpers strip hidden reasoning and control marker text.
 import {
-  stripReasoningTagsFromText,
-  type ReasoningTagMode,
-  type ReasoningTagTrim,
-} from "./reasoning-tags.js";
+  createPlainTextToolCallBraceProbe,
+  projectPlainTextToolCallBlocks,
+} from "../../../packages/tool-call-repair/src/payload.js";
+import { escapeRegExp } from "../regexp.js";
+import {
+  stripMinimaxToolCallXml,
+  stripRelevantMemoriesTags,
+  stripAssistantInternalTraceLines,
+  stripLegacyBracketToolCallBlocks,
+  scanLegacyBracketToolCallBlocks,
+  plainToolCallTransform,
+  stripInvisibleAssistantText,
+  traceLineHeads,
+  INTERNAL_TRACE_LINE_RE,
+} from "./assistant-text-transforms.js";
+import {
+  findCodeRegions,
+  isInsideSettledBlockCode,
+  projectLinesOutsideCode,
+} from "./code-regions.js";
+import { downgradedToolCallTextFilter } from "./downgraded-tool-call-text.js";
+import { orderInternalScaffoldingStages } from "./internal-scaffolding-stages.js";
+import { modelSpecialTokensTextFilter } from "./model-special-tokens.js";
+import { reasoningTagTextFilter } from "./reasoning-tags.js";
+import {
+  applyTextFilters,
+  createConditionalTextProjector,
+  leadingEmptyLinesTextFilter,
+  trimTextFilter,
+  type TextFilter,
+} from "./text-projection.js";
+import { toolCallXmlTextFilter } from "./tool-call-xml.js";
 
-const MEMORY_TAG_RE = /<\s*(\/?)\s*relevant[-_]memories\b[^<>]*>/gi;
-const MEMORY_TAG_QUICK_RE = /<\s*\/?\s*relevant[-_]memories\b/i;
+export { stripAssistantInternalScaffolding } from "./assistant-internal-scaffolding.js";
+export { stripToolCallXmlTags, toolCallXmlTextFilter } from "./tool-call-xml.js";
 
-/**
- * Strip XML-style tool call tags that models sometimes emit as plain text.
- * This stateful pass hides content from an opening tag through the matching
- * closing tag, or to end-of-string if the stream was truncated mid-tag.
- */
-const TOOL_CALL_QUICK_RE = /<\s*\/?\s*(?:tool_call|tool_result|function_calls?|tool_calls)\b/i;
-const TOOL_CALL_TAG_NAMES = new Set([
-  "tool_call",
-  "tool_result",
-  "function_call",
-  "function_calls",
-  "tool_calls",
-]);
-const TOOL_CALL_JSON_PAYLOAD_START_RE =
-  /^(?:\s+[A-Za-z_:][-A-Za-z0-9_:.]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))*\s*(?:\r?\n\s*)?[[{]/;
-const TOOL_CALL_XML_PAYLOAD_START_RE =
-  /^\s*(?:\r?\n\s*)?<(?:function|invoke|parameters?|arguments?)\b/i;
+export type AssistantVisibleTextSanitizerProfile =
+  | "delivery"
+  | "final-answer-delivery"
+  | "history"
+  | "internal-scaffolding"
+  | "tool-progress";
 
-function endsInsideQuotedString(text: string, start: number, end: number): boolean {
-  let quoteChar: "'" | '"' | null = null;
-  let isEscaped = false;
-
-  for (let idx = start; idx < end; idx += 1) {
-    const char = text[idx];
-    if (quoteChar === null) {
-      if (char === '"' || char === "'") {
-        quoteChar = char;
-      }
-      continue;
-    }
-
-    if (isEscaped) {
-      isEscaped = false;
-      continue;
-    }
-
-    if (char === "\\") {
-      isEscaped = true;
-      continue;
-    }
-
-    if (char === quoteChar) {
-      quoteChar = null;
-    }
-  }
-
-  return quoteChar !== null;
-}
-
-interface ParsedToolCallTag {
-  contentStart: number;
-  end: number;
-  isClose: boolean;
-  isSelfClosing: boolean;
-  tagName: string;
-  isTruncated: boolean;
-}
-
-function isToolCallBoundary(char: string | undefined): boolean {
-  return !char || /\s/.test(char) || char === "/" || char === ">";
-}
-
-function findTagCloseIndex(text: string, start: number): number {
-  let quoteChar: "'" | '"' | null = null;
-  let isEscaped = false;
-
-  for (let idx = start; idx < text.length; idx += 1) {
-    const char = text[idx];
-    if (quoteChar !== null) {
-      if (isEscaped) {
-        isEscaped = false;
-        continue;
-      }
-      if (char === "\\") {
-        isEscaped = true;
-        continue;
-      }
-      if (char === quoteChar) {
-        quoteChar = null;
-      }
-      continue;
-    }
-
-    if (char === '"' || char === "'") {
-      quoteChar = char;
-      continue;
-    }
-    if (char === "<") {
-      return -1;
-    }
-    if (char === ">") {
-      return idx;
-    }
-  }
-
-  return -1;
-}
-
-function looksLikeToolCallPayloadStart(text: string, start: number): boolean {
-  const rest = text.slice(start);
-  return TOOL_CALL_JSON_PAYLOAD_START_RE.test(rest) || TOOL_CALL_XML_PAYLOAD_START_RE.test(rest);
-}
-
-function parseToolCallTagAt(text: string, start: number): ParsedToolCallTag | null {
-  if (text[start] !== "<") {
-    return null;
-  }
-
-  let cursor = start + 1;
-  while (cursor < text.length && /\s/.test(text[cursor])) {
-    cursor += 1;
-  }
-
-  let isClose = false;
-  if (text[cursor] === "/") {
-    isClose = true;
-    cursor += 1;
-    while (cursor < text.length && /\s/.test(text[cursor])) {
-      cursor += 1;
-    }
-  }
-
-  const nameStart = cursor;
-  while (cursor < text.length && /[A-Za-z_]/.test(text[cursor])) {
-    cursor += 1;
-  }
-
-  const tagName = normalizeLowercaseStringOrEmpty(text.slice(nameStart, cursor));
-  if (!TOOL_CALL_TAG_NAMES.has(tagName) || !isToolCallBoundary(text[cursor])) {
-    return null;
-  }
-  const contentStart = cursor;
-
-  const closeIndex = findTagCloseIndex(text, cursor);
-  if (closeIndex === -1) {
-    return {
-      contentStart,
-      end: text.length,
-      isClose,
-      isSelfClosing: false,
-      tagName,
-      isTruncated: true,
-    };
-  }
-
-  return {
-    contentStart,
-    end: closeIndex + 1,
-    isClose,
-    isSelfClosing: !isClose && /\/\s*$/.test(text.slice(cursor, closeIndex)),
-    tagName,
-    isTruncated: false,
-  };
-}
-
-export function stripToolCallXmlTags(text: string): string {
-  if (!text || !TOOL_CALL_QUICK_RE.test(text)) {
-    return text;
-  }
-
-  const codeRegions = findCodeRegions(text);
-  let result = "";
-  let lastIndex = 0;
-  let inToolCallBlock = false;
-  let toolCallContentStart = 0;
-  let toolCallBlockTagName: string | null = null;
-  const visibleTagBalance = new Map<string, number>();
-
-  for (let idx = 0; idx < text.length; idx += 1) {
-    if (text[idx] !== "<") {
-      continue;
-    }
-    if (!inToolCallBlock && isInsideCode(idx, codeRegions)) {
-      continue;
-    }
-
-    const tag = parseToolCallTagAt(text, idx);
-    if (!tag) {
-      continue;
-    }
-
-    if (!inToolCallBlock) {
-      result += text.slice(lastIndex, idx);
-      if (tag.isClose) {
-        if (tag.isTruncated) {
-          const preserveEnd = tag.contentStart;
-          result += text.slice(idx, preserveEnd);
-          lastIndex = preserveEnd;
-          idx = Math.max(idx, preserveEnd - 1);
-          continue;
-        }
-        const balance = visibleTagBalance.get(tag.tagName) ?? 0;
-        if (balance > 0) {
-          result += text.slice(idx, tag.end);
-          visibleTagBalance.set(tag.tagName, balance - 1);
-        }
-        lastIndex = tag.end;
-        idx = Math.max(idx, tag.end - 1);
-        continue;
-      }
-      if (tag.isSelfClosing) {
-        lastIndex = tag.end;
-        idx = Math.max(idx, tag.end - 1);
-        continue;
-      }
-      const payloadStart = tag.isTruncated ? tag.contentStart : tag.end;
-      const hasToolCallPayloadStart =
-        tag.tagName === "tool_call"
-          ? looksLikeToolCallPayloadStart(text, payloadStart)
-          : TOOL_CALL_JSON_PAYLOAD_START_RE.test(text.slice(payloadStart));
-      if (!tag.isClose && hasToolCallPayloadStart) {
-        inToolCallBlock = true;
-        toolCallContentStart = tag.end;
-        toolCallBlockTagName = tag.tagName;
-        if (tag.isTruncated) {
-          lastIndex = text.length;
-          break;
-        }
-      } else {
-        const preserveEnd = tag.isTruncated ? tag.contentStart : tag.end;
-        result += text.slice(idx, preserveEnd);
-        if (!tag.isTruncated) {
-          visibleTagBalance.set(tag.tagName, (visibleTagBalance.get(tag.tagName) ?? 0) + 1);
-        }
-        lastIndex = preserveEnd;
-        idx = Math.max(idx, preserveEnd - 1);
-        continue;
-      }
-    } else if (
-      tag.isClose &&
-      (tag.tagName === toolCallBlockTagName ||
-        (toolCallBlockTagName === "tool_result" && tag.tagName === "tool_call")) &&
-      !endsInsideQuotedString(text, toolCallContentStart, idx)
-    ) {
-      inToolCallBlock = false;
-      toolCallBlockTagName = null;
-    }
-
-    lastIndex = tag.end;
-    idx = Math.max(idx, tag.end - 1);
-  }
-
-  if (!inToolCallBlock) {
-    result += text.slice(lastIndex);
-  }
-
-  return result;
-}
-
-/**
- * Strip malformed Minimax tool invocations that leak into text content.
- * Minimax sometimes embeds tool calls as XML in text blocks instead of
- * proper structured tool calls.
- */
-export function stripMinimaxToolCallXml(text: string): string {
-  if (!text || !/minimax:tool_call/i.test(text)) {
-    return text;
-  }
-
-  // Remove <invoke ...>...</invoke> blocks (non-greedy to handle multiple).
-  let cleaned = text.replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/gi, "");
-
-  // Remove stray minimax tool tags.
-  cleaned = cleaned.replace(/<\/?minimax:tool_call>/gi, "");
-
-  return cleaned;
-}
-
-/**
- * Strip downgraded tool call text representations that leak into user-visible
- * text content when replaying history across providers.
- */
-export function stripDowngradedToolCallText(text: string): string {
-  if (!text) {
-    return text;
-  }
-  if (!/\[Tool (?:Call|Result)/i.test(text) && !/\[Historical context/i.test(text)) {
-    return text;
-  }
-
-  const consumeJsonish = (
-    input: string,
-    start: number,
-    options?: { allowLeadingNewlines?: boolean },
-  ): number | null => {
-    const { allowLeadingNewlines = false } = options ?? {};
-    let index = start;
-    while (index < input.length) {
-      const ch = input[index];
-      if (ch === " " || ch === "\t") {
-        index += 1;
-        continue;
-      }
-      if (allowLeadingNewlines && (ch === "\n" || ch === "\r")) {
-        index += 1;
-        continue;
-      }
-      break;
-    }
-    if (index >= input.length) {
-      return null;
-    }
-
-    const startChar = input[index];
-    if (startChar === "{" || startChar === "[") {
-      let depth = 0;
-      let inString = false;
-      let escape = false;
-      for (let idx = index; idx < input.length; idx += 1) {
-        const ch = input[idx];
-        if (inString) {
-          if (escape) {
-            escape = false;
-          } else if (ch === "\\") {
-            escape = true;
-          } else if (ch === '"') {
-            inString = false;
-          }
-          continue;
-        }
-        if (ch === '"') {
-          inString = true;
-          continue;
-        }
-        if (ch === "{" || ch === "[") {
-          depth += 1;
-        } else if (ch === "}" || ch === "]") {
-          depth -= 1;
-          if (depth === 0) {
-            return idx + 1;
+const invisibleTextFilter: TextFilter = {
+  transform: stripInvisibleAssistantText,
+  create: () => {
+    let visible = false;
+    let visibleThrough = 0;
+    let trailingHighSurrogate = "";
+    const projector = createConditionalTextProjector(
+      () => "",
+      (input) => {
+        if (!visible) {
+          const appended = trailingHighSurrogate + (input.delta ?? input.text);
+          // A split supplementary character cannot permanently establish visibility yet.
+          trailingHighSurrogate = /[\uD800-\uDBFF]$/.test(appended) ? appended.slice(-1) : "";
+          visible = Boolean(
+            stripInvisibleAssistantText(trailingHighSurrogate ? appended.slice(0, -1) : appended),
+          );
+          if (visible) {
+            visibleThrough = input.text.length;
           }
         }
-      }
-      return null;
-    }
-
-    if (startChar === '"') {
-      let escape = false;
-      for (let idx = index + 1; idx < input.length; idx += 1) {
-        const ch = input[idx];
-        if (escape) {
-          escape = false;
-          continue;
-        }
-        if (ch === "\\") {
-          escape = true;
-          continue;
-        }
-        if (ch === '"') {
-          return idx + 1;
-        }
-      }
-      return null;
-    }
-
-    let end = index;
-    while (end < input.length && input[end] !== "\n" && input[end] !== "\r") {
-      end += 1;
-    }
-    return end;
-  };
-
-  const stripToolCalls = (input: string): string => {
-    const toolCallRe = /\[Tool Call:[^\]]*\]/gi;
-    let result = "";
-    let cursor = 0;
-    for (const match of input.matchAll(toolCallRe)) {
-      const start = match.index ?? 0;
-      if (start < cursor) {
-        continue;
-      }
-      result += input.slice(cursor, start);
-      let index = start + match[0].length;
-      while (index < input.length && (input[index] === " " || input[index] === "\t")) {
-        index += 1;
-      }
-      if (input[index] === "\r") {
-        index += 1;
-        if (input[index] === "\n") {
-          index += 1;
-        }
-      } else if (input[index] === "\n") {
-        index += 1;
-      }
-      while (index < input.length && (input[index] === " " || input[index] === "\t")) {
-        index += 1;
-      }
-      if (normalizeLowercaseStringOrEmpty(input.slice(index, index + 9)) === "arguments") {
-        index += 9;
-        if (input[index] === ":") {
-          index += 1;
-        }
-        if (input[index] === " ") {
-          index += 1;
-        }
-        const end = consumeJsonish(input, index, { allowLeadingNewlines: true });
-        if (end !== null) {
-          index = end;
-        }
-      }
-      if (
-        (input[index] === "\n" || input[index] === "\r") &&
-        (result.endsWith("\n") || result.endsWith("\r") || result.length === 0)
-      ) {
-        if (input[index] === "\r") {
-          index += 1;
-        }
-        if (input[index] === "\n") {
-          index += 1;
-        }
-      }
-      cursor = index;
-    }
-    result += input.slice(cursor);
-    return result;
-  };
-
-  // Remove [Tool Call: name (ID: ...)] blocks and their Arguments.
-  let cleaned = stripToolCalls(text);
-
-  // Remove [Tool Result for ID ...] blocks and their content.
-  cleaned = cleaned.replace(/\[Tool Result for ID[^\]]*\]\n?[\s\S]*?(?=\n*\[Tool |\n*$)/gi, "");
-
-  // Remove [Historical context: ...] markers (self-contained within brackets).
-  cleaned = cleaned.replace(/\[Historical context:[^\]]*\]\n?/gi, "");
-
-  return cleaned.trim();
-}
-
-function stripRelevantMemoriesTags(text: string): string {
-  if (!text || !MEMORY_TAG_QUICK_RE.test(text)) {
-    return text;
-  }
-  MEMORY_TAG_RE.lastIndex = 0;
-
-  const codeRegions = findCodeRegions(text);
-  let result = "";
-  let lastIndex = 0;
-  let inMemoryBlock = false;
-
-  for (const match of text.matchAll(MEMORY_TAG_RE)) {
-    const idx = match.index ?? 0;
-    if (isInsideCode(idx, codeRegions)) {
-      continue;
-    }
-
-    const isClose = match[1] === "/";
-    if (!inMemoryBlock) {
-      result += text.slice(lastIndex, idx);
-      if (!isClose) {
-        inMemoryBlock = true;
-      }
-    } else if (isClose) {
-      inMemoryBlock = false;
-    }
-
-    lastIndex = idx + match[0].length;
-  }
-
-  if (!inMemoryBlock) {
-    result += text.slice(lastIndex);
-  }
-
-  return result;
-}
-
-export type AssistantVisibleTextSanitizerProfile = "delivery" | "history" | "internal-scaffolding";
-
-type AssistantVisibleTextPipelineOptions = {
-  finalTrim: ReasoningTagTrim;
-  preserveDowngradedToolText?: boolean;
-  preserveMinimaxToolXml?: boolean;
-  reasoningMode: ReasoningTagMode;
-  reasoningTrim: ReasoningTagTrim;
-  stageOrder: "reasoning-first" | "reasoning-last";
-};
-
-const ASSISTANT_VISIBLE_TEXT_PIPELINE_OPTIONS: Record<
-  AssistantVisibleTextSanitizerProfile,
-  AssistantVisibleTextPipelineOptions
-> = {
-  delivery: {
-    finalTrim: "both",
-    reasoningMode: "strict",
-    reasoningTrim: "both",
-    stageOrder: "reasoning-last",
-  },
-  history: {
-    finalTrim: "none",
-    reasoningMode: "strict",
-    reasoningTrim: "none",
-    stageOrder: "reasoning-last",
-  },
-  "internal-scaffolding": {
-    finalTrim: "start",
-    preserveDowngradedToolText: true,
-    preserveMinimaxToolXml: true,
-    reasoningMode: "preserve",
-    reasoningTrim: "start",
-    stageOrder: "reasoning-first",
+        return !visible;
+      },
+    );
+    projector.canReplaceFrom = (start) => visible && start >= visibleThrough;
+    return projector;
   },
 };
 
-function applyAssistantVisibleTextStagePipeline(
-  text: string,
-  options: AssistantVisibleTextPipelineOptions,
-): string {
-  if (!text) {
-    return text;
-  }
+const profileFilters = new Map<string, readonly TextFilter[]>();
 
-  const stripReasoning = (value: string) =>
-    stripReasoningTagsFromText(value, {
-      mode: options.reasoningMode,
-      trim: options.reasoningTrim,
+export function assistantVisibleTextFilters(
+  profile: AssistantVisibleTextSanitizerProfile,
+  streaming = false,
+  options?: { preserveTrailingWhitespace?: boolean },
+): readonly TextFilter[] {
+  const key = `${profile}:${streaming}:${Boolean(options?.preserveTrailingWhitespace)}`;
+  const cached = profileFilters.get(key);
+  if (cached) {
+    return cached;
+  }
+  const preserve = profile === "internal-scaffolding";
+  const preserveCodeIndentation = profile === "delivery" || profile === "final-answer-delivery";
+  const trim =
+    preserve || profile === "history"
+      ? "none"
+      : options?.preserveTrailingWhitespace
+        ? "start"
+        : "both";
+  const reasoning = reasoningTagTextFilter({
+    mode: preserve ? "preserve" : "strict",
+    scope: profile === "final-answer-delivery" ? "leading" : "all",
+    // An unfinished stream cannot use terminal malformed-output recovery.
+    recoverUnclosed: !streaming,
+  });
+  if (preserve) {
+    const filters = orderInternalScaffoldingStages<TextFilter>({
+      reasoning,
+      modelTokens: modelSpecialTokensTextFilter,
+      memories: {
+        transform: stripRelevantMemoriesTags,
+        activationTokens: ["relevant-memories", "relevant_memories"],
+      },
+      xml: toolCallXmlTextFilter({}, streaming),
+      trace: assistantTraceTextFilter,
+      legacy: legacyBracketToolCallTextFilter,
+      plain: plainToolCallTextFilter,
+      leading: leadingEmptyLinesTextFilter,
+      invisible: invisibleTextFilter,
     });
-  const applyFinalTrim = (value: string) => {
-    if (options.finalTrim === "none") {
-      return value;
-    }
-    if (options.finalTrim === "start") {
-      return value.trimStart();
-    }
-    return value.trim();
-  };
-  const stripNonReasoningStages = (value: string) => {
-    let cleaned = value;
-    if (!options.preserveMinimaxToolXml) {
-      cleaned = stripMinimaxToolCallXml(cleaned);
-    }
-    cleaned = stripModelSpecialTokens(cleaned);
-    cleaned = stripRelevantMemoriesTags(cleaned);
-    cleaned = stripToolCallXmlTags(cleaned);
-    if (!options.preserveDowngradedToolText) {
-      cleaned = stripDowngradedToolCallText(cleaned);
-    }
-    return cleaned;
-  };
-
-  if (options.stageOrder === "reasoning-first") {
-    return applyFinalTrim(stripNonReasoningStages(stripReasoning(text)));
+    profileFilters.set(key, filters);
+    return filters;
   }
+  const filters: TextFilter[] = [
+    minimaxToolCallTextFilter(streaming),
+    modelSpecialTokensTextFilter,
+    {
+      transform: stripRelevantMemoriesTags,
+      activationTokens: ["relevant-memories", "relevant_memories"],
+    },
+    toolCallXmlTextFilter(
+      {
+        stripFunctionCallsXmlPayloads: profile === "tool-progress",
+        stripFunctionResponseAfterPluralToolCalls:
+          profile === "delivery" || profile === "final-answer-delivery",
+      },
+      streaming,
+    ),
+    ...(profile === "tool-progress" ? [] : [assistantTraceTextFilter]),
+    legacyBracketToolCallTextFilter,
+    plainToolCallTextFilter,
+    downgradedToolCallTextFilter(options),
+  ];
+  filters.push(reasoning);
+  filters.push(trimTextFilter(trim, { preserveCodeIndentation }), invisibleTextFilter);
+  profileFilters.set(key, filters);
+  return filters;
+}
 
-  return applyFinalTrim(stripReasoning(stripNonReasoningStages(text)));
+// Activation is a necessary condition only; the canonical parsers still own
+// syntax, code protection, and later corrections once a marker has appeared.
+export function minimaxToolCallTextFilter(streaming = false): TextFilter {
+  return {
+    transform: (text) => stripMinimaxToolCallXml(text, { recoverUnclosed: !streaming }),
+    activationTokens: ["minimax:tool_call", "<]minimax[>[<tool_call>"],
+  };
+}
+
+export const legacyBracketToolCallTextFilter: TextFilter = {
+  transform: stripLegacyBracketToolCallBlocks,
+  activationTokens: ["TOOL_CALL", "TOOL_RESULT"],
+  checkpoint(text, boundary, context) {
+    const regions = context.codeRegions();
+    const scan = scanLegacyBracketToolCallBlocks(text, regions);
+    const prefix = scanLegacyBracketToolCallBlocks(text.slice(0, boundary), regions);
+    const retainStart = scan.pending || prefix.pending ? 0 : boundary;
+    return {
+      text: scan.text,
+      retainStart,
+      retainedOutputStart: retainStart ? prefix.text.length : 0,
+    };
+  },
+};
+
+export const assistantTraceTextFilter: TextFilter = {
+  transform: stripAssistantInternalTraceLines,
+  create() {
+    let active = false;
+    const resetLine = () => traceLineHeads.map((parts) => ({ parts, part: 0, offset: 0 }));
+    let candidates = resetLine();
+    return createConditionalTextProjector(
+      stripAssistantInternalTraceLines,
+      (input) => {
+        if (active) {
+          return true;
+        }
+        const appended = input.delta ?? input.text;
+        for (let at = 0; at < appended.length; at++) {
+          const char = appended.charAt(at).toLowerCase();
+          if (char === "\n") {
+            candidates = resetLine();
+            continue;
+          }
+          const whitespace = /\s/.test(char);
+          candidates = candidates.filter((candidate) => {
+            if (candidate.offset === 0 && whitespace) {
+              return true;
+            }
+            if (candidate.parts[candidate.part]?.charAt(candidate.offset) !== char) {
+              return false;
+            }
+            candidate.offset++;
+            if (candidate.offset === candidate.parts[candidate.part]?.length) {
+              candidate.part++;
+              candidate.offset = 0;
+              active ||= candidate.part === candidate.parts.length;
+            }
+            return true;
+          });
+          // The canonical transform owns code protection and corrections after activation.
+          if (active) {
+            return true;
+          }
+          if (candidates.length === 0) {
+            const newline = appended.indexOf("\n", at + 1);
+            if (newline === -1) {
+              break;
+            }
+            at = newline - 1;
+          }
+        }
+        return false;
+      },
+      (text, retainStart) =>
+        projectLinesOutsideCode(
+          text,
+          (line) => INTERNAL_TRACE_LINE_RE.test(line.trim()),
+          retainStart,
+        ),
+    );
+  },
+};
+
+const plainToolCallActivationTokens = ["<parameter=", "<function=", "to="] as const;
+function createPlainToolCallTextProjector(preview = false) {
+  const checkpoint: NonNullable<TextFilter["checkpoint"]> = (text, settleBefore, context) =>
+    projectPlainTextToolCallBlocks(text, {
+      resolveProtectedRanges: context.codeRegions,
+      settleBefore,
+      preview,
+      isProtectionSettled: (offset) =>
+        offset < settleBefore || isInsideSettledBlockCode(offset, text, context.codeRegions()),
+    });
+  const activation = new RegExp(plainToolCallActivationTokens.map(escapeRegExp).join("|"), "i");
+  const overlap = Math.max(...plainToolCallActivationTokens.map((token) => token.length - 1));
+  const braceProbe = createPlainTextToolCallBraceProbe(preview);
+  let active = false;
+  let tail = "";
+  return createConditionalTextProjector(
+    plainToolCallTransform,
+    (input) => {
+      if (!active) {
+        const appended = tail + (input.delta ?? input.text);
+        active = activation.test(appended) || braceProbe(input.delta ?? input.text);
+        tail = !active && overlap ? appended.slice(-overlap) : "";
+      }
+      return active;
+    },
+    checkpoint,
+  );
+}
+
+export const plainToolCallTextFilter: TextFilter = {
+  transform: plainToolCallTransform,
+  create: createPlainToolCallTextProjector,
+};
+
+/** Channel previews share the call grammar, but cannot expose its provisional tail. */
+export const plainToolCallPreviewTextFilter: TextFilter = {
+  transform: plainToolCallTransform,
+  create: () => createPlainToolCallTextProjector(true),
+};
+
+/**
+ * Settlement of a plain-text tool-call candidate at the end of visible text. Streaming may
+ * publish that tail and retract it later through a replacement, but block replies
+ * (already-delivered chat messages) cannot be retracted, so their drain waits until the
+ * candidate settles.
+ */
+export function hasUnsettledPlainTextToolCall(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  const projected = projectPlainTextToolCallBlocks(text, {
+    resolveProtectedRanges: findCodeRegions,
+  });
+  return projected.unsettled;
 }
 
 export function sanitizeAssistantVisibleTextWithProfile(
   text: string,
   profile: AssistantVisibleTextSanitizerProfile = "delivery",
+  streaming = false,
 ): string {
-  return applyAssistantVisibleTextStagePipeline(
-    text,
-    ASSISTANT_VISIBLE_TEXT_PIPELINE_OPTIONS[profile],
-  );
-}
-
-export function stripAssistantInternalScaffolding(text: string): string {
-  return sanitizeAssistantVisibleTextWithProfile(text, "internal-scaffolding");
+  return applyTextFilters(text, assistantVisibleTextFilters(profile, streaming));
 }
 
 /**

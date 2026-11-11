@@ -1,87 +1,71 @@
-import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { resolveLanceDbDependencySpec } from "./lancedb-runtime.js";
+import { afterEach, assert, expect, test, vi } from "vitest";
 
-function mapReader(
-  entries: ReadonlyArray<[string, { dependencies?: Record<string, string> } | null]>,
-): (manifestPath: string) => { dependencies?: Record<string, string> } | null {
-  const byPath = new Map(
-    entries.map(([manifestPath, value]) => [path.normalize(manifestPath), value]),
-  );
-  return (manifestPath: string) => byPath.get(path.normalize(manifestPath)) ?? null;
+type LoaderModule = typeof import("./lancedb-runtime.js");
+
+async function loadRuntimeForHost(platform: NodeJS.Platform, arch: NodeJS.Architecture) {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  const archDescriptor = Object.getOwnPropertyDescriptor(process, "arch");
+  if (!platformDescriptor || !archDescriptor) {
+    throw new Error("Expected native process platform and architecture descriptors");
+  }
+  vi.resetModules();
+  try {
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: platform });
+    Object.defineProperty(process, "arch", { ...archDescriptor, value: arch });
+    // Capture the synthetic host only during module load.
+    return await vi.importActual<LoaderModule>("./lancedb-runtime.js");
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor);
+    Object.defineProperty(process, "arch", archDescriptor);
+  }
 }
 
-describe("resolveLanceDbDependencySpec", () => {
-  it("reads dependency from source-layout sibling manifest", () => {
-    const modulePath = path.join("/repo/extensions/memory-lancedb", "lancedb-runtime.js");
-    const packagePath = path.join("/repo/extensions/memory-lancedb", "package.json");
-    const readPackageJson = mapReader([
-      [
-        packagePath,
-        {
-          dependencies: { "@lancedb/lancedb": "^0.27.1" },
-        },
-      ],
-    ]);
+afterEach(() => {
+  vi.doUnmock("@lancedb/lancedb");
+  vi.resetModules();
+});
 
-    expect(resolveLanceDbDependencySpec(modulePath, readPackageJson)).toBe("^0.27.1");
+test("uses the bundled module when it is already available", async () => {
+  const connect = vi.fn();
+  const importBundled = vi.fn(() => ({ connect }));
+  vi.doMock("@lancedb/lancedb", importBundled);
+  const { loadLanceDbModule } = await loadRuntimeForHost("linux", "x64");
+  expect(importBundled).not.toHaveBeenCalled();
+  const [first, concurrent] = await Promise.all([loadLanceDbModule(), loadLanceDbModule()]);
+  expect(first.connect).toBe(connect);
+  expect(concurrent).toBe(first);
+  expect(importBundled).toHaveBeenCalledTimes(1);
+
+  const replacementConnect = vi.fn();
+  vi.doMock("@lancedb/lancedb", () => ({ connect: replacementConnect }));
+  const replacement = await import("@lancedb/lancedb");
+  expect(replacement.connect).toBe(replacementConnect);
+  expect(replacement).not.toBe(first);
+  // Replacement distinguishes the owner cache from Vite's module cache.
+  expect((await loadLanceDbModule()) === first).toBe(true);
+});
+
+test.each([
+  ["darwin", "memory-lancedb: LanceDB runtime is unavailable on darwin-x64."],
+  ["linux", "memory-lancedb: bundled @lancedb/lancedb dependency is unavailable."],
+] as const)("handles an unavailable %s runtime", async (platform, diagnostic) => {
+  const dependencyFailure = new Error("dependency unavailable");
+  vi.doMock("@lancedb/lancedb", () => {
+    throw dependencyFailure;
   });
-
-  it("falls back to dist/extensions memory-lancedb manifest for flattened bundles", () => {
-    const modulePath = path.join(
-      "/usr/lib/node_modules/openclaw/dist",
-      "lancedb-runtime-3m75WU-W.js",
-    );
-    const distPackagePath = path.join("/usr/lib/node_modules/openclaw/dist", "package.json");
-    const extensionPackagePath = path.join(
-      "/usr/lib/node_modules/openclaw/dist/extensions/memory-lancedb",
-      "package.json",
-    );
-    const readPackageJson = mapReader([
-      [distPackagePath, { dependencies: {} }],
-      [
-        extensionPackagePath,
-        {
-          dependencies: { "@lancedb/lancedb": "^0.27.1" },
-        },
-      ],
-    ]);
-
-    expect(resolveLanceDbDependencySpec(modulePath, readPackageJson)).toBe("^0.27.1");
-  });
-
-  it("walks parent directories to support nested dist chunk paths", () => {
-    const modulePath = path.join(
-      "/usr/lib/node_modules/openclaw/dist/chunks/runtime",
-      "lancedb-runtime-3m75WU-W.js",
-    );
-    const extensionPackagePath = path.join(
-      "/usr/lib/node_modules/openclaw/dist/extensions/memory-lancedb",
-      "package.json",
-    );
-    const readPackageJson = mapReader([
-      [
-        extensionPackagePath,
-        {
-          dependencies: { "@lancedb/lancedb": "0.27.2" },
-        },
-      ],
-    ]);
-
-    expect(resolveLanceDbDependencySpec(modulePath, readPackageJson)).toBe("0.27.2");
-  });
-
-  it("throws when no candidate package manifest declares @lancedb/lancedb", () => {
-    const modulePath = path.join(
-      "/usr/lib/node_modules/openclaw/dist",
-      "lancedb-runtime-3m75WU-W.js",
-    );
-    const readPackageJson = mapReader([
-      [path.join("/usr/lib/node_modules/openclaw/dist", "package.json"), null],
-    ]);
-
-    expect(() => resolveLanceDbDependencySpec(modulePath, readPackageJson)).toThrow(
-      'memory-lancedb package.json is missing "@lancedb/lancedb"',
-    );
-  });
+  const { loadLanceDbModule } = await loadRuntimeForHost(platform, "x64");
+  const error = await loadLanceDbModule().catch((cause: unknown) => cause);
+  expect(error).toHaveProperty("message", expect.stringContaining(diagnostic));
+  assert(error && typeof error === "object" && "cause" in error);
+  const importFailure = error.cause;
+  assert(importFailure && typeof importFailure === "object" && "cause" in importFailure);
+  expect(importFailure.cause).toBe(dependencyFailure);
+  if (platform === "linux") {
+    const connect = vi.fn();
+    vi.doMock("@lancedb/lancedb", () => ({ connect }));
+    const available = await import("@lancedb/lancedb");
+    expect(available.connect).toBe(connect);
+    // Do not reset the SUT: that would mask a sticky rejection.
+    expect(await loadLanceDbModule()).toBe(available);
+  }
 });

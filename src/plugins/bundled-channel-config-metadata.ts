@@ -1,8 +1,12 @@
-import fs from "node:fs";
+/** Loads bundled channel config schema metadata from source or public surface modules. */
 import path from "node:path";
-import { createJiti } from "jiti";
-import { buildChannelConfigSchema } from "../channels/plugins/config-schema.js";
+import {
+  buildChannelConfigSchema,
+  buildJsonChannelConfigSchema,
+} from "../channels/plugins/config-schema.js";
 import type { ChannelConfigRuntimeSchema } from "../channels/plugins/types.config.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import type { JsonSchemaObject } from "../shared/json-schema.types.js";
 import {
   normalizeBundledPluginStringList,
   trimBundledPluginString,
@@ -13,26 +17,24 @@ import type {
   PluginManifest,
   PluginManifestChannelConfig,
 } from "./manifest.js";
-import { buildPluginLoaderJitiOptions, resolvePluginLoaderJitiConfig } from "./sdk-alias.js";
+import { PUBLIC_SURFACE_SOURCE_EXTENSIONS } from "./package-entrypoints.js";
+import { pluginCacheExistsSync } from "./plugin-cache-files.js";
+import { getCachedPluginModuleLoader } from "./plugin-module-loader-cache.js";
 
-const PUBLIC_SURFACE_SOURCE_EXTENSIONS = [".ts", ".mts", ".js", ".mjs", ".cts", ".cjs"] as const;
-const SOURCE_CONFIG_SCHEMA_CANDIDATES = [
-  path.join("src", "config-schema.ts"),
-  path.join("src", "config-schema.js"),
-  path.join("src", "config-schema.mts"),
-  path.join("src", "config-schema.mjs"),
-  path.join("src", "config-schema.cts"),
-  path.join("src", "config-schema.cjs"),
-] as const;
-const PUBLIC_CONFIG_SURFACE_BASENAMES = ["channel-config-api", "runtime-api", "api"] as const;
+const log = createSubsystemLogger("plugins");
+
+const CONFIG_SCHEMA_CANDIDATES = [
+  ...[".ts", ".js", ".mts", ".mjs", ".cts", ".cjs"].map((extension) =>
+    path.join("src", `config-schema${extension}`),
+  ),
+  ...PUBLIC_SURFACE_SOURCE_EXTENSIONS.map((extension) => `channel-config-api${extension}`),
+];
 
 type ChannelConfigSurface = {
-  schema: Record<string, unknown>;
+  schema: JsonSchemaObject;
   uiHints?: Record<string, PluginConfigUiHint>;
   runtime?: ChannelConfigRuntimeSchema;
 };
-
-const jitiLoaders = new Map<string, ReturnType<typeof createJiti>>();
 
 function isBuiltChannelConfigSchema(value: unknown): value is ChannelConfigSurface {
   if (!value || typeof value !== "object") {
@@ -40,6 +42,24 @@ function isBuiltChannelConfigSchema(value: unknown): value is ChannelConfigSurfa
   }
   const candidate = value as { schema?: unknown };
   return Boolean(candidate.schema && typeof candidate.schema === "object");
+}
+
+function isJsonSchemaConfigSurface(value: unknown): value is JsonSchemaObject {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.safeParse === "function" || typeof candidate.toJSONSchema === "function") {
+    return false;
+  }
+  return (
+    typeof candidate.type === "string" ||
+    Array.isArray(candidate.anyOf) ||
+    Array.isArray(candidate.oneOf) ||
+    Array.isArray(candidate.allOf) ||
+    Array.isArray(candidate.enum) ||
+    Object.hasOwn(candidate, "const")
+  );
 }
 
 function resolveConfigSchemaExport(imported: Record<string, unknown>): ChannelConfigSurface | null {
@@ -56,62 +76,38 @@ function resolveConfigSchemaExport(imported: Record<string, unknown>): ChannelCo
     if (isBuiltChannelConfigSchema(value)) {
       return value;
     }
+    if (isJsonSchemaConfigSurface(value)) {
+      return buildJsonChannelConfigSchema(value);
+    }
     if (value && typeof value === "object") {
       return buildChannelConfigSchema(value as never);
     }
   }
 
-  for (const value of Object.values(imported)) {
-    if (isBuiltChannelConfigSchema(value)) {
-      return value;
-    }
-  }
-
-  return null;
-}
-
-function getJiti(modulePath: string) {
-  const { tryNative, aliasMap, cacheKey } = resolvePluginLoaderJitiConfig({
-    modulePath,
-    argv1: process.argv[1],
-    moduleUrl: import.meta.url,
-    preferBuiltDist: true,
-  });
-  const cached = jitiLoaders.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-  const loader = createJiti(import.meta.url, {
-    ...buildPluginLoaderJitiOptions(aliasMap),
-    tryNative,
-  });
-  jitiLoaders.set(cacheKey, loader);
-  return loader;
+  return Object.values(imported).find(isBuiltChannelConfigSchema) ?? null;
 }
 
 function resolveChannelConfigSchemaModulePath(pluginDir: string): string | undefined {
-  for (const relativePath of SOURCE_CONFIG_SCHEMA_CANDIDATES) {
-    const candidate = path.join(pluginDir, relativePath);
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  for (const basename of PUBLIC_CONFIG_SURFACE_BASENAMES) {
-    for (const extension of PUBLIC_SURFACE_SOURCE_EXTENSIONS) {
-      const candidate = path.join(pluginDir, `${basename}${extension}`);
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
-    }
-  }
-  return undefined;
+  return CONFIG_SCHEMA_CANDIDATES.map((relativePath) => path.join(pluginDir, relativePath)).find(
+    pluginCacheExistsSync,
+  );
 }
 
 function loadChannelConfigSurfaceModuleSync(modulePath: string): ChannelConfigSurface | null {
   try {
-    const imported = getJiti(modulePath)(modulePath) as Record<string, unknown>;
+    const load = getCachedPluginModuleLoader({
+      modulePath,
+      importerUrl: import.meta.url,
+      preferBuiltDist: true,
+      loaderFilename: import.meta.url,
+    });
+    const imported = load(modulePath) as Record<string, unknown>;
     return resolveConfigSchemaExport(imported);
-  } catch {
+  } catch (error) {
+    log.warn(
+      `Unable to load bundled channel config metadata from ${modulePath}; using manifest metadata`,
+      { error },
+    );
     return null;
   }
 }
@@ -124,7 +120,7 @@ function resolvePackageChannelMeta(
   return channelMeta?.id?.trim() === channelId ? channelMeta : undefined;
 }
 
-export function collectBundledChannelConfigs(params: {
+export function collectBundledChannelConfigsCore(params: {
   pluginDir: string;
   manifest: PluginManifest;
   packageManifest?: OpenClawPackageManifest;
@@ -145,46 +141,30 @@ export function collectBundledChannelConfigs(params: {
     const existing = existingChannelConfigs[channelId];
     const channelMeta = resolvePackageChannelMeta(params.packageManifest, channelId);
     const preferOver = normalizeBundledPluginStringList(channelMeta?.preferOver);
-    const uiHints: Record<string, PluginConfigUiHint> | undefined =
-      surface?.uiHints || existing?.uiHints
-        ? {
-            ...(surface?.uiHints && Object.keys(surface.uiHints).length > 0 ? surface.uiHints : {}),
-            ...(existing?.uiHints && Object.keys(existing.uiHints).length > 0
-              ? existing.uiHints
-              : {}),
-          }
-        : undefined;
+    const uiHints = { ...surface?.uiHints, ...existing?.uiHints };
 
     if (!surface?.schema && !existing?.schema) {
       continue;
     }
+    const runtime = surface?.runtime ?? existing?.runtime;
+    const label =
+      trimBundledPluginString(existing?.label) ?? trimBundledPluginString(channelMeta?.label);
+    const description =
+      trimBundledPluginString(existing?.description) ?? trimBundledPluginString(channelMeta?.blurb);
+    const commands = existing?.commands ?? channelMeta?.commands;
 
     existingChannelConfigs[channelId] = {
       schema: surface?.schema ?? existing?.schema ?? {},
-      ...(uiHints && Object.keys(uiHints).length > 0 ? { uiHints } : {}),
-      ...((surface?.runtime ?? existing?.runtime)
-        ? { runtime: surface?.runtime ?? existing?.runtime }
-        : {}),
-      ...((trimBundledPluginString(existing?.label) ?? trimBundledPluginString(channelMeta?.label))
-        ? {
-            label:
-              trimBundledPluginString(existing?.label) ??
-              trimBundledPluginString(channelMeta?.label)!,
-          }
-        : {}),
-      ...((trimBundledPluginString(existing?.description) ??
-      trimBundledPluginString(channelMeta?.blurb))
-        ? {
-            description:
-              trimBundledPluginString(existing?.description) ??
-              trimBundledPluginString(channelMeta?.blurb)!,
-          }
-        : {}),
+      ...(Object.keys(uiHints).length > 0 ? { uiHints } : {}),
+      ...(runtime ? { runtime } : {}),
+      ...(label ? { label } : {}),
+      ...(description ? { description } : {}),
       ...(existing?.preferOver?.length
         ? { preferOver: existing.preferOver }
         : preferOver.length > 0
           ? { preferOver }
           : {}),
+      ...(commands ? { commands } : {}),
     };
   }
 

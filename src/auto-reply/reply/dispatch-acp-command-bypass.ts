@@ -1,65 +1,33 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import {
-  isCommandEnabled,
-  maybeResolveTextAlias,
-  shouldHandleTextCommands,
-} from "../commands-registry.js";
-import type { FinalizedMsgContext } from "../templating.js";
-
-function resolveFirstContextText(
-  ctx: FinalizedMsgContext,
-  keys: Array<"BodyForAgent" | "BodyForCommands" | "CommandBody" | "RawBody" | "Body">,
-): string {
-  for (const key of keys) {
-    const value = ctx[key];
-    if (typeof value === "string") {
-      return value;
-    }
-  }
-  return "";
-}
-
-function resolveCommandCandidateText(ctx: FinalizedMsgContext): string {
-  return resolveFirstContextText(ctx, ["CommandBody", "BodyForCommands", "RawBody", "Body"]).trim();
-}
-
-function isResetCommandCandidate(text: string): boolean {
-  return /^\/(?:new|reset)(?:\s|$)/i.test(text);
-}
+import { hasControlCommand } from "../command-detection.js";
+import { isCommandEnabled } from "../commands-registry-list.js";
+import { shouldHandleTextCommands } from "../commands-text-routing.js";
+import type { FinalizedRuntimeMsgContext } from "../templating.js";
+import { resolveCommandContextText } from "./context-text.js";
 
 export function shouldBypassAcpDispatchForCommand(
-  ctx: FinalizedMsgContext,
+  ctx: FinalizedRuntimeMsgContext,
   cfg: OpenClawConfig,
 ): boolean {
-  const candidate = resolveCommandCandidateText(ctx);
+  const candidate = resolveCommandContextText(ctx);
   if (!candidate) {
     return false;
   }
-  const normalized = candidate.trim();
   const allowTextCommands = shouldHandleTextCommands({
     cfg,
     surface: ctx.Surface ?? ctx.Provider ?? "",
     commandSource: ctx.CommandSource,
   });
-  if (!normalized.startsWith("/") && maybeResolveTextAlias(candidate, cfg) != null) {
-    return allowTextCommands;
-  }
-
-  if (isResetCommandCandidate(normalized)) {
+  if (/^\/(?:new|reset|acp)(?:\s|$)/i.test(candidate)) {
     return true;
   }
 
-  if (!normalized.startsWith("!")) {
-    return false;
+  if (hasControlCommand(candidate, cfg)) {
+    return allowTextCommands;
   }
 
-  if (!ctx.CommandAuthorized) {
+  if (!candidate.startsWith("!") || !ctx.CommandAuthorized || !isCommandEnabled(cfg, "bash")) {
     return false;
   }
-
-  if (!isCommandEnabled(cfg, "bash")) {
-    return false;
-  }
-
   return allowTextCommands;
 }

@@ -1,55 +1,90 @@
+/** Public cron service interface shared by callers and implementations. */
+import type {
+  CronEventRunOptions,
+  CronEventRunResult,
+  CronEventSourceSnapshot,
+} from "./event-source.js";
+import type { CronListPageOptions, CronListPageResult } from "./service/list-page-types.js";
 import type {
   CronAddInput,
+  CronAddOptions,
   CronAddResult,
+  CronCommitGuardOptions,
   CronListResult,
   CronRemoveResult,
+  CronRemoveOptions,
   CronRunMode,
   CronRunResult,
   CronStatusSummary,
   CronUpdateInput,
+  CronUpdateOptions,
+  CronUpdatePrecondition,
   CronUpdateResult,
   CronWakeMode,
 } from "./service/state.js";
-import type { CronJob } from "./types.js";
+import type { CronDelivery, CronJob, CronPayload, CronStoredJob } from "./types.js";
 
-type CronJobsEnabledFilter = "all" | "enabled" | "disabled";
-type CronJobsSortBy = "nextRunAtMs" | "updatedAtMs" | "name";
-type CronSortDir = "asc" | "desc";
+type CronWakeResult = { ok: true } | { ok: false; reason?: string };
 
-export type CronListPageOptions = {
-  includeDisabled?: boolean;
-  limit?: number;
-  offset?: number;
-  query?: string;
-  enabled?: CronJobsEnabledFilter;
-  sortBy?: CronJobsSortBy;
-  sortDir?: CronSortDir;
+/** Result shape for direct/queued cron runs. */
+export type CronServiceRunResult = CronRunResult;
+export type CronServiceRunOptions = {
+  payload?: CronPayload;
+  /** Per-occurrence routing; stored delivery policy remains authoritative. */
+  delivery?: Partial<
+    Pick<CronDelivery, "mode" | "target" | "channel" | "to" | "threadId" | "accountId">
+  >;
+  /** Internal event-source runs keep their persisted trigger on force execution. */
+  evaluateTrigger?: boolean;
+  /** Current stream batch exposed to trigger scripts as trigger.streamBatch. */
+  streamBatch?: string;
+  /** Source schedule identity checked under the cron store lock before admission. */
+  streamScheduleKey?: string;
+  /** Logical source identity; rejects retired batches under same-schedule ABA. */
+  streamSourceIdentity?: string;
+  onTriggerDisposition?: (disposition: "fired" | "dropped" | "busy" | "error") => void;
+  /** Synchronous caller-authority guard consumed before run reservation. */
+  commitGuard?: () => void;
 };
 
-export type CronListPageResult = {
-  jobs: CronJob[];
-  total: number;
-  offset: number;
-  limit: number;
-  hasMore: boolean;
-  nextOffset: number | null;
-};
-
-export type CronWakeResult = { ok: true } | { ok: false };
-
-export type CronServiceRunResult = CronRunResult | { ok: true; ran: false; reason: "invalid-spec" };
-
+/** Public cron service facade used by gateway, plugin SDK, and tests. */
 export interface CronServiceContract {
+  readEventSources(source: string): Promise<CronEventSourceSnapshot[]>;
+  runEvent(id: string, opts: CronEventRunOptions): Promise<CronEventRunResult>;
   start(): Promise<void>;
   stop(): void;
   status(): Promise<CronStatusSummary>;
   list(opts?: { includeDisabled?: boolean }): Promise<CronListResult>;
-  listPage(opts?: CronListPageOptions): Promise<CronListPageResult>;
-  add(input: CronAddInput): Promise<CronAddResult>;
-  update(id: string, patch: CronUpdateInput): Promise<CronUpdateResult>;
-  remove(id: string): Promise<CronRemoveResult>;
-  run(id: string, mode?: CronRunMode): Promise<CronServiceRunResult>;
-  enqueueRun(id: string, mode?: CronRunMode): Promise<CronServiceRunResult>;
-  getJob(id: string): CronJob | undefined;
-  wake(opts: { mode: CronWakeMode; text: string }): CronWakeResult;
+  /** The in-process predicate runs under the store lock and must not mutate borrowed jobs. */
+  listPage(
+    opts?: CronListPageOptions,
+    matchesJob?: (job: CronJob) => boolean,
+  ): Promise<CronListPageResult>;
+  add(input: CronAddInput, opts?: CronAddOptions): Promise<CronAddResult>;
+  update(id: string, patch: CronUpdateInput, opts?: CronUpdateOptions): Promise<CronUpdateResult>;
+  updateWithPrecondition(
+    id: string,
+    patch: CronUpdateInput,
+    precondition: CronUpdatePrecondition,
+    opts?: CronUpdateOptions,
+  ): Promise<CronUpdateResult>;
+  remove(id: string, opts?: CronRemoveOptions): Promise<CronRemoveResult>;
+  run(id: string, mode?: CronRunMode, opts?: CronServiceRunOptions): Promise<CronServiceRunResult>;
+  enqueueRun(
+    id: string,
+    mode?: CronRunMode,
+    opts?: CronCommitGuardOptions,
+  ): Promise<CronServiceRunResult>;
+  getJob(id: string): CronStoredJob | undefined;
+  readJob(id: string): Promise<CronStoredJob | undefined>;
+  getDefaultAgentId(): string | undefined;
+  wake(opts: {
+    expectedTarget?: import("../auto-reply/reply/session-event-contract.js").SessionEventTarget;
+    createIfMissing?: true;
+    mode: CronWakeMode;
+    text: string;
+    sessionKey?: string;
+    agentId?: string;
+    commitGuard?: () => void;
+  }): Promise<CronWakeResult>;
 }

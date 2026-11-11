@@ -1,160 +1,153 @@
+// Runtime registry loader assembles process-root plugin runtimes from config metadata.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { listAgentEntries } from "../../agents/agent-scope-config.js";
+import { captureRuntimeConfigAsyncReader } from "../../config/io.runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { withActivatedPluginIds } from "../activation-context.js";
 import {
   resolveChannelPluginIds,
-  resolveConfiguredChannelPluginIds,
+  resolveConfiguredChannelPluginIdsAsync,
 } from "../channel-plugin-ids.js";
-import { loadOpenClawPlugins } from "../loader.js";
-import {
-  hasExplicitPluginIdScope,
-  hasNonEmptyPluginIdScope,
-  normalizePluginIdScope,
-} from "../plugin-scope.js";
-import { getActivePluginRegistry } from "../runtime.js";
-import {
-  buildPluginRuntimeLoadOptionsFromValues,
-  resolvePluginRuntimeLoadContext,
-} from "./load-context.js";
+import { normalizePluginsConfig } from "../config-state.js";
+import { resolveEffectivePluginIdsAsync } from "../effective-plugin-ids.js";
+import { collectConfiguredMemoryEmbeddingProviderIds } from "../gateway-startup-plugin-ids.js";
+import { createInstalledPluginIndexScopeLookup } from "../installed-plugin-index-scope-lookup.js";
+import { loadAndActivateRootPluginRegistry } from "../loader.js";
+import { hasNonEmptyPluginIdScope } from "../plugin-scope.js";
+import { buildPluginRuntimeLoadOptions } from "./load-context.js";
+import { resolvePluginRuntimeLoadContext } from "./load-context.resolve.js";
 
-let pluginRegistryLoaded: "none" | "configured-channels" | "channels" | "all" = "none";
+export type PluginRegistryScope =
+  | "configured-channels"
+  | "channels"
+  | "memory"
+  | "sandbox-backends"
+  | "all";
 
-export type PluginRegistryScope = "configured-channels" | "channels" | "all";
+// Core-owned backends must keep their registry ownership if a plugin reuses an id.
+const CORE_SANDBOX_BACKEND_IDS = new Set(["docker", "podman", "ssh"]);
 
-function scopeRank(scope: typeof pluginRegistryLoaded): number {
-  switch (scope) {
-    case "none":
-      return 0;
-    case "configured-channels":
-      return 1;
-    case "channels":
-      return 2;
-    case "all":
-      return 3;
-  }
-  throw new Error("Unsupported plugin registry scope");
-}
-
-function activeRegistrySatisfiesScope(
-  scope: PluginRegistryScope,
-  active: ReturnType<typeof getActivePluginRegistry>,
-  expectedChannelPluginIds: readonly string[],
-  requestedPluginIds: readonly string[] | undefined,
-): boolean {
-  if (!active) {
-    return false;
-  }
-  if (requestedPluginIds !== undefined) {
-    if (requestedPluginIds.length === 0) {
-      return false;
+function resolveMemoryPluginIds(
+  context: ReturnType<typeof resolvePluginRuntimeLoadContext>,
+): string[] {
+  const configuredProviderIds = [
+    ...collectConfiguredMemoryEmbeddingProviderIds(context.activationSourceConfig),
+  ];
+  const pluginIds = new Set<string>();
+  if (context.metadataSnapshot) {
+    createInstalledPluginIndexScopeLookup(
+      context.metadataSnapshot.index,
+    ).addProviderContributionOwners(pluginIds, configuredProviderIds);
+  } else {
+    for (const providerId of configuredProviderIds) {
+      pluginIds.add(providerId);
     }
-    const activePluginIds = new Set(
-      active.plugins.filter((plugin) => plugin.status === "loaded").map((plugin) => plugin.id),
-    );
-    return requestedPluginIds.every((pluginId) => activePluginIds.has(pluginId));
   }
-  const activeChannelPluginIds = new Set(active.channels.map((entry) => entry.plugin.id));
-  switch (scope) {
-    case "configured-channels":
-    case "channels":
-      return (
-        active.channels.length > 0 &&
-        expectedChannelPluginIds.every((pluginId) => activeChannelPluginIds.has(pluginId))
-      );
-    case "all":
-      return false;
+  const memoryPluginId = normalizePluginsConfig(context.config.plugins).slots.memory?.trim();
+  if (memoryPluginId) {
+    pluginIds.add(memoryPluginId);
   }
-  throw new Error("Unsupported plugin registry scope");
+  return [...pluginIds].toSorted();
 }
 
-function shouldForwardChannelScope(params: {
-  scope: PluginRegistryScope;
-  scopedLoad: boolean;
-}): boolean {
-  return !params.scopedLoad && params.scope === "configured-channels";
+function resolveSandboxBackendPluginIds(
+  context: ReturnType<typeof resolvePluginRuntimeLoadContext>,
+  persistedBackendIds: readonly string[] = [],
+): string[] {
+  if (!context.metadataSnapshot) {
+    return [];
+  }
+  const agents = context.activationSourceConfig.agents;
+  const configuredBackendIds = [
+    agents?.defaults?.sandbox?.backend,
+    ...listAgentEntries(context.activationSourceConfig).map((agent) => agent.sandbox?.backend),
+    ...persistedBackendIds,
+  ];
+  const lookup = createInstalledPluginIndexScopeLookup(context.metadataSnapshot.index);
+  const pluginIds = new Set<string>();
+  for (const backendId of configuredBackendIds) {
+    const normalizedBackendId = normalizeOptionalLowercaseString(backendId);
+    if (
+      !normalizedBackendId ||
+      CORE_SANDBOX_BACKEND_IDS.has(normalizedBackendId) ||
+      !lookup.hasInstalledPluginIds([normalizedBackendId])
+    ) {
+      continue;
+    }
+    // Backend ids have no manifest ownership contract; only an exact installed plugin id is safe.
+    pluginIds.add(lookup.normalizePluginId(normalizedBackendId));
+  }
+  return [...pluginIds].toSorted();
 }
 
-export function ensurePluginRegistryLoaded(options?: {
+export async function ensurePluginRegistryLoaded(options?: {
   scope?: PluginRegistryScope;
   config?: OpenClawConfig;
   activationSourceConfig?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
-  onlyPluginIds?: string[];
-}): void {
+  workspaceDir?: string;
+  persistedSandboxBackendIds?: readonly string[];
+}): Promise<void> {
   const scope = options?.scope ?? "all";
-  const requestedPluginIds = normalizePluginIdScope(options?.onlyPluginIds);
-  const scopedLoad = hasExplicitPluginIdScope(requestedPluginIds);
-  const context = resolvePluginRuntimeLoadContext(options);
-  const expectedChannelPluginIds = scopedLoad
-    ? (requestedPluginIds ?? [])
-    : scope === "configured-channels"
-      ? resolveConfiguredChannelPluginIds({
-          config: context.config,
-          activationSourceConfig: context.activationSourceConfig,
-          workspaceDir: context.workspaceDir,
-          env: context.env,
-        })
-      : scope === "channels"
-        ? resolveChannelPluginIds({
-            config: context.config,
-            workspaceDir: context.workspaceDir,
-            env: context.env,
-          })
-        : [];
-  const active = getActivePluginRegistry();
-  if (
-    !scopedLoad &&
-    scopeRank(pluginRegistryLoaded) >= scopeRank(scope) &&
-    activeRegistrySatisfiesScope(scope, active, expectedChannelPluginIds, undefined)
-  ) {
-    return;
+  const context = resolvePluginRuntimeLoadContext({
+    ...options,
+    config: options?.config ?? (await captureRuntimeConfigAsyncReader()()),
+  });
+  let pluginIds: string[];
+  switch (scope) {
+    case "configured-channels":
+      pluginIds = await resolveConfiguredChannelPluginIdsAsync({
+        config: context.config,
+        activationSourceConfig: context.activationSourceConfig,
+        workspaceDir: context.workspaceDir,
+        env: context.env,
+      });
+      break;
+    case "channels":
+      pluginIds = resolveChannelPluginIds({
+        config: context.config,
+        workspaceDir: context.workspaceDir,
+        env: context.env,
+      });
+      break;
+    case "memory":
+      // Memory CLI commands must use the same backend and embedding adapters as
+      // Gateway, without activating unrelated explicitly enabled plugins.
+      pluginIds = resolveMemoryPluginIds(context);
+      break;
+    case "sandbox-backends":
+      pluginIds = resolveSandboxBackendPluginIds(context, options?.persistedSandboxBackendIds);
+      break;
+    default:
+      pluginIds = await resolveEffectivePluginIdsAsync({
+        config: context.rawConfig,
+        workspaceDir: context.workspaceDir,
+        env: context.env,
+      });
   }
-  if (
-    (pluginRegistryLoaded === "none" || scopedLoad) &&
-    activeRegistrySatisfiesScope(scope, active, expectedChannelPluginIds, requestedPluginIds)
-  ) {
-    if (!scopedLoad) {
-      pluginRegistryLoaded = scope;
-    }
-    return;
-  }
-  const scopedConfig =
-    !scopedLoad && scope === "configured-channels" && expectedChannelPluginIds.length > 0
-      ? (withActivatedPluginIds({
-          config: context.config,
-          pluginIds: expectedChannelPluginIds,
-        }) ?? context.config)
-      : context.config;
-  const scopedActivationSourceConfig =
-    !scopedLoad && scope === "configured-channels" && expectedChannelPluginIds.length > 0
-      ? (withActivatedPluginIds({
-          config: context.activationSourceConfig,
-          pluginIds: expectedChannelPluginIds,
-        }) ?? context.activationSourceConfig)
-      : context.activationSourceConfig;
-  loadOpenClawPlugins(
-    buildPluginRuntimeLoadOptionsFromValues(
-      {
-        ...context,
-        config: scopedConfig,
-        activationSourceConfig: scopedActivationSourceConfig,
-      },
+  const activateConfigured = scope === "configured-channels" && pluginIds.length > 0;
+  const config = activateConfigured
+    ? (withActivatedPluginIds({ config: context.config, pluginIds }) ?? context.config)
+    : context.config;
+  const activationSourceConfig = activateConfigured
+    ? (withActivatedPluginIds({
+        config: context.activationSourceConfig,
+        pluginIds,
+      }) ?? context.activationSourceConfig)
+    : context.activationSourceConfig;
+  await loadAndActivateRootPluginRegistry(
+    buildPluginRuntimeLoadOptions(
+      { ...context, config, activationSourceConfig },
       {
         throwOnLoadError: true,
-        ...(hasExplicitPluginIdScope(requestedPluginIds) ||
-        shouldForwardChannelScope({ scope, scopedLoad }) ||
-        hasNonEmptyPluginIdScope(expectedChannelPluginIds)
-          ? { onlyPluginIds: expectedChannelPluginIds }
+        ...(scope === "configured-channels" ||
+        scope === "memory" ||
+        scope === "sandbox-backends" ||
+        scope === "all" ||
+        hasNonEmptyPluginIdScope(pluginIds)
+          ? { onlyPluginIds: pluginIds }
           : {}),
       },
     ),
   );
-  if (!scopedLoad) {
-    pluginRegistryLoaded = scope;
-  }
 }
-
-export const __testing = {
-  resetPluginRegistryLoadedForTests(): void {
-    pluginRegistryLoaded = "none";
-  },
-};

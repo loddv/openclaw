@@ -1,56 +1,104 @@
-const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
+import { createPersistentDedupeCache } from "openclaw/plugin-sdk/dedupe-runtime";
+import { sha256Hex } from "openclaw/plugin-sdk/node-crypto-runtime";
+import { createPluginStateErrorReporter } from "openclaw/plugin-sdk/plugin-state-runtime";
+import { getOptionalMSTeamsRuntime } from "./runtime.js";
+
+const TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_ENTRIES = 20_000;
+const PERSISTENT_MAX_ENTRIES = 1000;
+const PERSISTENT_NAMESPACE = "msteams.sent-messages";
 const MSTEAMS_SENT_MESSAGES_KEY = Symbol.for("openclaw.msteamsSentMessages");
 
-let sentMessageCache: Map<string, Map<string, number>> | undefined;
+type MSTeamsSentMessageRecord = {
+  sentAt: number;
+};
 
-function getSentMessageCache(): Map<string, Map<string, number>> {
-  if (!sentMessageCache) {
-    const globalStore = globalThis as Record<PropertyKey, unknown>;
-    sentMessageCache =
-      (globalStore[MSTEAMS_SENT_MESSAGES_KEY] as Map<string, Map<string, number>> | undefined) ??
-      new Map<string, Map<string, number>>();
-    globalStore[MSTEAMS_SENT_MESSAGES_KEY] = sentMessageCache;
-  }
-  return sentMessageCache;
+type MSTeamsSentMessageScope = {
+  accountId?: string | null;
+  botId?: string;
+};
+
+const namedAccountCaches = new Map<
+  string,
+  ReturnType<typeof createPersistentDedupeCache<MSTeamsSentMessageRecord>>
+>();
+
+function createSentMessageCache(accountId: string) {
+  const isDefault = accountId === "default";
+  const accountDigest = isDefault ? undefined : sha256Hex(accountId);
+  return createPersistentDedupeCache<MSTeamsSentMessageRecord>({
+    globalKey: isDefault
+      ? MSTEAMS_SENT_MESSAGES_KEY
+      : Symbol.for(`openclaw.msteamsSentMessages.account.v1.${accountDigest}`),
+    ttlMs: TTL_MS,
+    maxSize: MAX_ENTRIES,
+    persistent: {
+      // Each named account owns its retention budget; keep the shipped default namespace intact.
+      namespace: isDefault
+        ? PERSISTENT_NAMESPACE
+        : `${PERSISTENT_NAMESPACE}.account.v1.${accountDigest}`,
+      maxEntries: PERSISTENT_MAX_ENTRIES,
+      openStore: (options) => getOptionalMSTeamsRuntime()?.state.openKeyedStoreV2(options),
+      logError: createPluginStateErrorReporter(
+        getOptionalMSTeamsRuntime,
+        "msteams",
+        "sent-message-state",
+        "Microsoft Teams persistent sent-message state failed",
+      ),
+      // Re-prime with the original send time so restored entries keep their TTL window.
+      readTimestamp: (record) => record.sentAt,
+    },
+  });
 }
 
-function cleanupExpired(scopeKey: string, entry: Map<string, number>, now: number): void {
-  for (const [id, timestamp] of entry) {
-    if (now - timestamp > TTL_MS) {
-      entry.delete(id);
-    }
+const defaultSentMessages = createSentMessageCache("default");
+
+function getSentMessageCache(accountId: string) {
+  if (accountId === "default") {
+    return defaultSentMessages;
   }
-  if (entry.size === 0) {
-    getSentMessageCache().delete(scopeKey);
+  let cache = namedAccountCaches.get(accountId);
+  if (!cache) {
+    cache = createSentMessageCache(accountId);
+    namedAccountCaches.set(accountId, cache);
   }
+  return cache;
 }
 
-export function recordMSTeamsSentMessage(conversationId: string, messageId: string): void {
-  if (!conversationId || !messageId) {
+function makeKey(conversationId: string, messageId: string, botId?: string): string {
+  // Bot-scoped records establish root ownership; legacy records retain reply-to-bot activation.
+  return botId
+    ? JSON.stringify([botId, conversationId, messageId])
+    : `${conversationId}:${messageId}`;
+}
+
+export function recordMSTeamsSentMessage(
+  conversationId: string,
+  messageId: string,
+  options?: MSTeamsSentMessageScope,
+): void {
+  if (!conversationId || !messageId || messageId === "unknown") {
     return;
   }
-  const now = Date.now();
-  const store = getSentMessageCache();
-  let entry = store.get(conversationId);
-  if (!entry) {
-    entry = new Map<string, number>();
-    store.set(conversationId, entry);
-  }
-  entry.set(messageId, now);
-  if (entry.size > 200) {
-    cleanupExpired(conversationId, entry, now);
-  }
+  const sentAt = Date.now();
+  void getSentMessageCache(normalizeAccountId(options?.accountId)).register(
+    makeKey(conversationId, messageId, options?.botId),
+    { sentAt },
+    { at: sentAt },
+  );
 }
 
-export function wasMSTeamsMessageSent(conversationId: string, messageId: string): boolean {
-  const entry = getSentMessageCache().get(conversationId);
-  if (!entry) {
+export async function wasMSTeamsMessageSentWithPersistence(params: {
+  conversationId: string;
+  messageId: string;
+  accountId?: string | null;
+  botId?: string;
+}): Promise<boolean> {
+  if (!params.conversationId || !params.messageId) {
     return false;
   }
-  cleanupExpired(conversationId, entry, Date.now());
-  return entry.has(messageId);
-}
-
-export function clearMSTeamsSentMessageCache(): void {
-  getSentMessageCache().clear();
+  return await getSentMessageCache(normalizeAccountId(params.accountId)).lookup(
+    makeKey(params.conversationId, params.messageId, params.botId),
+  );
 }

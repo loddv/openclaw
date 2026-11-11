@@ -1,124 +1,67 @@
+/**
+ * Runtime boundary checks for bundled plugin public-surface facade imports.
+ */
 import fs from "node:fs";
 import path from "node:path";
-import JSON5 from "json5";
 import { resolveConfigPath } from "../config/paths.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
 import { configMayNeedPluginAutoEnable } from "../config/plugin-auto-enable.shared.js";
-import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
+import {
+  getRuntimeConfigSnapshot,
+  getRuntimeConfigSourceSnapshot,
+} from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.js";
-import { resolveBundledPluginsDir } from "../plugins/bundled-dir.js";
 import {
   createPluginActivationSource,
   normalizePluginsConfig,
   resolveEffectivePluginActivationState,
 } from "../plugins/config-state.js";
+import { isPluginEnabledByDefaultForPlatform } from "../plugins/default-enablement.js";
+import type { PluginManifestRecord } from "../plugins/manifest-registry.js";
+import { resolvePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
+import { getPluginRegistryState } from "../plugins/runtime-state.js";
+import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
+import { parseJsonWithJson5Fallback } from "../utils/parse-json-compat.js";
+import { ALWAYS_ALLOWED_RUNTIME_DIR_NAMES } from "./facade-activation-contract.js";
 import {
-  loadPluginManifestRegistry,
-  type PluginManifestRecord,
-} from "../plugins/manifest-registry.js";
-import { normalizeBundledPluginArtifactSubpath } from "../plugins/public-surface-runtime.js";
+  resolveBundledMetadataManifestRecord,
+  resolveRegistryPluginModuleLocationFromRecords,
+  type BundledPluginPublicSurfaceParams,
+  type FacadeModuleLocationLike,
+  type FacadePluginManifestLike,
+} from "./facade-resolution-shared.js";
 
-const ALWAYS_ALLOWED_RUNTIME_DIR_NAMES = new Set([
-  "image-generation-core",
-  "media-understanding-core",
-  "speech-core",
-]);
+const ALWAYS_ALLOWED_RUNTIME_DIR_NAME_SET = new Set<string>(ALWAYS_ALLOWED_RUNTIME_DIR_NAMES);
 const EMPTY_FACADE_BOUNDARY_CONFIG: OpenClawConfig = {};
 
-let cachedBoundaryRawConfig: OpenClawConfig | undefined;
-let cachedBoundaryResolvedConfigKey: string | undefined;
-let cachedBoundaryConfigFileState:
-  | {
-      configPath: string;
-      mtimeMs: number;
-      size: number;
-      rawConfig: OpenClawConfig;
-    }
-  | undefined;
-let cachedBoundaryResolvedConfig:
-  | {
-      rawConfig: OpenClawConfig;
-      config: OpenClawConfig;
-      normalizedPluginsConfig: ReturnType<typeof normalizePluginsConfig>;
-      activationSource: ReturnType<typeof createPluginActivationSource>;
-      autoEnabledReasons: Record<string, string[]>;
-    }
-  | undefined;
-let cachedManifestRegistryByKey = new Map<string, readonly PluginManifestRecord[]>();
-const cachedFacadeManifestRecordsByKey = new Map<string, FacadePluginManifestLike | null>();
-const cachedFacadePublicSurfaceAccessByKey = new Map<
-  string,
-  { allowed: boolean; pluginId?: string; reason?: string }
->();
+type FacadeActivationCheckParams = Parameters<typeof resolveBundledMetadataManifestRecord>[0];
 
-export type FacadePluginManifestLike = Pick<
-  PluginManifestRecord,
-  "id" | "origin" | "enabledByDefault" | "rootDir" | "channels"
->;
-
-type FacadeModuleLocation = {
-  modulePath: string;
-  boundaryRoot: string;
-};
-const PUBLIC_SURFACE_SOURCE_EXTENSIONS = [".ts", ".mts", ".js", ".mjs", ".cts", ".cjs"] as const;
-
-function readFacadeBoundaryConfigSafely(): {
-  rawConfig: OpenClawConfig;
-  cacheKey?: string;
-} {
+function readFacadeBoundaryConfigSafely(): OpenClawConfig {
   try {
+    const sourceSnapshot = getRuntimeConfigSourceSnapshot();
+    if (sourceSnapshot) {
+      return sourceSnapshot;
+    }
     const runtimeSnapshot = getRuntimeConfigSnapshot();
     if (runtimeSnapshot) {
-      return { rawConfig: runtimeSnapshot };
+      return runtimeSnapshot;
     }
     const configPath = resolveConfigPath();
     if (!fs.existsSync(configPath)) {
-      return { rawConfig: EMPTY_FACADE_BOUNDARY_CONFIG, cacheKey: `missing:${configPath}` };
-    }
-    const stat = fs.statSync(configPath);
-    if (
-      cachedBoundaryConfigFileState &&
-      cachedBoundaryConfigFileState.configPath === configPath &&
-      cachedBoundaryConfigFileState.mtimeMs === stat.mtimeMs &&
-      cachedBoundaryConfigFileState.size === stat.size
-    ) {
-      return {
-        rawConfig: cachedBoundaryConfigFileState.rawConfig,
-        cacheKey: `file:${configPath}:${stat.mtimeMs}:${stat.size}`,
-      };
+      return EMPTY_FACADE_BOUNDARY_CONFIG;
     }
     const raw = fs.readFileSync(configPath, "utf8");
-    const parsed = JSON5.parse(raw);
-    const rawConfig =
-      parsed && typeof parsed === "object"
-        ? (parsed as OpenClawConfig)
-        : EMPTY_FACADE_BOUNDARY_CONFIG;
-    cachedBoundaryConfigFileState = {
-      configPath,
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-      rawConfig,
-    };
-    return {
-      rawConfig,
-      cacheKey: `file:${configPath}:${stat.mtimeMs}:${stat.size}`,
-    };
+    const parsed = parseJsonWithJson5Fallback(raw);
+    return parsed && typeof parsed === "object"
+      ? (parsed as OpenClawConfig)
+      : EMPTY_FACADE_BOUNDARY_CONFIG;
   } catch {
-    return { rawConfig: EMPTY_FACADE_BOUNDARY_CONFIG };
+    return EMPTY_FACADE_BOUNDARY_CONFIG;
   }
 }
 
 function getFacadeBoundaryResolvedConfig() {
-  const readResult = readFacadeBoundaryConfigSafely();
-  const { rawConfig } = readResult;
-  if (
-    cachedBoundaryResolvedConfig &&
-    ((readResult.cacheKey && cachedBoundaryResolvedConfigKey === readResult.cacheKey) ||
-      (!readResult.cacheKey && cachedBoundaryRawConfig === rawConfig))
-  ) {
-    return cachedBoundaryResolvedConfig;
-  }
-
+  const rawConfig = readFacadeBoundaryConfigSafely();
   const autoEnabled = configMayNeedPluginAutoEnable(rawConfig, process.env)
     ? applyPluginAutoEnable({
         config: rawConfig,
@@ -129,163 +72,49 @@ function getFacadeBoundaryResolvedConfig() {
         autoEnabledReasons: {} as Record<string, string[]>,
       };
   const config = autoEnabled.config;
-  const resolved = {
+  return {
     rawConfig,
     config,
     normalizedPluginsConfig: normalizePluginsConfig(config?.plugins),
     activationSource: createPluginActivationSource({ config: rawConfig }),
     autoEnabledReasons: autoEnabled.autoEnabledReasons,
   };
-  cachedBoundaryRawConfig = rawConfig;
-  cachedBoundaryResolvedConfigKey = readResult.cacheKey;
-  cachedBoundaryResolvedConfig = resolved;
-  return resolved;
 }
 
-function getFacadeManifestRegistry(params: { cacheKey: string }): readonly PluginManifestRecord[] {
-  const cached = cachedManifestRegistryByKey.get(params.cacheKey);
-  if (cached) {
-    return cached;
-  }
-  const loaded = loadPluginManifestRegistry({
-    config: getFacadeBoundaryResolvedConfig().config,
-    cache: true,
-  }).plugins;
-  cachedManifestRegistryByKey.set(params.cacheKey, loaded);
-  return loaded;
+function getFacadeManifestRegistry(params: {
+  env?: NodeJS.ProcessEnv;
+}): readonly PluginManifestRecord[] {
+  const envOption = params.env ? { env: params.env } : {};
+  const resolved = getFacadeBoundaryResolvedConfig();
+  return resolvePluginMetadataSnapshot({
+    config: resolved.config,
+    ...envOption,
+    allowWorkspaceScopedCurrent: true,
+  }).manifestRegistry.plugins;
 }
 
-export function resolveRegistryPluginModuleLocation(params: {
-  dirName: string;
-  artifactBasename: string;
-  resolutionKey: string;
-}): FacadeModuleLocation | null {
-  const registry = getFacadeManifestRegistry({ cacheKey: params.resolutionKey });
-  type RegistryRecord = (typeof registry)[number];
-  const tiers: Array<(plugin: RegistryRecord) => boolean> = [
-    (plugin) => plugin.id === params.dirName,
-    (plugin) => path.basename(plugin.rootDir) === params.dirName,
-    (plugin) => plugin.channels.includes(params.dirName),
-  ];
-  const artifactBasename = normalizeBundledPluginArtifactSubpath(params.artifactBasename);
-  const sourceBaseName = artifactBasename.replace(/\.js$/u, "");
-  for (const matchFn of tiers) {
-    for (const record of registry.filter(matchFn)) {
-      const rootDir = path.resolve(record.rootDir);
-      const builtCandidate = path.join(rootDir, artifactBasename);
-      if (fs.existsSync(builtCandidate)) {
-        return { modulePath: builtCandidate, boundaryRoot: rootDir };
-      }
-      for (const ext of PUBLIC_SURFACE_SOURCE_EXTENSIONS) {
-        const sourceCandidate = path.join(rootDir, `${sourceBaseName}${ext}`);
-        if (fs.existsSync(sourceCandidate)) {
-          return { modulePath: sourceCandidate, boundaryRoot: rootDir };
-        }
-      }
-    }
-  }
-  return null;
-}
-
-function readBundledPluginManifestRecordFromDir(params: {
-  pluginsRoot: string;
-  resolvedDirName: string;
-}): FacadePluginManifestLike | null {
-  const manifestPath = path.join(
-    params.pluginsRoot,
-    params.resolvedDirName,
-    "openclaw.plugin.json",
-  );
-  if (!fs.existsSync(manifestPath)) {
-    return null;
-  }
-  try {
-    const raw = JSON5.parse(fs.readFileSync(manifestPath, "utf8")) as {
-      id?: unknown;
-      enabledByDefault?: unknown;
-      channels?: unknown;
-    };
-    if (typeof raw.id !== "string" || raw.id.trim().length === 0) {
-      return null;
-    }
-    return {
-      id: raw.id,
-      origin: "bundled",
-      enabledByDefault: raw.enabledByDefault === true,
-      rootDir: path.join(params.pluginsRoot, params.resolvedDirName),
-      channels: Array.isArray(raw.channels)
-        ? raw.channels.filter((entry): entry is string => typeof entry === "string")
-        : [],
-    };
-  } catch {
-    return null;
-  }
-}
-
-function resolveBundledMetadataManifestRecord(params: {
-  dirName: string;
-  artifactBasename: string;
-  location: FacadeModuleLocation | null;
-  sourceExtensionsRoot: string;
-}): FacadePluginManifestLike | null {
-  if (!params.location) {
-    return null;
-  }
-  if (params.location.modulePath.startsWith(`${params.sourceExtensionsRoot}${path.sep}`)) {
-    const relativeToExtensions = path.relative(
-      params.sourceExtensionsRoot,
-      params.location.modulePath,
-    );
-    const resolvedDirName = relativeToExtensions.split(path.sep)[0];
-    if (!resolvedDirName) {
-      return null;
-    }
-    return readBundledPluginManifestRecordFromDir({
-      pluginsRoot: params.sourceExtensionsRoot,
-      resolvedDirName,
-    });
-  }
-  const bundledPluginsDir = resolveBundledPluginsDir();
-  if (!bundledPluginsDir) {
-    return null;
-  }
-  const normalizedBundledPluginsDir = path.resolve(bundledPluginsDir);
-  if (!params.location.modulePath.startsWith(`${normalizedBundledPluginsDir}${path.sep}`)) {
-    return null;
-  }
-  const relativeToBundledDir = path.relative(
-    normalizedBundledPluginsDir,
-    params.location.modulePath,
-  );
-  const resolvedDirName = relativeToBundledDir.split(path.sep)[0];
-  if (!resolvedDirName) {
-    return null;
-  }
-  return readBundledPluginManifestRecordFromDir({
-    pluginsRoot: normalizedBundledPluginsDir,
-    resolvedDirName,
+/** Resolves the concrete plugin module location recorded in the manifest registry. */
+export function resolveRegistryPluginModuleLocation(
+  params: BundledPluginPublicSurfaceParams,
+): FacadeModuleLocationLike | null {
+  const registry = getFacadeManifestRegistry(params);
+  return resolveRegistryPluginModuleLocationFromRecords({
+    registry,
+    dirName: params.dirName,
+    artifactBasename: params.artifactBasename,
   });
 }
 
-function resolveBundledPluginManifestRecord(params: {
-  dirName: string;
-  artifactBasename: string;
-  location: FacadeModuleLocation | null;
-  sourceExtensionsRoot: string;
-  resolutionKey: string;
-}): FacadePluginManifestLike | null {
-  if (cachedFacadeManifestRecordsByKey.has(params.resolutionKey)) {
-    return cachedFacadeManifestRecordsByKey.get(params.resolutionKey) ?? null;
-  }
-
+function resolveBundledPluginManifestRecord(
+  params: FacadeActivationCheckParams,
+): FacadePluginManifestLike | null {
   const metadataRecord = resolveBundledMetadataManifestRecord(params);
   if (metadataRecord) {
-    cachedFacadeManifestRecordsByKey.set(params.resolutionKey, metadataRecord);
     return metadataRecord;
   }
 
-  const registry = getFacadeManifestRegistry({ cacheKey: params.resolutionKey });
-  const resolved =
+  const registry = getFacadeManifestRegistry(params);
+  return (
     (params.location
       ? registry.find((plugin) => {
           const normalizedRootDir = path.resolve(plugin.rootDir);
@@ -299,132 +128,86 @@ function resolveBundledPluginManifestRecord(params: {
     registry.find((plugin) => plugin.id === params.dirName) ??
     registry.find((plugin) => path.basename(plugin.rootDir) === params.dirName) ??
     registry.find((plugin) => plugin.channels.includes(params.dirName)) ??
-    null;
-  cachedFacadeManifestRecordsByKey.set(params.resolutionKey, resolved);
-  return resolved;
+    null
+  );
 }
 
-export function resolveTrackedFacadePluginId(params: {
-  dirName: string;
-  artifactBasename: string;
-  location: FacadeModuleLocation | null;
-  sourceExtensionsRoot: string;
-  resolutionKey: string;
-}): string {
+/** Resolves the stable plugin id used for telemetry and error reporting. */
+export function resolveTrackedFacadePluginId(params: FacadeActivationCheckParams): string {
   return resolveBundledPluginManifestRecord(params)?.id ?? params.dirName;
 }
 
-export function resolveBundledPluginPublicSurfaceAccess(params: {
-  dirName: string;
-  artifactBasename: string;
-  location: FacadeModuleLocation | null;
-  sourceExtensionsRoot: string;
-  resolutionKey: string;
-}): { allowed: boolean; pluginId?: string; reason?: string } {
-  const cached = cachedFacadePublicSurfaceAccessByKey.get(params.resolutionKey);
-  if (cached) {
-    return cached;
-  }
-
+/** Evaluates whether a bundled plugin's api/runtime-api facade is currently enabled. */
+export function resolveBundledPluginPublicSurfaceAccess(params: FacadeActivationCheckParams): {
+  allowed: boolean;
+  pluginId?: string;
+  reason?: string;
+} {
   if (
     params.artifactBasename === "runtime-api.js" &&
-    ALWAYS_ALLOWED_RUNTIME_DIR_NAMES.has(params.dirName)
+    ALWAYS_ALLOWED_RUNTIME_DIR_NAME_SET.has(params.dirName)
   ) {
-    const resolved = {
+    return {
       allowed: true,
       pluginId: params.dirName,
     };
-    cachedFacadePublicSurfaceAccessByKey.set(params.resolutionKey, resolved);
-    return resolved;
   }
 
   const manifestRecord = resolveBundledPluginManifestRecord(params);
   if (!manifestRecord) {
-    const resolved = {
+    return {
       allowed: false,
       reason: `no bundled plugin manifest found for ${params.dirName}`,
     };
-    cachedFacadePublicSurfaceAccessByKey.set(params.resolutionKey, resolved);
-    return resolved;
+  }
+  const state = getPluginRegistryState();
+  const runtimeRegistry =
+    getPluginRuntimeGatewayRequestScope()?.pluginRegistry ??
+    (state?.runtimeSubagentMode === "gateway-bindable" ? state.activeRegistry : undefined);
+  if (runtimeRegistry) {
+    const record = runtimeRegistry.plugins.find((entry) => entry.id === manifestRecord.id);
+    return {
+      allowed: record?.status === "loaded",
+      pluginId: manifestRecord.id,
+      ...(record?.status === "loaded" ? {} : { reason: "plugin runtime is not active" }),
+    };
   }
   const { config, normalizedPluginsConfig, activationSource, autoEnabledReasons } =
     getFacadeBoundaryResolvedConfig();
-  const resolved = evaluateBundledPluginPublicSurfaceAccess({
-    params,
-    manifestRecord,
-    config,
-    normalizedPluginsConfig,
-    activationSource,
-    autoEnabledReasons,
-  });
-  cachedFacadePublicSurfaceAccessByKey.set(params.resolutionKey, resolved);
-  return resolved;
-}
-
-export function evaluateBundledPluginPublicSurfaceAccess(params: {
-  params: { dirName: string; artifactBasename: string };
-  manifestRecord: FacadePluginManifestLike;
-  config: OpenClawConfig;
-  normalizedPluginsConfig: ReturnType<typeof normalizePluginsConfig>;
-  activationSource: ReturnType<typeof createPluginActivationSource>;
-  autoEnabledReasons: Record<string, string[]>;
-}): { allowed: boolean; pluginId?: string; reason?: string } {
   const activationState = resolveEffectivePluginActivationState({
-    id: params.manifestRecord.id,
-    origin: params.manifestRecord.origin,
-    config: params.normalizedPluginsConfig,
-    rootConfig: params.config,
-    enabledByDefault: params.manifestRecord.enabledByDefault,
-    activationSource: params.activationSource,
-    autoEnabledReason: params.autoEnabledReasons[params.manifestRecord.id]?.[0],
+    id: manifestRecord.id,
+    origin: manifestRecord.origin,
+    channelIds: manifestRecord.channels,
+    config: normalizedPluginsConfig,
+    rootConfig: config,
+    enabledByDefault: isPluginEnabledByDefaultForPlatform(manifestRecord),
+    activationSource,
+    autoEnabledReason: autoEnabledReasons[manifestRecord.id]?.[0],
   });
   if (activationState.enabled) {
     return {
       allowed: true,
-      pluginId: params.manifestRecord.id,
+      pluginId: manifestRecord.id,
     };
   }
 
   return {
     allowed: false,
-    pluginId: params.manifestRecord.id,
+    pluginId: manifestRecord.id,
     reason: activationState.reason ?? "plugin runtime is not activated",
   };
 }
 
-export function throwForBundledPluginPublicSurfaceAccess(params: {
-  access: { allowed: boolean; pluginId?: string; reason?: string };
-  request: { dirName: string; artifactBasename: string };
-}): never {
-  const pluginLabel = params.access.pluginId ?? params.request.dirName;
-  throw new Error(
-    `Bundled plugin public surface access blocked for "${pluginLabel}" via ${params.request.dirName}/${params.request.artifactBasename}: ${params.access.reason ?? "plugin runtime is not activated"}`,
-  );
-}
-
-export function resolveActivatedBundledPluginPublicSurfaceAccessOrThrow(params: {
-  dirName: string;
-  artifactBasename: string;
-  location: FacadeModuleLocation | null;
-  sourceExtensionsRoot: string;
-  resolutionKey: string;
-}) {
+/** Resolves bundled facade access and throws unless the facade is allowed to load. */
+export function resolveActivatedBundledPluginPublicSurfaceAccessOrThrow(
+  params: FacadeActivationCheckParams,
+) {
   const access = resolveBundledPluginPublicSurfaceAccess(params);
   if (!access.allowed) {
-    throwForBundledPluginPublicSurfaceAccess({
-      access,
-      request: params,
-    });
+    const pluginLabel = access.pluginId ?? params.dirName;
+    throw new Error(
+      `Bundled plugin public surface access blocked for "${pluginLabel}" via ${params.dirName}/${params.artifactBasename}: ${access.reason ?? "plugin runtime is not activated"}`,
+    );
   }
   return access;
-}
-
-export function resetFacadeActivationCheckRuntimeStateForTest(): void {
-  cachedManifestRegistryByKey.clear();
-  cachedBoundaryRawConfig = undefined;
-  cachedBoundaryResolvedConfigKey = undefined;
-  cachedBoundaryConfigFileState = undefined;
-  cachedBoundaryResolvedConfig = undefined;
-  cachedFacadeManifestRecordsByKey.clear();
-  cachedFacadePublicSurfaceAccessByKey.clear();
 }

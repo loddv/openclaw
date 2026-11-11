@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChannelId } from "../../channels/plugins/types.public.js";
+import { PlatformMessageNotDispatchedError } from "../../infra/outbound/deliver-types.js";
+import { sendChannelOutboundMessage, type RuntimeSendOpts } from "./channel-outbound-send.js";
 
 const mocks = vi.hoisted(() => ({
   loadChannelOutboundAdapter: vi.fn(),
@@ -8,27 +11,45 @@ vi.mock("../../channels/plugins/outbound/load.js", () => ({
   loadChannelOutboundAdapter: mocks.loadChannelOutboundAdapter,
 }));
 
-describe("createChannelOutboundRuntimeSend", () => {
+describe("sendChannelOutboundMessage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
+  const defaults = { cfg: {}, accountId: "default" };
+  function send(channel: ChannelId, opts: RuntimeSendOpts = {}, text = "hello") {
+    return sendChannelOutboundMessage(channel, "target", text, { ...defaults, ...opts });
+  }
+
+  function expectSend(mockFn: ReturnType<typeof vi.fn>, params: Record<string, unknown>) {
+    expect(mockFn).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ ...defaults, to: "target", text: "hello", ...params }),
+    );
+  }
+
+  function mockSend(channel: string, method = "sendText", extra = {}) {
+    const sender = vi.fn(async () => ({ channel, messageId: "sent" }));
+    mocks.loadChannelOutboundAdapter.mockResolvedValue({ ...extra, [method]: sender });
+    return sender;
+  }
+
+  it("classifies unavailable adapters as definitely not dispatched", async () => {
+    mocks.loadChannelOutboundAdapter.mockResolvedValue(undefined);
+    const message = "discord outbound adapter is unavailable.";
+
+    const error = await send("discord").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PlatformMessageNotDispatchedError);
+    expect(error).toMatchObject({
+      name: "PlatformMessageNotDispatchedError",
+      message,
+      cause: expect.objectContaining({ message }),
+    });
+  });
+
   it("routes media sends through sendMedia and preserves media access", async () => {
-    const sendMedia = vi.fn(async () => ({ channel: "whatsapp", messageId: "wa-1" }));
-    mocks.loadChannelOutboundAdapter.mockResolvedValue({
-      sendText: vi.fn(),
-      sendMedia,
-    });
-
-    const { createChannelOutboundRuntimeSend } = await import("./channel-outbound-send.js");
+    const sendMedia = mockSend("whatsapp", "sendMedia", { sendText: vi.fn() });
     const mediaReadFile = vi.fn(async () => Buffer.from("image"));
-    const runtimeSend = createChannelOutboundRuntimeSend({
-      channelId: "whatsapp" as never,
-      unavailableMessage: "unavailable",
-    });
-
-    await runtimeSend.sendMessage("+15551234567", "caption", {
-      cfg: {},
+    const opts = {
       mediaUrl: "file:///tmp/photo.png",
       mediaAccess: {
         localRoots: ["/tmp/workspace"],
@@ -36,97 +57,45 @@ describe("createChannelOutboundRuntimeSend", () => {
       },
       mediaLocalRoots: ["/tmp/fallback-root"],
       mediaReadFile,
-      accountId: "default",
       gifPlayback: true,
-    });
-
-    expect(sendMedia).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cfg: {},
-        to: "+15551234567",
-        text: "caption",
-        mediaUrl: "file:///tmp/photo.png",
-        mediaAccess: {
-          localRoots: ["/tmp/workspace"],
-          readFile: mediaReadFile,
-        },
-        mediaLocalRoots: ["/tmp/fallback-root"],
-        mediaReadFile,
-        accountId: "default",
-        gifPlayback: true,
-      }),
-    );
+    };
+    await send("whatsapp", opts);
+    expectSend(sendMedia, opts);
   });
 
-  it("falls back to sendText for text-only sends", async () => {
-    const sendText = vi.fn(async () => ({ channel: "whatsapp", messageId: "wa-2" }));
-    mocks.loadChannelOutboundAdapter.mockResolvedValue({
-      sendText,
-      sendMedia: vi.fn(),
-    });
-
-    const { createChannelOutboundRuntimeSend } = await import("./channel-outbound-send.js");
-    const runtimeSend = createChannelOutboundRuntimeSend({
-      channelId: "whatsapp" as never,
-      unavailableMessage: "unavailable",
-    });
-
-    await runtimeSend.sendMessage("+15551234567", "hello", {
-      cfg: {},
-      accountId: "default",
-    });
-
-    expect(sendText).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cfg: {},
-        to: "+15551234567",
-        text: "hello",
-        accountId: "default",
-      }),
-    );
+  it("preserves rendered html formatting through lazy text sends", async () => {
+    const sendText = mockSend("telegram");
+    const opts = {
+      deliveryQueueId: "queue-1",
+      deliveryPartIndex: 3,
+      deliveryPartCount: 4,
+      onPlatformSendDispatch: vi.fn(),
+    };
+    const text = '<a href="https://example.com">Example</a>';
+    await send("telegram", { ...opts, textMode: "html" }, text);
+    expectSend(sendText, { ...opts, text, formatting: { parseMode: "HTML" } });
   });
 
-  it("falls back to sendText when media is present but sendMedia is unavailable", async () => {
-    const sendText = vi.fn(async () => ({ channel: "whatsapp", messageId: "wa-3" }));
-    mocks.loadChannelOutboundAdapter.mockResolvedValue({
-      sendText,
-    });
+  it("routes block sends through payload delivery", async () => {
+    const sendText = vi.fn();
+    const sendPayload = mockSend("slack", "sendPayload", { sendText });
 
-    const { createChannelOutboundRuntimeSend } = await import("./channel-outbound-send.js");
-    const mediaReadFile = vi.fn(async () => Buffer.from("pdf"));
-    const runtimeSend = createChannelOutboundRuntimeSend({
-      channelId: "whatsapp" as never,
-      unavailableMessage: "unavailable",
+    const blocks = [{ type: "section", text: { type: "plain_text", text: "OK" } }];
+    await send("slack", { blocks });
+    expectSend(sendPayload, {
+      payload: { channelData: { slack: { blocks } }, text: "hello" },
     });
+    expect(sendText).not.toHaveBeenCalled();
+  });
 
-    await runtimeSend.sendMessage("+15551234567", "caption", {
-      cfg: {},
-      mediaUrl: "file:///tmp/test.pdf",
-      mediaAccess: {
-        localRoots: ["/tmp/workspace"],
-        readFile: mediaReadFile,
-      },
-      mediaLocalRoots: ["/tmp/fallback-root"],
-      mediaReadFile,
-      accountId: "default",
-      forceDocument: true,
-    });
-
-    expect(sendText).toHaveBeenCalledWith(
-      expect.objectContaining({
-        cfg: {},
-        to: "+15551234567",
-        text: "caption",
-        mediaUrl: "file:///tmp/test.pdf",
-        mediaAccess: {
-          localRoots: ["/tmp/workspace"],
-          readFile: mediaReadFile,
-        },
-        mediaLocalRoots: ["/tmp/fallback-root"],
-        mediaReadFile,
-        accountId: "default",
-        forceDocument: true,
-      }),
-    );
+  it("accepts plugin outbound thread and reply aliases", async () => {
+    const sendText = mockSend("matrix");
+    const opts = {
+      accountId: "sut",
+      replyToId: "$parent",
+      threadId: "$thread-root",
+    };
+    await send("matrix", opts);
+    expectSend(sendText, opts);
   });
 });

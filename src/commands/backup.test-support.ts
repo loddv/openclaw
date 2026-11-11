@@ -1,40 +1,46 @@
-import fs from "node:fs/promises";
+// Backup test support provides temp config/state fixtures and mocked backup runtime helpers.
 import path from "node:path";
+import { Readable } from "node:stream";
 import { vi } from "vitest";
-import type { RuntimeEnv } from "../runtime.js";
+import { writeFixtureJson } from "../cli/cli-fixtures.test-support.js";
 import * as backupShared from "./backup-shared.js";
-import { resolveBackupPlanFromPaths } from "./backup-shared.js";
 
-export const tarCreateMock = vi.fn();
-export const backupVerifyCommandMock = vi.fn();
-
-vi.mock("tar", () => ({
-  c: tarCreateMock,
+const backupTestMocks = vi.hoisted(() => ({
+  backupWalkMock: vi.fn(),
 }));
 
-vi.mock("./backup-verify.js", () => ({
-  backupVerifyCommand: backupVerifyCommandMock,
-}));
+export const { backupWalkMock } = backupTestMocks;
 
-export function createBackupTestRuntime(): RuntimeEnv {
-  return {
-    log: vi.fn(),
-    error: vi.fn(),
-    exit: vi.fn(),
-  } satisfies RuntimeEnv;
+export function createMockTarStream(
+  params: {
+    beforeRead?: () => Promise<void> | void;
+    contents?: string;
+    error?: Error;
+  } = {},
+): Readable {
+  return Readable.from(
+    (async function* () {
+      await params.beforeRead?.();
+      if (params.error) {
+        throw params.error;
+      }
+      yield Buffer.from(params.contents ?? "archive-bytes");
+      yield Buffer.alloc(1024);
+    })(),
+  );
 }
 
+vi.mock("../infra/backup-tar-walk.js", () => ({
+  walkBackupTar: backupTestMocks.backupWalkMock,
+}));
+
 export async function mockStateOnlyBackupPlan(stateDir: string) {
-  await fs.writeFile(path.join(stateDir, "openclaw.json"), JSON.stringify({}), "utf8");
-  vi.spyOn(backupShared, "resolveBackupPlanFromDisk").mockResolvedValue(
-    await resolveBackupPlanFromPaths({
-      stateDir,
-      configPath: path.join(stateDir, "openclaw.json"),
-      oauthDir: path.join(stateDir, "credentials"),
-      includeWorkspace: false,
-      configInsideState: true,
-      oauthInsideState: true,
-      nowMs: 123,
-    }),
-  );
+  await writeFixtureJson(path.join(stateDir, "openclaw.json"), {
+    agents: { ownership: "explicit", entries: { main: {} } },
+  });
+  const plan = await backupShared.resolveBackupPlanFromDisk({
+    includeWorkspace: false,
+    nowMs: 123,
+  });
+  vi.spyOn(backupShared, "resolveBackupPlanFromDisk").mockResolvedValue(plan);
 }

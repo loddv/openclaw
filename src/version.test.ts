@@ -1,213 +1,114 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
-import { withTempDir } from "./test-helpers/temp-dir.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { createSuiteTempRootTracker } from "./test-helpers/temp-dir.js";
+import { withEnv } from "./test-utils/env.js";
 import {
   VERSION,
-  readVersionFromBuildInfoForModuleUrl,
+  readBuildIdFromBuildInfoForModuleUrl,
+  readBuildProvenanceForModuleUrl,
   resolveCompatibilityHostVersion,
-  readVersionFromPackageJsonForModuleUrl,
   resolveBinaryVersion,
   resolveRuntimeServiceVersion,
   resolveUsableRuntimeVersion,
-  resolveVersionFromModuleUrl,
 } from "./version.js";
 
-function moduleUrlFrom(root: string, relativePath: string): string {
-  return pathToFileURL(path.join(root, relativePath)).href;
+const versionFixtureRoot = createSuiteTempRootTracker({ prefix: "openclaw-version-" });
+
+beforeAll(() => versionFixtureRoot.setup());
+afterAll(() => versionFixtureRoot.cleanup());
+
+async function versionFixture(files: Record<string, unknown>) {
+  const root = await versionFixtureRoot.make("case");
+  await fs.mkdir(path.join(root, "dist/plugin-sdk"), { recursive: true });
+  for (const [name, value] of Object.entries(files)) {
+    await fs.writeFile(path.join(root, name), JSON.stringify(value), "utf-8");
+  }
+  return pathToFileURL(path.join(root, "dist/plugin-sdk/core.js")).href;
 }
 
-async function ensureModuleFixture(root: string, relativePath = "dist/plugin-sdk/index.js") {
-  await fs.mkdir(path.dirname(path.join(root, relativePath)), { recursive: true });
-  return moduleUrlFrom(root, relativePath);
-}
+const sourcePackage = { name: "openclaw", version: "2" };
+it.each([
+  [{ "package.json": sourcePackage, "build-info.json": { version: "1" } }, "1"],
+  [{ "package.json": sourcePackage }, "2"],
+  [{ "package.json": { name: "other", version: "2" }, "build-info.json": { version: " " } }, "8"],
+  [undefined, "8"],
+  [undefined, "0.0.0", " "],
+] as const)("resolves version precedence: %j", async (files, expected, bundled?: string) => {
+  const moduleUrl = files ? await versionFixture(files) : "not-a-valid-url";
+  expect(resolveBinaryVersion({ moduleUrl, bundledVersion: bundled ?? "8" })).toBe(expected);
+});
 
-async function writeJsonFixture(root: string, relativePath: string, value: unknown) {
-  const filePath = path.join(root, relativePath);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(value), "utf-8");
-}
-
-function expectVersionMetadataToBeMissing(moduleUrl: string) {
-  expect(readVersionFromPackageJsonForModuleUrl(moduleUrl)).toBeNull();
-  expect(readVersionFromBuildInfoForModuleUrl(moduleUrl)).toBeNull();
-  expect(resolveVersionFromModuleUrl(moduleUrl)).toBeNull();
-}
-
-describe("version resolution", () => {
-  it("resolves package version from nested dist/plugin-sdk module URL", async () => {
-    await withTempDir({ prefix: "openclaw-version-" }, async (root) => {
-      await writeJsonFixture(root, "package.json", { name: "openclaw", version: "1.2.3" });
-      const moduleUrl = await ensureModuleFixture(root);
-      expect(readVersionFromPackageJsonForModuleUrl(moduleUrl)).toBe("1.2.3");
-      expect(resolveVersionFromModuleUrl(moduleUrl)).toBe("1.2.3");
-    });
+it.each([
+  { buildId: "build-a" },
+  {
+    buildId: "x".repeat(96),
+    version: "2026.10.22",
+    commit: "a".repeat(40),
+    builtAt: "2026-10-22T00:00:00.000Z",
+  },
+])("captures the first usable build record: %j", async (record) => {
+  const moduleUrl = await versionFixture({
+    "dist/build-info.json": { buildId: "x".repeat(97) },
+    "build-info.json": record,
   });
-
-  it("ignores unrelated nearby package.json files", async () => {
-    await withTempDir({ prefix: "openclaw-version-" }, async (root) => {
-      await writeJsonFixture(root, "package.json", { name: "openclaw", version: "2.3.4" });
-      await writeJsonFixture(root, "dist/package.json", {
-        name: "other-package",
-        version: "9.9.9",
-      });
-      const moduleUrl = await ensureModuleFixture(root);
-      expect(readVersionFromPackageJsonForModuleUrl(moduleUrl)).toBe("2.3.4");
-    });
+  expect(readBuildIdFromBuildInfoForModuleUrl(moduleUrl)).toBe(record.buildId);
+  // Provenance names the file that actually supplied the ID, not the first candidate found.
+  expect(readBuildProvenanceForModuleUrl(moduleUrl)).toEqual({
+    ...record,
+    buildInfoPath: await fs.realpath(fileURLToPath(new URL("../../build-info.json", moduleUrl))),
   });
+});
 
-  it("falls back to build-info when package metadata is unavailable", async () => {
-    await withTempDir({ prefix: "openclaw-version-" }, async (root) => {
-      await writeJsonFixture(root, "build-info.json", { version: "4.5.6" });
-      const moduleUrl = await ensureModuleFixture(root);
-      expect(readVersionFromPackageJsonForModuleUrl(moduleUrl)).toBeNull();
-      expect(readVersionFromBuildInfoForModuleUrl(moduleUrl)).toBe("4.5.6");
-      expect(resolveVersionFromModuleUrl(moduleUrl)).toBe("4.5.6");
-    });
-  });
+it.each([undefined, " ", "x".repeat(97)])("rejects unusable build id %s", async (buildId) => {
+  const moduleUrl = await versionFixture(
+    buildId === undefined ? {} : { "build-info.json": { version: "1", buildId } },
+  );
+  expect(readBuildProvenanceForModuleUrl(moduleUrl)).toBeNull();
+  expect(readBuildIdFromBuildInfoForModuleUrl(moduleUrl)).toBeNull();
+});
 
-  it("returns null when no version metadata exists", async () => {
-    await withTempDir({ prefix: "openclaw-version-" }, async (root) => {
-      const moduleUrl = await ensureModuleFixture(root);
-      expectVersionMetadataToBeMissing(moduleUrl);
-    });
-  });
+it("captures the runtime commit from startup provenance once", async () => {
+  let commit = "aaaaaaa";
+  // mock-isolation: Pin startup provenance without probing the checkout or build environment.
+  vi.doMock("./infra/git-commit.js", () => ({ resolveLoadedCommitHash: () => commit }));
+  vi.resetModules();
+  try {
+    const runtimeVersion = await import("./version.js");
+    expect(runtimeVersion.resolveRuntimeServiceCommit()).toBe("aaaaaaa");
+    commit = "bbbbbbb";
+    expect(runtimeVersion.resolveRuntimeServiceCommit()).toBe("aaaaaaa");
+  } finally {
+    vi.doUnmock("./infra/git-commit.js");
+    vi.resetModules();
+  }
+});
 
-  it("ignores non-openclaw package and blank build-info versions", async () => {
-    await withTempDir({ prefix: "openclaw-version-" }, async (root) => {
-      await writeJsonFixture(root, "package.json", { name: "other-package", version: "9.9.9" });
-      await writeJsonFixture(root, "build-info.json", { version: "  " });
-      const moduleUrl = await ensureModuleFixture(root);
-      expectVersionMetadataToBeMissing(moduleUrl);
-    });
-  });
+it.each([
+  [true, undefined, VERSION],
+  [false, undefined, "2026.3.99"],
+  [false, "2026.4.8", "2026.4.8"],
+] as const)("selects compatibility version (%s, %s)", (useProcess, override, expected) => {
+  const env = {
+    OPENCLAW_COMPATIBILITY_HOST_VERSION: override,
+    OPENCLAW_VERSION: "2026.3.99",
+    npm_package_version: "2026.3.97",
+  };
+  withEnv(env, () =>
+    expect(resolveCompatibilityHostVersion(useProcess ? undefined : env)).toBe(expected),
+  );
+});
 
-  it("returns null for malformed module URLs", () => {
-    expect(readVersionFromPackageJsonForModuleUrl("not-a-valid-url")).toBeNull();
-    expect(readVersionFromBuildInfoForModuleUrl("not-a-valid-url")).toBeNull();
-    expect(resolveVersionFromModuleUrl("not-a-valid-url")).toBeNull();
-  });
+it("normalizes runtime version candidate for fallback handling", () => {
+  const inputs = [undefined, " \t ", " 0.0.0 ", " 2026.3.2 "];
+  const versions = inputs.map(resolveUsableRuntimeVersion);
+  expect(versions).toEqual([undefined, undefined, undefined, "2026.3.2"]);
+});
 
-  it("resolves binary version with explicit precedence", async () => {
-    await withTempDir({ prefix: "openclaw-version-" }, async (root) => {
-      await writeJsonFixture(root, "package.json", { name: "openclaw", version: "2.3.4" });
-      const moduleUrl = await ensureModuleFixture(root);
-      expect(
-        resolveBinaryVersion({
-          moduleUrl,
-          injectedVersion: "9.9.9",
-          bundledVersion: "8.8.8",
-          fallback: "0.0.0",
-        }),
-      ).toBe("9.9.9");
-      expect(
-        resolveBinaryVersion({
-          moduleUrl,
-          bundledVersion: "8.8.8",
-          fallback: "0.0.0",
-        }),
-      ).toBe("2.3.4");
-      expect(
-        resolveBinaryVersion({
-          moduleUrl: "not-a-valid-url",
-          bundledVersion: "8.8.8",
-          fallback: "0.0.0",
-        }),
-      ).toBe("8.8.8");
-      expect(
-        resolveBinaryVersion({
-          moduleUrl: "not-a-valid-url",
-          bundledVersion: "   ",
-          fallback: "0.0.0",
-        }),
-      ).toBe("0.0.0");
-    });
-  });
-
-  it("prefers OPENCLAW_VERSION over service and package versions", () => {
-    expect(
-      resolveRuntimeServiceVersion({
-        OPENCLAW_VERSION: "9.9.9",
-        OPENCLAW_SERVICE_VERSION: "2.2.2",
-        npm_package_version: "1.1.1",
-      }),
-    ).toBe("9.9.9");
-  });
-
-  it("prefers runtime VERSION over stale OPENCLAW_VERSION for compatibility checks", () => {
-    const previous = process.env.OPENCLAW_VERSION;
-    const previousService = process.env.OPENCLAW_SERVICE_VERSION;
-    const previousPackage = process.env.npm_package_version;
-    try {
-      process.env.OPENCLAW_VERSION = "2026.3.25";
-      process.env.OPENCLAW_SERVICE_VERSION = "2026.3.25-service";
-      process.env.npm_package_version = "2026.3.25-package";
-      expect(resolveCompatibilityHostVersion()).toBe(VERSION);
-    } finally {
-      process.env.OPENCLAW_VERSION = previous;
-      process.env.OPENCLAW_SERVICE_VERSION = previousService;
-      process.env.npm_package_version = previousPackage;
-    }
-  });
-
-  it("keeps explicit env-object overrides for compatibility checks in tests", () => {
-    expect(
-      resolveCompatibilityHostVersion({
-        OPENCLAW_VERSION: "2026.3.99",
-        OPENCLAW_SERVICE_VERSION: "2026.3.98",
-        npm_package_version: "2026.3.97",
-      }),
-    ).toBe("2026.3.99");
-  });
-
-  it("prefers explicit compatibility host overrides over runtime and stale env versions", () => {
-    expect(
-      resolveCompatibilityHostVersion({
-        OPENCLAW_COMPATIBILITY_HOST_VERSION: "2026.4.8",
-        OPENCLAW_VERSION: "2026.3.99",
-        OPENCLAW_SERVICE_VERSION: "2026.3.98",
-        npm_package_version: "2026.3.97",
-      }),
-    ).toBe("2026.4.8");
-  });
-
-  it("normalizes runtime version candidate for fallback handling", () => {
-    expect(resolveUsableRuntimeVersion(undefined)).toBeUndefined();
-    expect(resolveUsableRuntimeVersion("")).toBeUndefined();
-    expect(resolveUsableRuntimeVersion(" \t ")).toBeUndefined();
-    expect(resolveUsableRuntimeVersion("0.0.0")).toBeUndefined();
-    expect(resolveUsableRuntimeVersion(" 0.0.0 ")).toBeUndefined();
-    expect(resolveUsableRuntimeVersion("2026.3.2")).toBe("2026.3.2");
-    expect(resolveUsableRuntimeVersion(" 2026.3.2 ")).toBe("2026.3.2");
-  });
-
-  it("prefers runtime VERSION over service/package markers and ignores blank env values", () => {
-    expect(
-      resolveRuntimeServiceVersion({
-        OPENCLAW_VERSION: "   ",
-        OPENCLAW_SERVICE_VERSION: "  2.0.0  ",
-        npm_package_version: "1.0.0",
-      }),
-    ).toBe(VERSION);
-
-    expect(
-      resolveRuntimeServiceVersion({
-        OPENCLAW_VERSION: " ",
-        OPENCLAW_SERVICE_VERSION: "\t",
-        npm_package_version: " 1.0.0-package ",
-      }),
-    ).toBe(VERSION);
-
-    expect(
-      resolveRuntimeServiceVersion(
-        {
-          OPENCLAW_VERSION: "",
-          OPENCLAW_SERVICE_VERSION: " ",
-          npm_package_version: "",
-        },
-        "fallback",
-      ),
-    ).toBe(VERSION);
-  });
+it("prefers runtime VERSION over package markers and ignores unusable env values", () => {
+  const resolve = (OPENCLAW_VERSION: string, npm_package_version: string, fallback?: string) =>
+    resolveRuntimeServiceVersion({ OPENCLAW_VERSION, npm_package_version }, fallback);
+  expect(resolve("   ", "1.0.0", "fallback")).toBe(VERSION);
+  expect(resolve("undefined", "1.0.0-package")).toBe(VERSION);
 });

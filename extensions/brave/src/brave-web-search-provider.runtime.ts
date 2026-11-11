@@ -1,367 +1,509 @@
+import { buildTimeoutAbortSignal } from "openclaw/plugin-sdk/extension-shared";
+import { sha256Hex } from "openclaw/plugin-sdk/node-crypto-runtime";
+import {
+  assertOkOrThrowProviderError,
+  readProviderJsonResponse,
+} from "openclaw/plugin-sdk/provider-http";
 import type { SearchConfigRecord } from "openclaw/plugin-sdk/provider-web-search";
 import {
+  externalContentStamp,
+  nativeWebSearchCodecs,
   buildSearchCacheKey,
   DEFAULT_SEARCH_COUNT,
   formatCliCommand,
-  normalizeFreshness,
-  parseIsoDateRange,
+  parseWebSearchTimeFilters,
   readCachedSearchPayload,
   readConfiguredSecretString,
-  readNumberParam,
-  readProviderEnvValue,
+  readWebSearchApiKey,
+  readWebSearchQueryAndCount,
   readStringParam,
   resolveSearchCacheTtlMs,
   resolveSearchCount,
   resolveSearchTimeoutSeconds,
   resolveSiteName,
-  withTrustedWebSearchEndpoint,
+  withSelfHostedWebToolsEndpoint,
+  withTrustedWebToolsEndpoint,
   wrapWebContent,
   writeCachedSearchPayload,
 } from "openclaw/plugin-sdk/provider-web-search";
+import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import {
-  type BraveLlmContextResponse,
-  mapBraveLlmContextResults,
-  normalizeBraveCountry,
-  normalizeBraveLanguageParams,
-  resolveBraveConfig,
-  resolveBraveMode,
-} from "./brave-web-search-provider.shared.js";
+  assertHttpUrlTargetsPrivateNetwork,
+  isBlockedHostnameOrIp,
+  isPrivateIpAddress,
+  resolvePinnedHostnameWithPolicy,
+} from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  asNonArrayRecord,
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveBraveMode } from "../web-search-shared.js";
 
-const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
-const BRAVE_LLM_CONTEXT_ENDPOINT = "https://api.search.brave.com/res/v1/llm/context";
+const DEFAULT_BRAVE_BASE_URL = "https://api.search.brave.com";
+const BRAVE_SEARCH_ENDPOINT_PATH = "/res/v1/web/search";
+const BRAVE_LLM_CONTEXT_ENDPOINT_PATH = "/res/v1/llm/context";
+const braveHttpLogger = createSubsystemLogger("brave/http");
+type BraveEndpointMode = "selfHosted" | "strict";
 
-type BraveSearchResult = {
-  title?: string;
-  url?: string;
-  description?: string;
-  age?: string;
+type BraveLlmContextResponse = {
+  grounding: { generic?: { url: string; title: string; snippets: string[] }[] };
+  sources?: Record<string, { age?: string[] }>;
 };
 
-type BraveSearchResponse = {
-  web?: {
-    results?: BraveSearchResult[];
-  };
+const BRAVE_COUNTRY_CODES = new Set([
+  "AR",
+  "AU",
+  "AT",
+  "BE",
+  "BR",
+  "CA",
+  "CL",
+  "DK",
+  "FI",
+  "FR",
+  "DE",
+  "GR",
+  "HK",
+  "IN",
+  "ID",
+  "IT",
+  "JP",
+  "KR",
+  "MY",
+  "MX",
+  "NL",
+  "NZ",
+  "NO",
+  "CN",
+  "PL",
+  "PT",
+  "PH",
+  "RU",
+  "SA",
+  "ZA",
+  "ES",
+  "SE",
+  "CH",
+  "TW",
+  "TR",
+  "GB",
+  "US",
+  "ALL",
+]);
+
+const BRAVE_SEARCH_LANG_CODES = new Set([
+  "ar",
+  "eu",
+  "bn",
+  "bg",
+  "ca",
+  "zh-hans",
+  "zh-hant",
+  "hr",
+  "cs",
+  "da",
+  "nl",
+  "en",
+  "en-gb",
+  "et",
+  "fi",
+  "fr",
+  "gl",
+  "de",
+  "el",
+  "gu",
+  "he",
+  "hi",
+  "hu",
+  "is",
+  "it",
+  "jp",
+  "kn",
+  "ko",
+  "lv",
+  "lt",
+  "ms",
+  "ml",
+  "mr",
+  "nb",
+  "pl",
+  "pt-br",
+  "pt-pt",
+  "pa",
+  "ro",
+  "ru",
+  "sr",
+  "sk",
+  "sl",
+  "es",
+  "sv",
+  "ta",
+  "te",
+  "th",
+  "tr",
+  "uk",
+  "vi",
+]);
+
+const BRAVE_SEARCH_LANG_ALIASES: Record<string, string> = {
+  ja: "jp",
+  zh: "zh-hans",
+  "zh-cn": "zh-hans",
+  "zh-hk": "zh-hant",
+  "zh-sg": "zh-hans",
+  "zh-tw": "zh-hant",
 };
 
-function resolveBraveApiKey(searchConfig?: SearchConfigRecord): string | undefined {
-  return (
-    readConfiguredSecretString(searchConfig?.apiKey, "tools.web.search.apiKey") ??
-    readProviderEnvValue(["BRAVE_API_KEY"])
-  );
+const BRAVE_UI_LANG_LOCALE = /^([a-z]{2})-([a-z]{2})$/i;
+
+function normalizeBraveSearchLang(value: string | undefined): string | undefined {
+  const lower = normalizeLowercaseStringOrEmpty(value);
+  const canonical = BRAVE_SEARCH_LANG_ALIASES[lower] ?? lower;
+  return BRAVE_SEARCH_LANG_CODES.has(canonical) ? canonical : undefined;
 }
 
-function missingBraveKeyPayload() {
-  return {
-    error: "missing_brave_api_key",
-    message: `web_search (brave) needs a Brave Search API key. Run \`${formatCliCommand("openclaw configure --section web")}\` to store it, or set BRAVE_API_KEY in the Gateway environment.`,
-    docs: "https://docs.openclaw.ai/tools/web",
-  };
+function normalizeBraveUiLang(value: string | undefined): string | undefined {
+  const match = normalizeOptionalString(value)?.match(BRAVE_UI_LANG_LOCALE);
+  if (!match) {
+    return undefined;
+  }
+  const [, language, region] = match;
+  if (!language || !region) {
+    return undefined;
+  }
+  return `${normalizeLowercaseStringOrEmpty(language)}-${region.toUpperCase()}`;
 }
 
-async function runBraveLlmContextSearch(params: {
-  query: string;
-  apiKey: string;
-  timeoutSeconds: number;
-  country?: string;
-  search_lang?: string;
-  freshness?: string;
-}): Promise<{
-  results: Array<{
-    url: string;
-    title: string;
-    snippets: string[];
-    siteName?: string;
-  }>;
-  sources?: BraveLlmContextResponse["sources"];
-}> {
-  const url = new URL(BRAVE_LLM_CONTEXT_ENDPOINT);
-  url.searchParams.set("q", params.query);
-  if (params.country) {
-    url.searchParams.set("country", params.country);
+function logBraveHttp(
+  diagnosticsEnabled: boolean,
+  event: string,
+  meta?: Record<string, unknown>,
+): void {
+  if (!diagnosticsEnabled) {
+    return;
   }
-  if (params.search_lang) {
-    url.searchParams.set("search_lang", params.search_lang);
-  }
-  if (params.freshness) {
-    url.searchParams.set("freshness", params.freshness);
-  }
+  braveHttpLogger.info(`brave http ${event}`, meta);
+}
 
-  return withTrustedWebSearchEndpoint(
-    {
-      url: url.toString(),
-      timeoutSeconds: params.timeoutSeconds,
-      init: {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          "X-Subscription-Token": params.apiKey,
-        },
+async function braveEndpointTargetsPrivateNetwork(
+  url: URL,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (isBlockedHostnameOrIp(url.hostname)) {
+    return true;
+  }
+  try {
+    const pinned = await resolvePinnedHostnameWithPolicy(url.hostname, {
+      signal,
+      policy: {
+        allowPrivateNetwork: true,
+        allowRfc2544BenchmarkRange: true,
       },
-    },
-    async (response) => {
-      if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(
-          `Brave LLM Context API error (${response.status}): ${detail || response.statusText}`,
-        );
-      }
-
-      const data = (await response.json()) as BraveLlmContextResponse;
-      return { results: mapBraveLlmContextResults(data), sources: data.sources };
-    },
-  );
+    });
+    return pinned.addresses.every((address) => isPrivateIpAddress(address));
+  } catch {
+    signal?.throwIfAborted();
+    return false;
+  }
 }
 
-async function runBraveWebSearch(params: {
-  query: string;
-  count: number;
-  apiKey: string;
-  timeoutSeconds: number;
-  country?: string;
-  search_lang?: string;
-  ui_lang?: string;
-  freshness?: string;
-  dateAfter?: string;
-  dateBefore?: string;
-}): Promise<Array<Record<string, unknown>>> {
-  const url = new URL(BRAVE_SEARCH_ENDPOINT);
-  url.searchParams.set("q", params.query);
-  url.searchParams.set("count", String(params.count));
-  if (params.country) {
-    url.searchParams.set("country", params.country);
-  }
-  if (params.search_lang) {
-    url.searchParams.set("search_lang", params.search_lang);
-  }
-  if (params.ui_lang) {
-    url.searchParams.set("ui_lang", params.ui_lang);
-  }
-  if (params.freshness) {
-    url.searchParams.set("freshness", params.freshness);
-  } else if (params.dateAfter && params.dateBefore) {
-    url.searchParams.set("freshness", `${params.dateAfter}to${params.dateBefore}`);
-  } else if (params.dateAfter) {
-    url.searchParams.set(
-      "freshness",
-      `${params.dateAfter}to${new Date().toISOString().slice(0, 10)}`,
-    );
-  } else if (params.dateBefore) {
-    url.searchParams.set("freshness", `1970-01-01to${params.dateBefore}`);
+async function validateBraveBaseUrl(
+  baseUrl: string,
+  signal?: AbortSignal,
+): Promise<BraveEndpointMode> {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error("Brave Search base URL must be a valid http:// or https:// URL.");
   }
 
-  return withTrustedWebSearchEndpoint(
-    {
-      url: url.toString(),
-      timeoutSeconds: params.timeoutSeconds,
-      init: {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          "X-Subscription-Token": params.apiKey,
-        },
-      },
-    },
-    async (response) => {
-      if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(
-          `Brave Search API error (${response.status}): ${detail || response.statusText}`,
-        );
-      }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Brave Search base URL must use http:// or https://.");
+  }
 
-      const data = (await response.json()) as BraveSearchResponse;
-      const results = Array.isArray(data.web?.results) ? (data.web?.results ?? []) : [];
-      return results.map((entry) => {
-        const description = entry.description ?? "";
-        const title = entry.title ?? "";
-        const url = entry.url ?? "";
-        return {
-          title: title ? wrapWebContent(title, "web_search") : "",
-          url,
-          description: description ? wrapWebContent(description, "web_search") : "",
-          published: entry.age || undefined,
-          siteName: resolveSiteName(url) || undefined,
-        };
-      });
-    },
-  );
+  if (parsed.protocol === "http:") {
+    await assertHttpUrlTargetsPrivateNetwork(parsed.toString(), {
+      signal,
+      dangerouslyAllowPrivateNetwork: true,
+      errorMessage:
+        "Brave Search HTTP base URL must target a trusted private or loopback host. Use https:// for public hosts.",
+    });
+    return "selfHosted";
+  }
+
+  return (await braveEndpointTargetsPrivateNetwork(parsed, signal)) ? "selfHosted" : "strict";
 }
 
 export async function executeBraveSearch(
   args: Record<string, unknown>,
   searchConfig?: SearchConfigRecord,
+  options?: {
+    diagnosticsEnabled?: boolean;
+    signal?: AbortSignal;
+  },
 ): Promise<Record<string, unknown>> {
-  const apiKey = resolveBraveApiKey(searchConfig);
+  const apiKey = readWebSearchApiKey(
+    searchConfig?.apiKey,
+    "plugins.entries.brave.config.webSearch.apiKey",
+    ["BRAVE_API_KEY"],
+  );
   if (!apiKey) {
-    return missingBraveKeyPayload();
+    return {
+      error: "missing_brave_api_key",
+      message: `web_search (brave) needs a Brave Search API key. Run \`${formatCliCommand("openclaw configure --section web")}\` to store it, or set BRAVE_API_KEY in the Gateway environment. If you do not want to configure a search API key, use web_fetch for a specific URL or the browser tool for interactive pages.`,
+      docs: "https://docs.openclaw.ai/tools/web",
+    };
   }
 
-  const braveConfig = resolveBraveConfig(searchConfig);
+  const braveConfig = asNonArrayRecord(searchConfig?.brave);
   const braveMode = resolveBraveMode(braveConfig);
-  const query = readStringParam(args, "query", { required: true });
-  const count =
-    readNumberParam(args, "count", { integer: true }) ?? searchConfig?.maxResults ?? undefined;
-  const country = normalizeBraveCountry(readStringParam(args, "country"));
-  const language = readStringParam(args, "language");
-  const search_lang = readStringParam(args, "search_lang");
-  const ui_lang = readStringParam(args, "ui_lang");
-  const normalizedLanguage = normalizeBraveLanguageParams({
-    search_lang: search_lang || language,
-    ui_lang,
+  const configuredBraveBaseUrl = readConfiguredSecretString(
+    braveConfig?.baseUrl,
+    "plugins.entries.brave.config.webSearch.baseUrl",
+  );
+  const braveBaseUrl = configuredBraveBaseUrl?.replace(/\/+$/u, "") || DEFAULT_BRAVE_BASE_URL;
+  // One deadline owns classification, transport, response consumption, and cache publication.
+  const { signal, cleanup } = buildTimeoutAbortSignal({
+    timeoutMs: resolveSearchTimeoutSeconds(searchConfig) * 1_000,
+    signal: options?.signal,
+    operation: "brave.web_search",
+    url: braveBaseUrl,
   });
+  try {
+    signal?.throwIfAborted();
+    const braveEndpointMode = await validateBraveBaseUrl(braveBaseUrl, signal);
+    signal?.throwIfAborted();
+    const { query, count } = readWebSearchQueryAndCount(args, searchConfig);
+    const rawCountry = normalizeOptionalString(readStringParam(args, "country"));
+    const canonicalCountry = rawCountry?.toUpperCase();
+    const country = canonicalCountry
+      ? BRAVE_COUNTRY_CODES.has(canonicalCountry)
+        ? canonicalCountry
+        : "ALL"
+      : undefined;
+    const language = readStringParam(args, "language");
+    const search_lang = readStringParam(args, "search_lang");
+    const ui_lang = readStringParam(args, "ui_lang");
+    const rawSearchLang = normalizeOptionalString(search_lang || language);
+    const rawUiLang = normalizeOptionalString(ui_lang);
+    let searchLangCandidate = rawSearchLang;
+    let uiLangCandidate = rawUiLang;
+    if (normalizeBraveUiLang(rawSearchLang) && normalizeBraveSearchLang(rawUiLang)) {
+      searchLangCandidate = rawUiLang;
+      uiLangCandidate = rawSearchLang;
+    }
+    const normalizedSearchLang = normalizeBraveSearchLang(searchLangCandidate);
+    if (searchLangCandidate && !normalizedSearchLang) {
+      return {
+        error: "invalid_search_lang",
+        message:
+          "search_lang must be a Brave-supported language code like 'en', 'en-gb', 'zh-hans', or 'zh-hant'.",
+        docs: "https://docs.openclaw.ai/tools/web",
+      };
+    }
+    const normalizedUiLang = normalizeBraveUiLang(uiLangCandidate);
+    if (uiLangCandidate && !normalizedUiLang) {
+      return {
+        error: "invalid_ui_lang",
+        message: "ui_lang must be a language-region locale like 'en-US'.",
+        docs: "https://docs.openclaw.ai/tools/web",
+      };
+    }
+    if (normalizedUiLang && braveMode === "llm-context") {
+      return {
+        error: "unsupported_ui_lang",
+        message:
+          "ui_lang is not supported by Brave llm-context mode. Remove ui_lang or use Brave web mode for locale-based UI hints.",
+        docs: "https://docs.openclaw.ai/tools/web",
+      };
+    }
 
-  if (normalizedLanguage.invalidField === "search_lang") {
-    return {
-      error: "invalid_search_lang",
-      message:
-        "search_lang must be a Brave-supported language code like 'en', 'en-gb', 'zh-hans', or 'zh-hant'.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-  if (normalizedLanguage.invalidField === "ui_lang") {
-    return {
-      error: "invalid_ui_lang",
-      message: "ui_lang must be a language-region locale like 'en-US'.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-  if (normalizedLanguage.ui_lang && braveMode === "llm-context") {
-    return {
-      error: "unsupported_ui_lang",
-      message:
-        "ui_lang is not supported by Brave llm-context mode. Remove ui_lang or use Brave web mode for locale-based UI hints.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-
-  const rawFreshness = readStringParam(args, "freshness");
-  if (rawFreshness && braveMode === "llm-context") {
-    return {
-      error: "unsupported_freshness",
-      message:
-        "freshness filtering is not supported by Brave llm-context mode. Remove freshness or use Brave web mode.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-  const freshness = rawFreshness ? normalizeFreshness(rawFreshness, "brave") : undefined;
-  if (rawFreshness && !freshness) {
-    return {
-      error: "invalid_freshness",
-      message: "freshness must be day, week, month, or year.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-
-  const rawDateAfter = readStringParam(args, "date_after");
-  const rawDateBefore = readStringParam(args, "date_before");
-  if (rawFreshness && (rawDateAfter || rawDateBefore)) {
-    return {
-      error: "conflicting_time_filters",
-      message:
-        "freshness and date_after/date_before cannot be used together. Use either freshness (day/week/month/year) or a date range (date_after/date_before), not both.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-  if ((rawDateAfter || rawDateBefore) && braveMode === "llm-context") {
-    return {
-      error: "unsupported_date_filter",
-      message:
-        "date_after/date_before filtering is not supported by Brave llm-context mode. Use Brave web mode for date filters.",
-      docs: "https://docs.openclaw.ai/tools/web",
-    };
-  }
-
-  const parsedDateRange = parseIsoDateRange({
-    rawDateAfter,
-    rawDateBefore,
-    invalidDateAfterMessage: "date_after must be YYYY-MM-DD format.",
-    invalidDateBeforeMessage: "date_before must be YYYY-MM-DD format.",
-    invalidDateRangeMessage: "date_after must be before date_before.",
-  });
-  if ("error" in parsedDateRange) {
-    return parsedDateRange;
-  }
-
-  const { dateAfter, dateBefore } = parsedDateRange;
-  const cacheKey = buildSearchCacheKey([
-    "brave",
-    braveMode,
-    query,
-    resolveSearchCount(count, DEFAULT_SEARCH_COUNT),
-    country,
-    normalizedLanguage.search_lang,
-    normalizedLanguage.ui_lang,
-    freshness,
-    dateAfter,
-    dateBefore,
-  ]);
-  const cached = readCachedSearchPayload(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const start = Date.now();
-  const timeoutSeconds = resolveSearchTimeoutSeconds(searchConfig);
-  const cacheTtlMs = resolveSearchCacheTtlMs(searchConfig);
-
-  if (braveMode === "llm-context") {
-    const { results, sources } = await runBraveLlmContextSearch({
-      query,
-      apiKey,
-      timeoutSeconds,
-      country: country ?? undefined,
-      search_lang: normalizedLanguage.search_lang,
-      freshness,
+    const rawFreshness = readStringParam(args, "freshness");
+    const rawDateAfter = readStringParam(args, "date_after");
+    const rawDateBefore = readStringParam(args, "date_before");
+    const parsedTimeFilters = parseWebSearchTimeFilters({
+      rawDateAfter,
+      rawDateBefore,
+      rawFreshness,
+      freshnessProvider: "brave",
+      invalidFreshnessMessage: "freshness must be day, week, month, or year.",
+      invalidDateAfterMessage: "date_after must be YYYY-MM-DD format.",
+      invalidDateBeforeMessage: "date_before must be YYYY-MM-DD format.",
+      invalidDateRangeMessage: "date_after must be before date_before.",
     });
+    if ("error" in parsedTimeFilters) {
+      return parsedTimeFilters;
+    }
+
+    const { freshness, dateAfter, dateBefore } = parsedTimeFilters;
+    if (braveMode === "llm-context") {
+      const today = new Date().toISOString().slice(0, 10);
+      if (dateAfter && !dateBefore && dateAfter > today) {
+        return {
+          error: "invalid_date_range",
+          message: "date_after cannot be in the future for Brave llm-context mode.",
+          docs: "https://docs.openclaw.ai/tools/web",
+        };
+      }
+      if (dateBefore && !dateAfter) {
+        return {
+          error: "unsupported_date_filter",
+          message:
+            "Brave llm-context mode requires date_after when date_before is set. Use a bounded date range or freshness.",
+          docs: "https://docs.openclaw.ai/tools/web",
+        };
+      }
+    }
+    const llmContextDateEnd =
+      braveMode === "llm-context" && dateAfter
+        ? (dateBefore ?? new Date().toISOString().slice(0, 10))
+        : dateBefore;
+    const requestedCount = resolveSearchCount(count, DEFAULT_SEARCH_COUNT);
+    const cacheKey = buildSearchCacheKey([
+      "brave",
+      sha256Hex(apiKey),
+      braveMode,
+      braveBaseUrl,
+      query,
+      requestedCount,
+      country,
+      normalizedSearchLang,
+      ...(braveMode === "web" ? [normalizedUiLang] : []),
+      freshness,
+      dateAfter,
+      llmContextDateEnd,
+    ]);
+    const diagnosticsEnabled = options?.diagnosticsEnabled === true;
+    const cacheTtlMs = resolveSearchCacheTtlMs(searchConfig);
+    const cached = readCachedSearchPayload(cacheKey, cacheTtlMs);
+    if (cached) {
+      logBraveHttp(diagnosticsEnabled, "cache hit", { mode: braveMode });
+      return cached;
+    }
+    logBraveHttp(diagnosticsEnabled, "cache miss", { mode: braveMode });
+
+    const start = Date.now();
+    let url = new URL(braveBaseUrl);
+    url.pathname = `${url.pathname.replace(/\/+$/u, "")}${
+      braveMode === "llm-context" ? BRAVE_LLM_CONTEXT_ENDPOINT_PATH : BRAVE_SEARCH_ENDPOINT_PATH
+    }`;
+    url.search = "";
+    url.searchParams.set("q", query);
+    if (country) {
+      url.searchParams.set("country", country);
+    }
+    if (normalizedSearchLang) {
+      url.searchParams.set("search_lang", normalizedSearchLang);
+    }
+    if (freshness) {
+      url.searchParams.set("freshness", freshness);
+    } else if (dateAfter && dateBefore) {
+      url.searchParams.set("freshness", `${dateAfter}to${dateBefore}`);
+    } else if (dateAfter) {
+      url.searchParams.set("freshness", `${dateAfter}to${new Date().toISOString().slice(0, 10)}`);
+    } else if (braveMode === "web" && dateBefore) {
+      url.searchParams.set("freshness", `1970-01-01to${dateBefore}`);
+    }
+    if (braveMode === "web") {
+      url = new URL(
+        nativeWebSearchCodecs["brave.search"].request(url.href, query, requestedCount).url,
+      );
+      if (normalizedUiLang) {
+        url.searchParams.set("ui_lang", normalizedUiLang);
+      }
+    }
+    logBraveHttp(diagnosticsEnabled, "request", {
+      mode: braveMode,
+      endpoint: `${url.origin}${url.pathname}`,
+      count: requestedCount,
+    });
+    const requestStartedAt = Date.now();
+    const withEndpoint =
+      braveEndpointMode === "selfHosted"
+        ? withSelfHostedWebToolsEndpoint
+        : withTrustedWebToolsEndpoint;
+    const response = await withEndpoint(
+      {
+        url: url.toString(),
+        signal,
+        init: {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "X-Subscription-Token": apiKey,
+          },
+        },
+      },
+      async ({ response: httpResponse }) => {
+        logBraveHttp(diagnosticsEnabled, "response", {
+          mode: braveMode,
+          status: httpResponse.status,
+          ok: httpResponse.ok,
+          durationMs: Date.now() - requestStartedAt,
+        });
+        const errorLabel =
+          braveMode === "llm-context" ? "Brave LLM Context API error" : "Brave Search API error";
+        await assertOkOrThrowProviderError(httpResponse, errorLabel);
+        if (braveMode === "llm-context") {
+          const data = await readProviderJsonResponse<BraveLlmContextResponse>(
+            httpResponse,
+            errorLabel,
+          );
+          const genericResults = Array.isArray(data.grounding?.generic)
+            ? data.grounding.generic
+            : [];
+          return {
+            mode: "llm-context" as const,
+            results: genericResults.slice(0, requestedCount).map((entry) => ({
+              url: entry.url ?? "",
+              title: entry.title ? wrapWebContent(entry.title, "web_search") : "",
+              snippets: (entry.snippets ?? [])
+                .filter((snippet) => typeof snippet === "string" && snippet.length > 0)
+                .map((snippet) => wrapWebContent(snippet, "web_search")),
+              siteName: resolveSiteName(entry.url) || undefined,
+              // Brave's fixed age slots contain timestamp (3), date (1), and relative age (2).
+              // Only the absolute forms belong in published; never infer a date from recency.
+              published:
+                data.sources?.[entry.url]?.age?.[3] ||
+                data.sources?.[entry.url]?.age?.[1] ||
+                undefined,
+            })),
+            sources: data.sources,
+          };
+        }
+        const data = await readProviderJsonResponse(httpResponse, errorLabel);
+        return {
+          mode: "web" as const,
+          results: nativeWebSearchCodecs["brave.search"].results(data, requestedCount),
+        };
+      },
+    );
+    // A completed upstream response must not write cache state after its caller aborts.
+    signal?.throwIfAborted();
+    const results = response.results;
     const payload = {
       query,
       provider: "brave",
-      mode: "llm-context" as const,
+      ...(response.mode === "llm-context" ? { mode: response.mode } : {}),
       count: results.length,
       tookMs: Date.now() - start,
-      externalContent: {
-        untrusted: true,
-        source: "web_search",
-        provider: "brave",
-        wrapped: true,
-      },
-      results: results.map((entry) => ({
-        title: entry.title ? wrapWebContent(entry.title, "web_search") : "",
-        url: entry.url,
-        snippets: entry.snippets.map((snippet) => wrapWebContent(snippet, "web_search")),
-        siteName: entry.siteName,
-      })),
-      sources,
+      externalContent: externalContentStamp("brave"),
+      results,
+      ...(response.mode === "llm-context" ? { sources: response.sources } : {}),
     };
     writeCachedSearchPayload(cacheKey, payload, cacheTtlMs);
+    logBraveHttp(diagnosticsEnabled, "cache write", {
+      mode: response.mode,
+      ttlMs: cacheTtlMs,
+      count: results.length,
+    });
     return payload;
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw error;
+  } finally {
+    cleanup();
   }
-
-  const results = await runBraveWebSearch({
-    query,
-    count: resolveSearchCount(count, DEFAULT_SEARCH_COUNT),
-    apiKey,
-    timeoutSeconds,
-    country: country ?? undefined,
-    search_lang: normalizedLanguage.search_lang,
-    ui_lang: normalizedLanguage.ui_lang,
-    freshness,
-    dateAfter,
-    dateBefore,
-  });
-  const payload = {
-    query,
-    provider: "brave",
-    count: results.length,
-    tookMs: Date.now() - start,
-    externalContent: {
-      untrusted: true,
-      source: "web_search",
-      provider: "brave",
-      wrapped: true,
-    },
-    results,
-  };
-  writeCachedSearchPayload(cacheKey, payload, cacheTtlMs);
-  return payload;
 }

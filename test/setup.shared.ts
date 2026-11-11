@@ -1,9 +1,30 @@
+// Native-loader projects replace execArgv, so their setup also owns SQLite admission.
+import "./vitest/vitest.sqlite-preload.mts";
 import { vi } from "vitest";
+import { installProcessWarningFilter } from "../src/infra/warning-filter.js";
+import {
+  declarePostgresTestRoot,
+  installPostgresTestRootGuard,
+} from "./helpers/postgres-pool-roots.js";
+import { withIsolatedTestHome } from "./test-env.js";
 
-vi.mock("@mariozechner/pi-ai/oauth", () => ({
+declarePostgresTestRoot();
+installPostgresTestRootGuard();
+
+const openAiCodexTokenRefreshTestHook = "__OPENCLAW_TEST_REFRESH_OPENAI_CODEX_TOKEN__";
+type GlobalWithOpenAiCodexTokenRefreshTestHook = typeof globalThis & {
+  [openAiCodexTokenRefreshTestHook]?: ((...args: unknown[]) => unknown) | undefined;
+};
+
+vi.mock("../src/llm/oauth.js", () => ({
   getOAuthApiKey: () => undefined,
   getOAuthProviders: () => [],
   loginOpenAICodex: vi.fn(),
+  refreshOpenAICodexToken: vi.fn((...args: unknown[]) =>
+    (globalThis as GlobalWithOpenAiCodexTokenRefreshTestHook)[openAiCodexTokenRefreshTestHook]?.(
+      ...args,
+    ),
+  ),
 }));
 
 vi.mock("@mariozechner/clipboard", () => ({
@@ -29,18 +50,20 @@ vi.mock("@mariozechner/clipboard", () => ({
 
 // Ensure Vitest environment is properly set.
 process.env.VITEST = "true";
-// Config validation walks plugin manifests; keep an aggressive cache in tests to avoid
-// repeated filesystem discovery across suites/workers.
-process.env.OPENCLAW_PLUGIN_MANIFEST_CACHE_MS ??= "60000";
+// Tests frequently point bundled plugin discovery at temp fixture roots. Production still rejects
+// arbitrary OPENCLAW_BUNDLED_PLUGINS_DIR overrides unless this Vitest-only opt-in is present.
+process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR ??= "1";
+// The Codex plugin selects a newer PATH-installed Codex once per process. Tests
+// must not probe the developer's own install; selection tests reset this slot.
+(globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.codexInstalledAppServer")] = {
+  selection: Promise.resolve(undefined),
+};
 // Vitest fork workers can load transitive lockfile helpers many times per worker.
 // Raise listener budget to avoid noisy MaxListeners warnings and warning-stack overhead.
 const TEST_PROCESS_MAX_LISTENERS = 256;
 if (process.getMaxListeners() > 0 && process.getMaxListeners() < TEST_PROCESS_MAX_LISTENERS) {
   process.setMaxListeners(TEST_PROCESS_MAX_LISTENERS);
 }
-
-import { installProcessWarningFilter } from "../src/infra/warning-filter.js";
-import { withIsolatedTestHome } from "./test-env.js";
 
 type SharedTestSetupOptions = {
   loadProfileEnv?: boolean;
@@ -78,6 +101,7 @@ export function installSharedTestSetup(options?: SharedTestSetupOptions): {
         return;
       }
       cleaned = true;
+      process.removeListener("exit", handle.cleanup);
       testEnv.cleanup();
       delete globalState[SHARED_TEST_SETUP];
     },

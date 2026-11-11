@@ -1,54 +1,33 @@
+/** Config loader for model commands with command-scoped secret resolution. */
 import { resolveCommandConfigWithSecrets } from "../../cli/command-config-resolution.js";
-import type { RuntimeEnv } from "../../runtime.js";
+import { getModelsCommandSecretTargetIds } from "../../cli/command-secret-targets.js";
 import {
-  getRuntimeConfig,
-  readSourceConfigSnapshotForWrite,
+  captureRuntimeConfigAsyncReader,
+  getRuntimeConfigSourceSnapshot,
   setRuntimeConfigSnapshot,
   type OpenClawConfig,
-  getModelsCommandSecretTargetIds,
-} from "./load-config.runtime.js";
+} from "../../config/config.js";
+import type { RuntimeEnv } from "../../runtime.js";
 
-export type LoadedModelsConfig = {
-  sourceConfig: OpenClawConfig;
-  resolvedConfig: OpenClawConfig;
-  diagnostics: string[];
-};
-
-async function loadSourceConfigSnapshot(fallback: OpenClawConfig): Promise<OpenClawConfig> {
-  try {
-    const { snapshot } = await readSourceConfigSnapshotForWrite();
-    if (snapshot.valid) {
-      return snapshot.sourceConfig;
-    }
-  } catch {
-    // Fall back to runtime-loaded config if source snapshot cannot be read.
-  }
-  return fallback;
-}
-
-export async function loadModelsConfigWithSource(params: {
+/** Loads config, resolves model command secrets, and preserves the source snapshot. */
+export async function loadModelsConfig(params: {
   commandName: string;
   runtime?: RuntimeEnv;
-}): Promise<LoadedModelsConfig> {
-  const runtimeConfig = getRuntimeConfig();
-  const sourceConfig = await loadSourceConfigSnapshot(runtimeConfig);
-  const { resolvedConfig, diagnostics } = await resolveCommandConfigWithSecrets({
+  skipPluginValidation?: boolean;
+}): Promise<OpenClawConfig> {
+  const runtimeConfig = await captureRuntimeConfigAsyncReader(
+    params.skipPluginValidation ? { skipPluginValidation: true } : undefined,
+  )();
+  const pinnedSourceConfig = getRuntimeConfigSourceSnapshot();
+  const sourceConfig = pinnedSourceConfig ?? runtimeConfig;
+  const { resolvedConfig } = await resolveCommandConfigWithSecrets({
     config: runtimeConfig,
     commandName: params.commandName,
     targetIds: getModelsCommandSecretTargetIds(),
     runtime: params.runtime,
   });
+  // Keep the original source snapshot pinned so later config writes do not
+  // accidentally serialize already-resolved secret values.
   setRuntimeConfigSnapshot(resolvedConfig, sourceConfig);
-  return {
-    sourceConfig,
-    resolvedConfig,
-    diagnostics,
-  };
-}
-
-export async function loadModelsConfig(params: {
-  commandName: string;
-  runtime?: RuntimeEnv;
-}): Promise<OpenClawConfig> {
-  return (await loadModelsConfigWithSource(params)).resolvedConfig;
+  return resolvedConfig;
 }

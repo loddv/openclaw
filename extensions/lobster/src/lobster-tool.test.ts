@@ -1,307 +1,134 @@
-import { describe, expect, it, vi } from "vitest";
-import { createTestPluginApi } from "../../../test/helpers/plugins/plugin-api.js";
-import type { OpenClawPluginApi, OpenClawPluginToolContext } from "../runtime-api.js";
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import plugin from "../index.js";
 import { createLobsterTool } from "./lobster-tool.js";
-import { createFakeTaskFlow } from "./taskflow-test-helpers.js";
 
-function fakeApi(overrides: Partial<OpenClawPluginApi> = {}): OpenClawPluginApi {
-  return createTestPluginApi({
-    id: "lobster",
-    name: "lobster",
-    source: "test",
-    runtime: { version: "test" } as any,
-    resolvePath: (p) => p,
-    ...overrides,
-  });
-}
+afterEach(() => vi.unstubAllEnvs());
 
-function fakeCtx(overrides: Partial<OpenClawPluginToolContext> = {}): OpenClawPluginToolContext {
-  return {
-    config: {},
-    workspaceDir: "/tmp",
-    agentDir: "/tmp",
-    agentId: "main",
-    sessionKey: "main",
-    messageChannel: undefined,
-    agentAccountId: undefined,
-    sandboxed: false,
-    ...overrides,
-  };
+const requireRecord = createRequireRecord("record", "expected-label-record");
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
+function resumeToken(details: unknown, field = "requiresInput") {
+  const envelope = requireRecord(details, "Lobster envelope");
+  const request = requireRecord(envelope[field], field);
+  if (typeof request.resumeToken !== "string") {
+    throw new Error("expected a resume token");
+  }
+  return request.resumeToken;
 }
 
 describe("lobster plugin tool", () => {
-  it("returns the Lobster envelope in details", async () => {
-    const runner = {
-      run: vi.fn().mockResolvedValue({
-        ok: true,
-        status: "ok",
-        output: [{ hello: "world" }],
-        requiresApproval: null,
-      }),
-    };
+  let tool: ReturnType<typeof createLobsterTool>;
+  let dir: string;
+  beforeEach(() => {
+    tool = createLobsterTool();
+    dir = tempDirs.make("openclaw-lobster-tool-");
+    vi.stubEnv("LOBSTER_STATE_DIR", dir);
+  });
+  const run = async (pipeline: string) =>
+    (await tool.execute("run", { action: "run", pipeline })).details;
+  const resume = async (
+    token: string,
+    decision: { responseJson?: string; approve?: boolean; cancel?: boolean },
+  ) => (await tool.execute("resume", { action: "resume", token, ...decision })).details;
+  const inputStep = (id: string, prompt: string, responseSchema: object, defaults?: object) => ({
+    id,
+    input: { prompt, responseSchema, ...(defaults ? { defaults } : {}) },
+  });
 
-    const tool = createLobsterTool(fakeApi(), { runner });
-    const res = await tool.execute("call1", {
-      action: "run",
-      pipeline: "noop",
-      timeoutMs: 1000,
+  it("resumes real pipeline input, preserves invalid answers, and still handles approvals", async () => {
+    const first = await run('ask --prompt "Review draft?" | approve --prompt "Publish?"');
+    expect(first).toMatchObject({
+      status: "needs_input",
+      requiresInput: { type: "input_request", prompt: "Review draft?" },
     });
-
-    expect(runner.run).toHaveBeenCalledWith({
-      action: "run",
-      pipeline: "noop",
-      cwd: process.cwd(),
-      timeoutMs: 1000,
-      maxStdoutBytes: 512_000,
-    });
-    expect(res.details).toMatchObject({
-      ok: true,
+    const token = resumeToken(first);
+    await expect(resume(token, { responseJson: '{"decision":123}' })).rejects.toThrow(
+      /schema validation/,
+    );
+    const responseJson = '{"decision":"approve","feedback":"Looks good"}';
+    const second = await resume(token, { responseJson });
+    expect(second).toMatchObject({ status: "needs_approval" });
+    const approved = await resume(resumeToken(second, "requiresApproval"), { approve: true });
+    expect(approved).toMatchObject({
       status: "ok",
-      output: [{ hello: "world" }],
-      requiresApproval: null,
+      output: [{ decision: "approve", feedback: "Looks good" }],
     });
+    await expect(resume(token, { responseJson: '{"decision":"reject"}' })).rejects.toThrow(
+      /not found/i,
+    );
   });
 
-  it("supports approval envelopes without changing the tool contract", async () => {
-    const runner = {
-      run: vi.fn().mockResolvedValue({
-        ok: true,
-        status: "needs_approval",
-        output: [],
-        requiresApproval: {
-          type: "approval_request",
-          prompt: "Send these alerts?",
-          items: [{ id: "alert-1" }],
-          resumeToken: "resume-token-1",
-        },
+  it("resumes real workflow files through successive questions without repeating preparation", async () => {
+    const seed = path.join(dir, "seed.json");
+    await fs.writeFile(seed, JSON.stringify({ draft: "original" }));
+    const file = path.join(dir, "review.lobster");
+    await fs.writeFile(
+      file,
+      JSON.stringify({
+        steps: [
+          { id: "prepare", pipeline: "state.get seed | state.set prepared" },
+          inputStep("review", "Review?", { type: "object" }, { feedback: "" }),
+          inputStep("confirm", "Which label?", { type: "string" }),
+          { id: "finish", pipeline: "state.get prepared" },
+        ],
       }),
-    };
-
-    const tool = createLobsterTool(fakeApi(), { runner });
-    const res = await tool.execute("call-injected-runner", {
-      action: "run",
-      pipeline: "noop",
-      argsJson: '{"since_hours":1}',
-      timeoutMs: 1500,
-      maxStdoutBytes: 4096,
+    );
+    const first = await run(file);
+    expect(first).toMatchObject({
+      status: "needs_input",
+      requiresInput: { defaults: { feedback: "" }, subject: { draft: "original" } },
     });
-
-    expect(runner.run).toHaveBeenCalledWith({
-      action: "run",
-      pipeline: "noop",
-      argsJson: '{"since_hours":1}',
-      cwd: process.cwd(),
-      timeoutMs: 1500,
-      maxStdoutBytes: 4096,
+    await fs.writeFile(seed, JSON.stringify({ draft: "changed" }));
+    const second = await resume(resumeToken(first), { responseJson: '{"feedback":"Keep it"}' });
+    expect(second).toMatchObject({
+      status: "needs_input",
+      requiresInput: { prompt: "Which label?" },
     });
-    expect(res.details).toMatchObject({
-      ok: true,
-      status: "needs_approval",
-      requiresApproval: {
-        type: "approval_request",
-        prompt: "Send these alerts?",
-        resumeToken: "resume-token-1",
-      },
+    // A new tool instance proves continuation comes from saved state, not the runner's memory.
+    const continued = createLobsterTool();
+    expect(continued.parameters).toBe(tool.parameters);
+    const finished = await continued.execute("finish", {
+      action: "resume",
+      token: resumeToken(second),
+      responseJson: '"reviewed"',
     });
+    expect(finished.details).toMatchObject({ status: "ok", output: [{ draft: "original" }] });
   });
 
-  it("throws when the runner returns an error envelope", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: {
-        run: vi.fn().mockResolvedValue({
-          ok: false,
-          error: {
-            type: "runtime_error",
-            message: "boom",
-          },
-        }),
-      },
+  it("cancels a real input checkpoint without executing its remaining steps", async () => {
+    const token = resumeToken(await run("ask | state.set should-not-exist"));
+    expect(await resume(token, { cancel: true })).toMatchObject({ status: "cancelled" });
+    await expect(fs.stat(path.join(dir, "should-not-exist.json"))).rejects.toMatchObject({
+      code: "ENOENT",
     });
-
-    await expect(
-      tool.execute("call-runner-error", {
-        action: "run",
-        pipeline: "noop",
-      }),
-    ).rejects.toThrow("boom");
+    await expect(resume(token, { responseJson: '{"decision":"approve"}' })).rejects.toThrow(
+      /not found/i,
+    );
   });
 
-  it("can run through managed TaskFlow mode", async () => {
-    const runner = {
-      run: vi.fn().mockResolvedValue({
-        ok: true,
-        status: "needs_approval",
-        output: [],
-        requiresApproval: {
-          type: "approval_request",
-          prompt: "Approve this?",
-          items: [{ id: "item-1" }],
-          resumeToken: "resume-1",
-        },
-      }),
-    };
-    const taskFlow = createFakeTaskFlow();
-
-    const tool = createLobsterTool(fakeApi(), { runner, taskFlow });
-    const res = await tool.execute("call-managed-run", {
-      action: "run",
-      pipeline: "noop",
-      flowControllerId: "tests/lobster",
-      flowGoal: "Run Lobster workflow",
-      flowStateJson: '{"lane":"email"}',
-      flowCurrentStep: "run_lobster",
-      flowWaitingStep: "await_review",
-    });
-
-    expect(taskFlow.createManaged).toHaveBeenCalledWith({
-      controllerId: "tests/lobster",
-      goal: "Run Lobster workflow",
-      currentStep: "run_lobster",
-      stateJson: { lane: "email" },
-    });
-    expect(taskFlow.setWaiting).toHaveBeenCalledWith({
-      flowId: "flow-1",
-      expectedRevision: 1,
-      currentStep: "await_review",
-      waitJson: {
-        kind: "lobster_approval",
-        prompt: "Approve this?",
-        items: [{ id: "item-1" }],
-        resumeToken: "resume-1",
-      },
-    });
-    expect(res.details).toMatchObject({
-      ok: true,
-      status: "needs_approval",
-      flow: {
-        flowId: "flow-1",
-      },
-      mutation: {
-        applied: true,
-      },
-    });
+  it("registers ordinary execution without a task runtime and keeps sandbox gating", () => {
+    const registerTool = vi.fn<OpenClawPluginApi["registerTool"]>();
+    plugin.register(createTestPluginApi({ registerTool }));
+    const factory = registerTool.mock.calls[0]?.[0];
+    if (typeof factory !== "function") {
+      throw new Error("expected a registered Lobster tool factory");
+    }
+    expect(factory({ sandboxed: false })).toMatchObject({ name: "lobster" });
+    expect(factory({ sandboxed: true })).toBeNull();
   });
 
-  it("rejects managed TaskFlow params when no bound taskFlow runtime is available", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-    });
-
-    await expect(
-      tool.execute("call-missing-taskflow", {
-        action: "run",
-        pipeline: "noop",
-        flowControllerId: "tests/lobster",
-        flowGoal: "Run Lobster workflow",
-      }),
-    ).rejects.toThrow(/Managed TaskFlow run mode requires a bound taskFlow runtime/);
-  });
-
-  it("rejects invalid flowStateJson in managed TaskFlow mode", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-      taskFlow: createFakeTaskFlow(),
-    });
-
-    await expect(
-      tool.execute("call-invalid-flow-json", {
-        action: "run",
-        pipeline: "noop",
-        flowControllerId: "tests/lobster",
-        flowGoal: "Run Lobster workflow",
-        flowStateJson: "{bad",
-      }),
-    ).rejects.toThrow(/flowStateJson must be valid JSON/);
-  });
-
-  it("rejects managed TaskFlow resume mode without a token", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-      taskFlow: createFakeTaskFlow(),
-    });
-
-    await expect(
-      tool.execute("call-missing-resume-token", {
-        action: "resume",
-        flowId: "flow-1",
-        flowExpectedRevision: 1,
-        approve: true,
-      }),
-    ).rejects.toThrow(/token required when using managed TaskFlow resume mode/);
-  });
-
-  it("rejects managed TaskFlow resume mode without approve", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-      taskFlow: createFakeTaskFlow(),
-    });
-
-    await expect(
-      tool.execute("call-missing-resume-approve", {
-        action: "resume",
-        token: "resume-token",
-        flowId: "flow-1",
-        flowExpectedRevision: 1,
-      }),
-    ).rejects.toThrow(/approve required when using managed TaskFlow resume mode/);
-  });
-
-  it("requires action", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-    });
-    await expect(tool.execute("call-action-missing", {})).rejects.toThrow(/action required/);
-  });
-
-  it("rejects unknown action", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-    });
-    await expect(
-      tool.execute("call-action-unknown", {
-        action: "explode",
-      }),
-    ).rejects.toThrow(/Unknown action/);
-  });
-
-  it("rejects absolute cwd", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-    });
-    await expect(
-      tool.execute("call-absolute-cwd", {
-        action: "run",
-        pipeline: "noop",
-        cwd: "/tmp",
-      }),
-    ).rejects.toThrow(/cwd must be a relative path/);
-  });
-
-  it("rejects cwd that escapes the gateway working directory", async () => {
-    const tool = createLobsterTool(fakeApi(), {
-      runner: { run: vi.fn() },
-    });
-    await expect(
-      tool.execute("call-escape-cwd", {
-        action: "run",
-        pipeline: "noop",
-        cwd: "../../etc",
-      }),
-    ).rejects.toThrow(/must stay within/);
-  });
-
-  it("can be gated off in sandboxed contexts", async () => {
-    const api = fakeApi();
-    const factoryTool = (ctx: OpenClawPluginToolContext) => {
-      if (ctx.sandboxed) {
-        return null;
-      }
-      return createLobsterTool(api, {
-        runner: { run: vi.fn() },
-      });
-    };
-
-    expect(factoryTool(fakeCtx({ sandboxed: true }))).toBeNull();
-    expect(factoryTool(fakeCtx({ sandboxed: false }))?.name).toBe("lobster");
+  it.each<[string, Record<string, unknown>, RegExp]>([
+    ["missing action", {}, /action required/],
+    ["unknown action", { action: "explode" }, /Unknown action/],
+    ["absolute cwd", { action: "run", cwd: "/tmp" }, /cwd must be a relative path/],
+    ["escaping cwd", { action: "run", pipeline: "noop", cwd: "../../etc" }, /must stay within/],
+  ])("rejects %s", async (_name, params, error) => {
+    await expect(tool.execute("invalid", params)).rejects.toThrow(error);
   });
 });

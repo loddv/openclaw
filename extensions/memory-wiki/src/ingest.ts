@@ -1,41 +1,38 @@
+import { isUtf8 } from "node:buffer";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathExists, readRegularFile } from "openclaw/plugin-sdk/security-runtime";
+import { asNullableRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { compileMemoryWikiVault } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import { appendMemoryWikiLog } from "./log.js";
-import { renderMarkdownFence, renderWikiMarkdown, slugifyWikiSegment } from "./markdown.js";
+import {
+  decodeWikiPageUtf8,
+  preserveHumanNotesBlock,
+  slugifyWikiPageStem,
+  slugifyWikiSegment,
+} from "./markdown.js";
+import { withMemoryWikiVaultMutation } from "./mutation-coordinator.js";
+import { renderImportedSourcePage } from "./source-page-shared.js";
+import { resolveMemoryWikiTimestamp } from "./time.js";
+import { readExistingWikiPage } from "./vault-page-write.js";
 import { initializeMemoryWikiVault } from "./vault.js";
 
-export type IngestMemoryWikiSourceResult = {
-  sourcePath: string;
-  pageId: string;
-  pagePath: string;
-  title: string;
-  bytes: number;
-  created: boolean;
-  indexUpdatedFiles: string[];
-};
-
-function pathExists(filePath: string): Promise<boolean> {
-  return fs
-    .access(filePath)
-    .then(() => true)
-    .catch(() => false);
-}
-
-function resolveSourceTitle(sourcePath: string, explicitTitle?: string): string {
-  if (explicitTitle?.trim()) {
-    return explicitTitle.trim();
+async function readIngestFile(filePath: string): Promise<Buffer> {
+  try {
+    // A special file must not hold the vault mutation queue waiting for a writer.
+    const { buffer } = await readRegularFile({ filePath: await fs.realpath(filePath) });
+    return buffer;
+  } catch (cause) {
+    // Keep readExistingWikiPage's recovery when a previously visible page disappears.
+    if (asNullableRecord(cause)?.code === "ENOENT") {
+      throw cause;
+    }
+    throw new Error(
+      `Cannot read wiki ingest file ${filePath}. Choose a readable regular UTF-8 file and retry.`,
+      { cause },
+    );
   }
-  return path.basename(sourcePath, path.extname(sourcePath)).replace(/[-_]+/g, " ").trim();
-}
-
-function assertUtf8Text(buffer: Buffer, sourcePath: string): string {
-  const preview = buffer.subarray(0, Math.min(buffer.length, 4096));
-  if (preview.includes(0)) {
-    throw new Error(`Cannot ingest binary file as markdown source: ${sourcePath}`);
-  }
-  return buffer.toString("utf8");
 }
 
 export async function ingestMemoryWikiSource(params: {
@@ -43,70 +40,97 @@ export async function ingestMemoryWikiSource(params: {
   inputPath: string;
   title?: string;
   nowMs?: number;
-}): Promise<IngestMemoryWikiSourceResult> {
-  await initializeMemoryWikiVault(params.config, { nowMs: params.nowMs });
-  const sourcePath = path.resolve(params.inputPath);
-  const buffer = await fs.readFile(sourcePath);
-  const content = assertUtf8Text(buffer, sourcePath);
-  const title = resolveSourceTitle(sourcePath, params.title);
-  const slug = slugifyWikiSegment(title);
-  const pageId = `source.${slug}`;
-  const pageRelativePath = path.join("sources", `${slug}.md`);
-  const pagePath = path.join(params.config.vault.path, pageRelativePath);
-  const created = !(await pathExists(pagePath));
-  const timestamp = new Date(params.nowMs ?? Date.now()).toISOString();
+  signal?: AbortSignal;
+}) {
+  // Keep the source read-modify-write and nested compile under one vault mutation lease.
+  return await withMemoryWikiVaultMutation(params.config.vault.path, async () => {
+    await initializeMemoryWikiVault(params.config, {
+      ...(params.nowMs !== undefined ? { nowMs: params.nowMs } : {}),
+      ...(params.signal ? { signal: params.signal } : {}),
+    });
+    params.signal?.throwIfAborted();
+    const sourcePath = path.resolve(params.inputPath);
+    const buffer = await readIngestFile(sourcePath);
+    params.signal?.throwIfAborted();
+    if (buffer.subarray(0, 4096).includes(0)) {
+      throw new Error(`Cannot ingest binary file as markdown source: ${sourcePath}`);
+    }
+    if (!isUtf8(buffer)) {
+      throw new Error(
+        `Source file must be valid UTF-8: ${sourcePath}. Save the source as valid UTF-8 and retry the ingest.`,
+      );
+    }
+    const title =
+      params.title?.trim() ||
+      path.basename(sourcePath, path.extname(sourcePath)).replace(/[-_]+/g, " ").trim();
+    const slug = slugifyWikiSegment(title);
+    const pageStem = slugifyWikiPageStem(title);
+    const pageId = `source.${slug}`;
+    const pageRelativePath = path.join("sources", `${pageStem}.md`);
+    const pagePath = path.join(params.config.vault.path, pageRelativePath);
+    const created = !(await pathExists(pagePath));
+    const timestamp = resolveMemoryWikiTimestamp(params.nowMs);
 
-  const markdown = renderWikiMarkdown({
-    frontmatter: {
-      pageType: "source",
-      id: pageId,
-      title,
-      sourceType: "local-file",
+    const markdown = renderImportedSourcePage({
+      frontmatter: {
+        pageType: "source",
+        id: pageId,
+        title,
+        sourceType: "local-file",
+        sourcePath,
+        ingestedAt: timestamp,
+        updatedAt: timestamp,
+        status: "active",
+      },
+      sourceHeading: "Source",
+      sourceDetails: [
+        `- Type: \`local-file\``,
+        `- Path: \`${sourcePath}\``,
+        `- Bytes: ${buffer.byteLength}`,
+        `- Updated: ${timestamp}`,
+      ],
+      content: buffer.toString("utf8"),
+      language: "text",
+    });
+
+    const existing = created
+      ? ""
+      : await readExistingWikiPage(
+          async () => decodeWikiPageUtf8(await readIngestFile(pagePath), pagePath),
+          (error) => asNullableRecord(error)?.code === "ENOENT",
+        );
+    params.signal?.throwIfAborted();
+    await fs.writeFile(
+      pagePath,
+      existing ? preserveHumanNotesBlock(markdown, existing) : markdown,
+      "utf8",
+    );
+    params.signal?.throwIfAborted();
+    await appendMemoryWikiLog(params.config.vault.path, {
+      type: "ingest",
+      timestamp,
+      details: {
+        inputPath: sourcePath,
+        pageId,
+        pagePath: pageRelativePath.split(path.sep).join("/"),
+        bytes: buffer.byteLength,
+        created,
+      },
+    });
+    params.signal?.throwIfAborted();
+    const compile = await compileMemoryWikiVault(
+      params.config,
+      params.signal ? { signal: params.signal } : undefined,
+    );
+
+    return {
       sourcePath,
-      ingestedAt: timestamp,
-      updatedAt: timestamp,
-      status: "active",
-    },
-    body: [
-      `# ${title}`,
-      "",
-      "## Source",
-      `- Type: \`local-file\``,
-      `- Path: \`${sourcePath}\``,
-      `- Bytes: ${buffer.byteLength}`,
-      `- Updated: ${timestamp}`,
-      "",
-      "## Content",
-      renderMarkdownFence(content, "text"),
-      "",
-      "## Notes",
-      "<!-- openclaw:human:start -->",
-      "<!-- openclaw:human:end -->",
-      "",
-    ].join("\n"),
-  });
-
-  await fs.writeFile(pagePath, markdown, "utf8");
-  await appendMemoryWikiLog(params.config.vault.path, {
-    type: "ingest",
-    timestamp,
-    details: {
-      inputPath: sourcePath,
       pageId,
       pagePath: pageRelativePath.split(path.sep).join("/"),
+      title,
       bytes: buffer.byteLength,
       created,
-    },
+      indexUpdatedFiles: compile.updatedFiles,
+    };
   });
-  const compile = await compileMemoryWikiVault(params.config);
-
-  return {
-    sourcePath,
-    pageId,
-    pagePath: pageRelativePath.split(path.sep).join("/"),
-    title,
-    bytes: buffer.byteLength,
-    created,
-    indexUpdatedFiles: compile.updatedFiles,
-  };
 }

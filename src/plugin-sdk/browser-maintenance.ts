@@ -1,61 +1,59 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { generateSecureToken } from "../infra/secure-random.js";
-import { runExec } from "../process/exec.js";
-import { loadBundledPluginPublicSurfaceModuleSync } from "./facade-loader.js";
+import type { SessionEntryCurrentPreparation } from "../config/sessions/session-entry-current.types.js";
+import { tryLoadActivatedBundledPluginPublicSurfaceModule } from "./facade-runtime.js";
+export { movePathToTrash, type MovePathToTrashOptions } from "./browser-trash.js";
 
-type CloseTrackedBrowserTabsParams = {
+type CloseTrackedBrowserTabsParams = SessionEntryCurrentPreparation & {
   sessionKeys: Array<string | undefined>;
+  /** Gates new cleanup claims; already claimed tabs retain their cleanup owner. */
+  isCurrent?: () => boolean;
   closeTab?: (tab: { targetId: string; baseUrl?: string; profile?: string }) => Promise<void>;
   onWarn?: (message: string) => void;
 };
 
 type BrowserMaintenanceSurface = {
+  supportsSessionEntryCurrent?: true;
   closeTrackedBrowserTabsForSessions: (params: CloseTrackedBrowserTabsParams) => Promise<number>;
 };
 
-function hasRequestedSessionKeys(sessionKeys: Array<string | undefined>): boolean {
-  return sessionKeys.some((key) => Boolean(key?.trim()));
-}
-
-function loadBrowserMaintenanceSurface(): BrowserMaintenanceSurface {
-  return loadBundledPluginPublicSurfaceModuleSync<BrowserMaintenanceSurface>({
-    dirName: "browser",
-    artifactBasename: "browser-maintenance.js",
-  });
-}
-
+/** Closes tracked browser tabs for requested session keys when the browser plugin is active. */
 export async function closeTrackedBrowserTabsForSessions(
   params: CloseTrackedBrowserTabsParams,
 ): Promise<number> {
-  if (!hasRequestedSessionKeys(params.sessionKeys)) {
+  if (params.sessionEntryCurrent && typeof params.prepareCurrent !== "function") {
+    params.onWarn?.("browser cleanup unavailable: sessionEntryCurrent requires prepareCurrent");
+    return 0;
+  }
+  if (params.isCurrent?.() === false || !params.sessionKeys.some((key) => Boolean(key?.trim()))) {
     return 0;
   }
 
-  let surface: BrowserMaintenanceSurface;
+  let surface: BrowserMaintenanceSurface | null;
   try {
-    surface = loadBrowserMaintenanceSurface();
+    // Cleanup is already async; keep cold activation off the synchronous source loader.
+    surface = await tryLoadActivatedBundledPluginPublicSurfaceModule<BrowserMaintenanceSurface>({
+      dirName: "browser",
+      artifactBasename: "browser-maintenance.js",
+    });
   } catch (error) {
     params.onWarn?.(`browser cleanup unavailable: ${String(error)}`);
     return 0;
   }
-  return await surface.closeTrackedBrowserTabsForSessions(params);
-}
-
-export async function movePathToTrash(targetPath: string): Promise<string> {
-  try {
-    await runExec("trash", [targetPath], { timeoutMs: 10_000 });
-    return targetPath;
-  } catch {
-    const trashDir = path.join(os.homedir(), ".Trash");
-    fs.mkdirSync(trashDir, { recursive: true });
-    const base = path.basename(targetPath);
-    let dest = path.join(trashDir, `${base}-${Date.now()}`);
-    if (fs.existsSync(dest)) {
-      dest = path.join(trashDir, `${base}-${Date.now()}-${generateSecureToken(6)}`);
-    }
-    fs.renameSync(targetPath, dest);
-    return dest;
+  if (!surface || params.isCurrent?.() === false) {
+    return 0;
   }
+  if (
+    (params.prepareCurrent || params.sessionEntryCurrent) &&
+    surface.supportsSessionEntryCurrent !== true
+  ) {
+    params.onWarn?.(
+      "browser cleanup unavailable: update the Browser plugin to support session-current cleanup",
+    );
+    return 0;
+  }
+  if (params.prepareCurrent) {
+    if (!(await params.prepareCurrent()) || params.isCurrent?.() === false) {
+      return 0;
+    }
+  }
+  return await surface.closeTrackedBrowserTabsForSessions(params);
 }

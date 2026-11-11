@@ -1,219 +1,162 @@
-import { listAgentIds, resolveDefaultAgentId } from "../../agents/agent-scope.js";
-import { listChatCommandsForConfig } from "../../auto-reply/commands-registry.js";
-import type {
-  ChatCommandDefinition,
-  CommandArgChoice,
-  CommandArgDefinition,
-} from "../../auto-reply/commands-registry.types.js";
-import { listSkillCommandsForAgents } from "../../auto-reply/skill-commands.js";
-import { getChannelPlugin } from "../../channels/plugins/index.js";
-import { loadConfig } from "../../config/config.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { getPluginCommandSpecs } from "../../plugins/command-registry-state.js";
-import { listPluginCommands } from "../../plugins/commands.js";
-import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
-import type { CommandEntry, CommandsListResult } from "../protocol/index.js";
+import { isDeepStrictEqual } from "node:util";
 import {
   ErrorCodes,
   errorShape,
-  formatValidationErrors,
   validateCommandsListParams,
-} from "../protocol/index.js";
-import type { GatewayRequestHandlers, RespondFn } from "./types.js";
+} from "../../../packages/gateway-protocol/src/index.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { ExecutionSkillWorkspace } from "../../skills/loading/workspace-skill-roots.js";
+import { authorizeOperatorScopesForMethod } from "../method-scopes.js";
+import { authorizeGatewaySessionCreation, resolveCreatorSandbox } from "../operator-role-policy.js";
+import { projectRequesterForClient } from "../project-access.js";
+import { resolveOperatorSessionCreation } from "../session-creation-provenance.js";
+import { resolveAgentIdOrRespondError } from "./agent-id-shared.js";
+import { buildCommandsListResult } from "./commands-list-result.js";
+import { withSessionDiscoveryAccess } from "./session-discovery-access.js";
+import type { GatewayRequestHandlerOptions, GatewayRequestHandlers } from "./types.js";
+import { defineValidatedGatewayMethod } from "./validation.js";
 
-type SerializedArg = NonNullable<CommandEntry["args"]>[number];
-type CommandNameSurface = "text" | "native";
+class ProjectCommandScopeChangedError extends Error {}
 
-function resolveAgentIdOrRespondError(rawAgentId: unknown, respond: RespondFn) {
-  const cfg = loadConfig();
-  const knownAgents = listAgentIds(cfg);
-  const requestedAgentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
-  const agentId = requestedAgentId || resolveDefaultAgentId(cfg);
-  if (requestedAgentId && !knownAgents.includes(agentId)) {
-    respond(
-      false,
-      undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, `unknown agent id "${requestedAgentId}"`),
-    );
-    return null;
+/**
+ * A New session draft may preview its selected project's skills only while this
+ * client could create that session; otherwise the agent-only catalog stays in effect.
+ * The returned check repeats admission after discovery, right before disclosure.
+ */
+async function prepareProjectSkillScope(
+  params: Pick<
+    GatewayRequestHandlerOptions,
+    "client" | "context" | "signal" | "hasCurrentClientAuthority"
+  > & { cfg: OpenClawConfig; agentId: string; projectId: string },
+): Promise<{ root: ExecutionSkillWorkspace; assertDisclosable: () => Promise<void> } | undefined> {
+  const { cfg, agentId, client } = params;
+  const canCreate = () =>
+    !authorizeGatewaySessionCreation({ cfg, agentId, client }) &&
+    authorizeOperatorScopesForMethod("sessions.create", client?.connect.scopes ?? []).allowed;
+  if (!canCreate()) {
+    return undefined;
   }
-  return { cfg, agentId };
-}
-
-function resolveNativeName(cmd: ChatCommandDefinition, provider?: string): string {
-  const baseName = cmd.nativeName ?? cmd.key;
-  if (!provider || !cmd.nativeName) {
-    return baseName;
-  }
-  return (
-    getChannelPlugin(provider)?.commands?.resolveNativeCommandName?.({
-      commandKey: cmd.key,
-      defaultName: cmd.nativeName,
-    }) ?? baseName
-  );
-}
-
-function stripLeadingSlash(value: string): string {
-  return value.startsWith("/") ? value.slice(1) : value;
-}
-
-function resolveTextAliases(cmd: ChatCommandDefinition): string[] {
-  const seen = new Set<string>();
-  const aliases: string[] = [];
-  for (const alias of cmd.textAliases) {
-    const trimmed = alias.trim();
-    if (!trimmed) {
-      continue;
+  const profileId = client?.authenticatedUserProfile?.profileId;
+  const assertCurrent = () => {
+    params.signal?.throwIfAborted();
+    if (
+      params.hasCurrentClientAuthority?.() === false ||
+      params.context.getRuntimeConfig() !== cfg ||
+      client?.authenticatedUserProfile?.profileId !== profileId ||
+      !canCreate()
+    ) {
+      throw new ProjectCommandScopeChangedError();
     }
-    const exactAlias = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-    if (seen.has(exactAlias)) {
-      continue;
-    }
-    seen.add(exactAlias);
-    aliases.push(exactAlias);
-  }
-  if (aliases.length > 0) {
-    return aliases;
-  }
-  return [`/${cmd.key}`];
-}
-
-function resolvePrimaryTextName(cmd: ChatCommandDefinition): string {
-  return stripLeadingSlash(resolveTextAliases(cmd)[0] ?? `/${cmd.key}`);
-}
-
-function serializeArg(arg: CommandArgDefinition): SerializedArg {
-  const isDynamic = typeof arg.choices === "function";
-  const staticChoices = Array.isArray(arg.choices) ? arg.choices.map(normalizeChoice) : undefined;
-  return {
-    name: arg.name,
-    description: arg.description,
-    type: arg.type,
-    ...(arg.required ? { required: true } : {}),
-    ...(staticChoices ? { choices: staticChoices } : {}),
-    ...(isDynamic ? { dynamic: true } : {}),
   };
-}
-
-function normalizeChoice(choice: CommandArgChoice): { value: string; label: string } {
-  return typeof choice === "string" ? { value: choice, label: choice } : choice;
-}
-
-function mapCommand(
-  cmd: ChatCommandDefinition,
-  source: "native" | "skill",
-  includeArgs: boolean,
-  nameSurface: CommandNameSurface,
-  provider?: string,
-): CommandEntry {
-  const shouldIncludeArgs = includeArgs && cmd.acceptsArgs && cmd.args?.length;
-  const nativeName = cmd.scope === "text" ? undefined : resolveNativeName(cmd, provider);
-  return {
-    name: nameSurface === "text" ? resolvePrimaryTextName(cmd) : (nativeName ?? cmd.key),
-    ...(nativeName ? { nativeName } : {}),
-    ...(cmd.scope !== "native" ? { textAliases: resolveTextAliases(cmd) } : {}),
-    description: cmd.description,
-    ...(cmd.category ? { category: cmd.category } : {}),
-    source,
-    scope: cmd.scope,
-    acceptsArgs: Boolean(cmd.acceptsArgs),
-    ...(shouldIncludeArgs ? { args: cmd.args!.map(serializeArg) } : {}),
-  };
-}
-
-function buildPluginCommandEntries(params: {
-  provider?: string;
-  nameSurface: CommandNameSurface;
-}): CommandEntry[] {
-  const pluginTextSpecs = listPluginCommands();
-  const pluginNativeSpecs = getPluginCommandSpecs(params.provider);
-  const entries: CommandEntry[] = [];
-
-  for (const [index, textSpec] of pluginTextSpecs.entries()) {
-    const nativeSpec = pluginNativeSpecs[index];
-    const nativeName = nativeSpec?.name;
-    entries.push({
-      name: params.nameSurface === "text" ? textSpec.name : (nativeName ?? textSpec.name),
-      ...(nativeName ? { nativeName } : {}),
-      textAliases: [`/${textSpec.name}`],
-      description: textSpec.description,
-      source: "plugin",
-      scope: "both",
-      acceptsArgs: textSpec.acceptsArgs,
+  const { resolveSessionProjectSkillRoot } = await import("../session-project-source.js");
+  const admit = () =>
+    resolveSessionProjectSkillRoot({
+      cfg,
+      projectId: params.projectId,
+      targetAgentId: agentId,
+      requester: projectRequesterForClient(client),
+      resolveSandboxRequired: () =>
+        resolveCreatorSandbox(cfg, resolveOperatorSessionCreation(client)) === "required",
+      assertCurrent,
     });
-  }
-
-  if (params.nameSurface === "native") {
-    return entries.filter((entry) => entry.nativeName);
-  }
-  return entries;
-}
-
-export function buildCommandsListResult(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  provider?: string;
-  scope?: "native" | "text" | "both";
-  includeArgs?: boolean;
-}): CommandsListResult {
-  const includeArgs = params.includeArgs !== false;
-  const scopeFilter = params.scope ?? "both";
-  const nameSurface: CommandNameSurface = scopeFilter === "text" ? "text" : "native";
-  const provider = normalizeOptionalLowercaseString(params.provider);
-
-  const skillCommands = listSkillCommandsForAgents({ cfg: params.cfg, agentIds: [params.agentId] });
-  const chatCommands = listChatCommandsForConfig(params.cfg, { skillCommands });
-  const skillKeys = new Set(skillCommands.map((sc) => `skill:${sc.skillName}`));
-
-  const commands: CommandEntry[] = [];
-
-  for (const cmd of chatCommands) {
-    if (scopeFilter !== "both" && cmd.scope !== "both" && cmd.scope !== scopeFilter) {
-      continue;
-    }
-    commands.push(
-      mapCommand(
-        cmd,
-        skillKeys.has(cmd.key) ? "skill" : "native",
-        includeArgs,
-        nameSurface,
-        provider,
-      ),
-    );
-  }
-
-  commands.push(...buildPluginCommandEntries({ provider, nameSurface }));
-
-  return { commands };
+  const root = await admit();
+  assertCurrent();
+  return root
+    ? {
+        root,
+        assertDisclosable: async () => {
+          if (!isDeepStrictEqual(await admit(), root)) {
+            throw new ProjectCommandScopeChangedError();
+          }
+          assertCurrent();
+        },
+      }
+    : undefined;
 }
 
 export const commandsHandlers: GatewayRequestHandlers = {
-  "commands.list": ({ params, respond }) => {
-    if (!validateCommandsListParams(params)) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          `invalid commands.list params: ${formatValidationErrors(validateCommandsListParams.errors)}`,
-        ),
+  "commands.list": defineValidatedGatewayMethod(
+    "commands.list",
+    validateCommandsListParams,
+    async ({ params, respond, context, client, signal, hasCurrentClientAuthority }) => {
+      if (params.projectId && params.sessionKey) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "Use projectId only before a session exists; an existing session already owns its project.",
+          ),
+        );
+        return;
+      }
+      const resolved = resolveAgentIdOrRespondError({
+        rawAgentId: params.agentId,
+        respond,
+        cfg: context.getRuntimeConfig(),
+      });
+      if (!resolved) {
+        return;
+      }
+      if (params.projectId) {
+        const projectChanged = errorShape(
+          ErrorCodes.UNAVAILABLE,
+          "Project access changed while preparing its commands. Retry the request.",
+          { retryable: true },
+        );
+        try {
+          const scope = await prepareProjectSkillScope({
+            cfg: resolved.cfg,
+            agentId: resolved.agentId,
+            projectId: params.projectId,
+            client,
+            context,
+            signal,
+            hasCurrentClientAuthority,
+          });
+          const result = await buildCommandsListResult({
+            cfg: resolved.cfg,
+            agentId: resolved.agentId,
+            projectSkillRoot: scope?.root,
+            provider: params.provider,
+            scope: params.scope,
+            includeArgs: params.includeArgs,
+          });
+          await scope?.assertDisclosable();
+          respond(true, result, undefined);
+        } catch (error) {
+          if (!(error instanceof ProjectCommandScopeChangedError)) {
+            throw error;
+          }
+          respond(false, undefined, projectChanged);
+        }
+        return;
+      }
+      await withSessionDiscoveryAccess(
+        {
+          client,
+          context,
+          respond,
+          signal,
+          hasCurrentClientAuthority,
+          sessionKey: params.sessionKey,
+          agentId: resolved.agentId,
+          changedError: errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "Session changed while preparing its commands. Retry the request.",
+          ),
+        },
+        (sessionEntry) =>
+          buildCommandsListResult({
+            cfg: resolved.cfg,
+            agentId: resolved.agentId,
+            provider: params.provider,
+            scope: params.scope,
+            includeArgs: params.includeArgs,
+            sessionKey: params.sessionKey,
+            sessionEntry,
+          }),
       );
-      return;
-    }
-    const resolved = resolveAgentIdOrRespondError(params.agentId, respond);
-    if (!resolved) {
-      return;
-    }
-    respond(
-      true,
-      buildCommandsListResult({
-        cfg: resolved.cfg,
-        agentId: resolved.agentId,
-        provider: params.provider,
-        scope: params.scope,
-        includeArgs: params.includeArgs,
-      }),
-      undefined,
-    );
-  },
+    },
+  ),
 };

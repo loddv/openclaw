@@ -1,12 +1,13 @@
-import { promises as fs } from "node:fs";
+// Shared parsing, diffing, and reporting helpers for inventory guard scripts.
 import path from "node:path";
+import { visitModuleSpecifiers } from "./ts-guard-utils.mts";
 
-const parsedTypeScriptSourceCache = new Map();
-
+/** Convert an absolute file path to a repo-relative POSIX path. */
 export function normalizeRepoPath(repoRoot, filePath) {
   return path.relative(repoRoot, filePath).split(path.sep).join("/");
 }
 
+/** Resolve a relative or absolute module specifier to a repo-relative path. */
 export function resolveRepoSpecifier(repoRoot, specifier, importerFile) {
   if (specifier.startsWith(".")) {
     return normalizeRepoPath(repoRoot, path.resolve(path.dirname(importerFile), specifier));
@@ -17,123 +18,80 @@ export function resolveRepoSpecifier(repoRoot, specifier, importerFile) {
   return null;
 }
 
-export function visitModuleSpecifiers(ts, sourceFile, visit) {
-  function walk(node) {
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-      visit({
-        kind: "import",
-        node,
-        specifier: node.moduleSpecifier.text,
-        specifierNode: node.moduleSpecifier,
-      });
-    } else if (
-      ts.isExportDeclaration(node) &&
-      node.moduleSpecifier &&
-      ts.isStringLiteral(node.moduleSpecifier)
-    ) {
-      visit({
-        kind: "export",
-        node,
-        specifier: node.moduleSpecifier.text,
-        specifierNode: node.moduleSpecifier,
-      });
-    } else if (
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length === 1 &&
-      ts.isStringLiteral(node.arguments[0])
-    ) {
-      visit({
-        kind: "dynamic-import",
-        node,
-        specifier: node.arguments[0].text,
-        specifierNode: node.arguments[0],
-      });
-    }
-
-    ts.forEachChild(node, walk);
-  }
-
-  walk(sourceFile);
-}
-
-export function diffInventoryEntries(expected, actual, compareEntries) {
-  const expectedKeys = new Set(expected.map((entry) => JSON.stringify(entry)));
-  const actualKeys = new Set(actual.map((entry) => JSON.stringify(entry)));
-  return {
-    missing: expected
-      .filter((entry) => !actualKeys.has(JSON.stringify(entry)))
-      .toSorted(compareEntries),
-    unexpected: actual
-      .filter((entry) => !expectedKeys.has(JSON.stringify(entry)))
-      .toSorted(compareEntries),
-  };
-}
-
+/** Write one line to a stream without each caller repeating newline handling. */
 export function writeLine(stream, text) {
   stream.write(`${text}\n`);
 }
 
-export async function collectTypeScriptInventory(params) {
-  const inventory = [];
-  const scriptKind = params.scriptKind ?? params.ts.ScriptKind.TS;
-
-  for (const filePath of params.files) {
-    const cacheKey = `${scriptKind}:${filePath}`;
-    let sourceFile = parsedTypeScriptSourceCache.get(cacheKey);
-    if (!sourceFile) {
-      const source = await fs.readFile(filePath, "utf8");
-      if (params.shouldParseSource && !params.shouldParseSource(source, filePath)) {
-        continue;
+/**
+ * Collect module references from a source file owned by the caller's parsing session.
+ *
+ * @param {import("typescript/ast").SourceFile} sourceFile
+ * @param {{
+ *   acceptSpecifier?: (specifier: string) => boolean;
+ * }} [options]
+ * @returns {Array<{ kind: string; line: number; specifier: string }>}
+ */
+export function collectModuleReferencesFromSource(sourceFile, options = {}) {
+  const acceptSpecifier = options.acceptSpecifier ?? (() => true);
+  const references = [];
+  visitModuleSpecifiers(
+    sourceFile,
+    ({ kind, specifier, specifierNode }) => {
+      if (acceptSpecifier(specifier)) {
+        references.push({
+          kind,
+          line:
+            sourceFile.getLineAndCharacterOfPosition(specifierNode.getStart(sourceFile)).line + 1,
+          specifier,
+        });
       }
-      sourceFile = params.ts.createSourceFile(
-        filePath,
-        source,
-        params.ts.ScriptTarget.Latest,
-        true,
-        scriptKind,
-      );
-      parsedTypeScriptSourceCache.set(cacheKey, sourceFile);
-    }
-    inventory.push(...params.collectEntries(sourceFile, filePath));
-  }
+    },
+    { includeCommonJs: true, includeImportMetaUrl: true, includeImportTypes: true },
+  );
 
-  return inventory.toSorted(params.compareEntries);
+  return references.toSorted(
+    (left, right) =>
+      left.line - right.line ||
+      left.kind.localeCompare(right.kind) ||
+      left.specifier.localeCompare(right.specifier),
+  );
 }
 
-export async function runBaselineInventoryCheck(params) {
-  const streams = params.io ?? { stdout: process.stdout, stderr: process.stderr };
-  const json = params.argv.includes("--json");
-  const actual = await params.collectActual();
-  const expected = await params.readExpected();
-  const { missing, unexpected } = params.diffInventory(expected, actual);
-  const matchesBaseline = missing.length === 0 && unexpected.length === 0;
-
-  if (json) {
-    writeLine(streams.stdout, JSON.stringify(actual, null, 2));
-  } else {
-    writeLine(streams.stdout, params.formatInventoryHuman(actual));
-    writeLine(
-      streams.stdout,
-      matchesBaseline
-        ? `Baseline matches (${actual.length} entries).`
-        : `Baseline mismatch (${unexpected.length} unexpected, ${missing.length} missing).`,
-    );
-    if (!matchesBaseline) {
-      if (unexpected.length > 0) {
-        writeLine(streams.stderr, "Unexpected entries:");
-        for (const entry of unexpected) {
-          writeLine(streams.stderr, `- ${params.formatEntry(entry)}`);
-        }
-      }
-      if (missing.length > 0) {
-        writeLine(streams.stderr, "Missing baseline entries:");
-        for (const entry of missing) {
-          writeLine(streams.stderr, `- ${params.formatEntry(entry)}`);
-        }
-      }
+/** Memoize an async factory while resetting the cache after failures. */
+export function createCachedAsync(factory) {
+  let cachedPromise = null;
+  return async function getCachedValue() {
+    if (cachedPromise) {
+      return cachedPromise;
     }
+
+    cachedPromise = factory();
+    try {
+      return await cachedPromise;
+    } catch (error) {
+      cachedPromise = null;
+      throw error;
+    }
+  };
+}
+
+/** Format grouped inventory entries for human-readable guard output. */
+export function formatGroupedInventoryHuman(params, inventory) {
+  if (inventory.length === 0) {
+    return `${params.rule}\n${params.cleanMessage}`;
   }
 
-  return matchesBaseline ? 0 : 1;
+  const lines = [params.rule, params.inventoryTitle];
+  let activeFile = "";
+  for (const entry of inventory) {
+    if (entry.file !== activeFile) {
+      activeFile = entry.file;
+      lines.push(activeFile);
+    }
+    lines.push(`  - line ${entry.line} [${entry.kind}] ${entry.reason}`);
+    lines.push(`    specifier: ${entry.specifier}`);
+    lines.push(`    resolved: ${entry.resolvedPath}`);
+  }
+  return lines.join("\n");
 }

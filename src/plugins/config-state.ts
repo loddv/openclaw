@@ -1,148 +1,285 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+/** Normalizes plugin config and resolves effective enablement, slots, and activation sources. */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import {
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
+import { isDeeplyFrozenPlainData } from "../shared/immutable-data.js";
 import {
   resolveMemorySlotDecisionShared,
-  resolveEnableStateShared,
-  resolveEnableStateResult,
+  resolvePluginActivationStateShared,
+  type PluginActivationConfigSourceLike,
+  type PluginActivationStateLike,
 } from "./config-activation-shared.js";
 import {
-  hasExplicitPluginConfig as hasExplicitPluginConfigShared,
-  isBundledChannelEnabledByChannelConfig as isBundledChannelEnabledByChannelConfigShared,
-  normalizePluginsConfigWithResolver,
+  normalizePluginsConfigWithResolverCore,
   type NormalizedPluginsConfig as SharedNormalizedPluginsConfig,
 } from "./config-normalization-shared.js";
-import { loadPluginManifestRegistry } from "./manifest-registry.js";
 import type { PluginOrigin } from "./plugin-origin.types.js";
+import { normalizePluginPolicyId } from "./plugin-policy-id.js";
+import { defaultSlotIdForKey } from "./slots.js";
 
-export type PluginActivationSource = "disabled" | "explicit" | "auto" | "default";
+export type PluginActivationState = PluginActivationStateLike;
 
-export type PluginExplicitSelectionCause =
-  | "enabled-in-config"
-  | "bundled-channel-enabled-in-config"
-  | "selected-memory-slot"
-  | "selected-context-engine-slot"
-  | "selected-in-allowlist";
-
-export type PluginActivationCause =
-  | PluginExplicitSelectionCause
-  | "plugins-disabled"
-  | "blocked-by-denylist"
-  | "disabled-in-config"
-  | "workspace-disabled-by-default"
-  | "not-in-allowlist"
-  | "enabled-by-effective-config"
-  | "bundled-channel-configured"
-  | "bundled-default-enablement"
-  | "bundled-disabled-by-default";
-
-export type PluginActivationState = {
-  enabled: boolean;
-  activated: boolean;
-  explicitlyEnabled: boolean;
-  source: PluginActivationSource;
-  reason?: string;
-};
-
-type PluginActivationDecision = {
-  enabled: boolean;
-  activated: boolean;
-  explicitlyEnabled: boolean;
-  source: PluginActivationSource;
-  cause?: PluginActivationCause;
-  reason?: string;
-};
-
-export type PluginActivationConfigSource = {
-  plugins: NormalizedPluginsConfig;
-  rootConfig?: OpenClawConfig;
-};
+export type PluginActivationConfigSource = PluginActivationConfigSourceLike;
 
 export type NormalizedPluginsConfig = SharedNormalizedPluginsConfig;
 
-let bundledPluginAliasLookupCache: ReadonlyMap<string, string> | undefined;
+const BUILT_IN_PLUGIN_ALIAS_LOOKUP = new Map<string, string>([
+  ["google-gemini-cli", "google"],
+  ["minimax-portal", "minimax"],
+  ["minimax-portal-auth", "minimax"],
+]);
+const RETIRED_PLUGIN_IDS = new Set([
+  "google-antigravity-auth",
+  "google-gemini-cli-auth",
+  "webhooks",
+]);
 
-function getBundledPluginAliasLookup(): ReadonlyMap<string, string> {
-  if (bundledPluginAliasLookupCache) {
-    return bundledPluginAliasLookupCache;
-  }
-
-  const lookup = new Map<string, string>();
-  for (const plugin of loadPluginManifestRegistry({ cache: true }).plugins) {
-    if (plugin.origin !== "bundled") {
-      continue;
-    }
-    const pluginId = normalizeOptionalLowercaseString(plugin.id);
-    if (pluginId) {
-      lookup.set(pluginId, plugin.id);
-    }
-    for (const providerId of plugin.providers) {
-      const normalizedProviderId = normalizeOptionalLowercaseString(providerId);
-      if (normalizedProviderId) {
-        lookup.set(normalizedProviderId, plugin.id);
-      }
-    }
-    for (const legacyPluginId of plugin.legacyPluginIds ?? []) {
-      const normalizedLegacyPluginId = normalizeOptionalLowercaseString(legacyPluginId);
-      if (normalizedLegacyPluginId) {
-        lookup.set(normalizedLegacyPluginId, plugin.id);
-      }
-    }
-  }
-  bundledPluginAliasLookupCache = lookup;
-  return lookup;
-}
-
+/** Normalizes user/config plugin ids into the canonical lowercase key form. */
 export function normalizePluginId(id: string): string {
-  const trimmed = normalizeOptionalString(id) ?? "";
-  const normalized = normalizeOptionalLowercaseString(trimmed) ?? "";
-  return getBundledPluginAliasLookup().get(normalized) ?? trimmed;
+  const normalized = normalizePluginPolicyId(id);
+  return BUILT_IN_PLUGIN_ALIAS_LOOKUP.get(normalized) ?? normalized;
 }
 
-const PLUGIN_ACTIVATION_REASON_BY_CAUSE: Record<PluginActivationCause, string> = {
-  "enabled-in-config": "enabled in config",
-  "bundled-channel-enabled-in-config": "channel enabled in config",
-  "selected-memory-slot": "selected memory slot",
-  "selected-context-engine-slot": "selected context engine slot",
-  "selected-in-allowlist": "selected in allowlist",
-  "plugins-disabled": "plugins disabled",
-  "blocked-by-denylist": "blocked by denylist",
-  "disabled-in-config": "disabled in config",
-  "workspace-disabled-by-default": "workspace plugin (disabled by default)",
-  "not-in-allowlist": "not in allowlist",
-  "enabled-by-effective-config": "enabled by effective config",
-  "bundled-channel-configured": "channel configured",
-  "bundled-default-enablement": "bundled default enablement",
-  "bundled-disabled-by-default": "bundled (disabled by default)",
+export function isRetiredPluginId(id: string): boolean {
+  return RETIRED_PLUGIN_IDS.has(normalizePluginId(id));
+}
+
+/** Identifies the credential-free marker that records an explicit plugin disable decision. */
+export function isExplicitPluginDisableMarker(value: unknown): boolean {
+  return isRecord(value) && value.enabled === false && Object.keys(value).length === 1;
+}
+
+/** Builds caller-owned policy without exposing the host's prepared objects. */
+export const createNormalizedPluginsConfig = (
+  config?: OpenClawConfig["plugins"],
+): NormalizedPluginsConfig => normalizePluginsConfigWithResolverCore(config, normalizePluginId);
+
+export const normalizePluginsConfig = (
+  input?: OpenClawConfig["plugins"],
+): NormalizedPluginsConfig => {
+  if (preparedRuntimePluginsConfig && preparedRuntimePluginsConfig.source === input) {
+    return preparedRuntimePluginsConfig.value;
+  }
+  const config = input ?? EMPTY_PLUGINS_CONFIG;
+  if (!isDeeplyFrozenPlainData(config)) {
+    return createNormalizedPluginsConfig(config);
+  }
+  // Captured configs are frozen and cannot change in place, so they share one frozen policy.
+  let value = frozenPluginsConfigs.get(config);
+  if (!value) {
+    value = createSharedNormalizedPluginsConfig(config);
+    frozenPluginsConfigs.set(config, value);
+  }
+  return value;
 };
 
-function resolvePluginActivationReason(
-  cause?: PluginActivationCause,
-  reason?: string,
-): string | undefined {
-  if (reason) {
-    return reason;
+export type ContextEngineOwnerMetadata = {
+  id: string;
+  contextEngineIds?: readonly string[];
+};
+
+let preparedRuntimePluginsConfig:
+  | { source: OpenClawConfig["plugins"]; value: NormalizedPluginsConfig }
+  | undefined;
+const EMPTY_PLUGINS_CONFIG = Object.freeze({});
+const frozenPluginsConfigs = new WeakMap<
+  NonNullable<OpenClawConfig["plugins"]>,
+  NormalizedPluginsConfig
+>();
+
+function createSharedNormalizedPluginsConfig(
+  config: OpenClawConfig["plugins"],
+): NormalizedPluginsConfig {
+  const value = createNormalizedPluginsConfig(config);
+  for (const entry of Object.values(value.entries)) {
+    // Normalization owns these fixed-depth policy fields; plugin payloads retain their owner.
+    Object.freeze(entry.hooks?.timeouts);
+    Object.freeze(entry.hooks);
+    Object.freeze(entry.subagent?.allowedModels);
+    Object.freeze(entry.subagent);
+    Object.freeze(entry.llm?.allowedModels);
+    Object.freeze(entry.llm?.allowedCompletionModels);
+    Object.freeze(entry.llm);
+    Object.freeze(entry);
   }
-  return cause ? PLUGIN_ACTIVATION_REASON_BY_CAUSE[cause] : undefined;
+  Object.freeze(value.entries);
+  for (const field of [value.allow, value.deny, value.loadPaths, value.slots]) {
+    Object.freeze(field);
+  }
+  return Object.freeze(value);
 }
 
-function toPluginActivationState(decision: PluginActivationDecision): PluginActivationState {
+/** Runtime config publication owns replacement, including same-object refreshes and teardown. */
+export function prepareRuntimePluginsConfig(config: OpenClawConfig | null): void {
+  preparedRuntimePluginsConfig = config
+    ? { source: config.plugins, value: createSharedNormalizedPluginsConfig(config.plugins) }
+    : undefined;
+}
+
+/** Resolves the enabled plugin selected to own the context-engine slot. */
+export function resolveSelectedContextEnginePluginId(
+  config: OpenClawConfig | undefined,
+  records: readonly ContextEngineOwnerMetadata[],
+): string | undefined {
+  const plugins = normalizePluginsConfig(config?.plugins);
+  return resolveSelectedContextEnginePluginIdFromConfig(
+    plugins,
+    plugins.slots.contextEngine,
+    records,
+  );
+}
+
+function isContextEngineOwnerEligible(
+  plugins: NormalizedPluginsConfig,
+  pluginId: string,
+  normalizedEngineId: string,
+): boolean {
+  if (
+    !plugins.enabled ||
+    !pluginId ||
+    plugins.deny.includes(pluginId) ||
+    plugins.entries[pluginId]?.enabled === false
+  ) {
+    return false;
+  }
+  // Equal-ID slots retain their explicit-selection exception to the allowlist.
+  return (
+    pluginId === normalizedEngineId ||
+    ((plugins.entries[pluginId]?.enabled === true || plugins.allow.includes(pluginId)) &&
+      (plugins.allow.length === 0 || plugins.allow.includes(pluginId)))
+  );
+}
+
+/** Declared owners participate in selection and collision checks only when policy permits them. */
+export function resolveEligibleContextEngineDeclaredOwners(
+  plugins: NormalizedPluginsConfig,
+  engineId: string | null | undefined,
+  records: readonly ContextEngineOwnerMetadata[],
+  normalizeId: (id: string) => string = normalizePluginId,
+): { hasDeclarations: boolean; pluginIds: string[] } {
+  const declared = records.filter(
+    (record) => engineId && record.contextEngineIds?.includes(engineId),
+  );
+  const normalizedEngineId = engineId ? normalizePluginPolicyId(normalizeId(engineId)) : undefined;
   return {
-    enabled: decision.enabled,
-    activated: decision.activated,
-    explicitlyEnabled: decision.explicitlyEnabled,
-    source: decision.source,
-    reason: resolvePluginActivationReason(decision.cause, decision.reason),
+    hasDeclarations: declared.length > 0,
+    pluginIds: normalizedEngineId
+      ? [...new Set(declared.map((record) => record.id))].filter((pluginId) =>
+          isContextEngineOwnerEligible(
+            plugins,
+            normalizePluginPolicyId(normalizeId(pluginId)),
+            normalizedEngineId,
+          ),
+        )
+      : [],
   };
 }
 
-export const normalizePluginsConfig = (
-  config?: OpenClawConfig["plugins"],
-): NormalizedPluginsConfig => {
-  return normalizePluginsConfigWithResolver(config, normalizePluginId);
-};
+/** All independently eligible claimants must be known before any runtime module imports. */
+export function resolveEligibleContextEngineOwnerIds(
+  plugins: NormalizedPluginsConfig,
+  engineId: string | null | undefined,
+  records: readonly ContextEngineOwnerMetadata[],
+  normalizeId: (id: string) => string = normalizePluginId,
+): string[] {
+  if (!plugins.enabled || !engineId || engineId === defaultSlotIdForKey("contextEngine")) {
+    return [];
+  }
+  const declared = resolveEligibleContextEngineDeclaredOwners(
+    plugins,
+    engineId,
+    records,
+    normalizeId,
+  );
+  const legacyId = normalizePluginPolicyId(normalizeId(engineId));
+  const legacy = records
+    .filter(
+      (record) =>
+        normalizePluginPolicyId(normalizeId(record.id)) === legacyId &&
+        record.contextEngineIds === undefined,
+    )
+    .map((record) => record.id);
+  const legacyIndependentlyApproved =
+    !declared.hasDeclarations ||
+    plugins.entries[legacyId]?.enabled === true ||
+    plugins.allow.includes(legacyId);
+  return [
+    ...new Set([
+      ...declared.pluginIds,
+      ...(legacy.length > 0 &&
+      legacyIndependentlyApproved &&
+      isContextEngineOwnerEligible(plugins, legacyId, legacyId)
+        ? legacy
+        : []),
+    ]),
+  ];
+}
+
+export function resolveSelectedContextEnginePluginIdFromConfig(
+  plugins: NormalizedPluginsConfig,
+  engineId: string | null | undefined,
+  records: readonly ContextEngineOwnerMetadata[],
+  normalizeId: (id: string) => string = normalizePluginId,
+): string | undefined {
+  if (!plugins.enabled || !engineId || engineId === defaultSlotIdForKey("contextEngine")) {
+    return undefined;
+  }
+  const owners = resolveEligibleContextEngineOwnerIds(plugins, engineId, records, normalizeId);
+  return owners.length === 1 ? owners[0] : undefined;
+}
+
+/** Carries prepared ownership without changing the registered engine selector. */
+export function withContextEngineOwner(
+  plugins: NormalizedPluginsConfig,
+  records: readonly ContextEngineOwnerMetadata[],
+  normalizeId: (id: string) => string = normalizePluginId,
+): NormalizedPluginsConfig {
+  const selectedOwner = resolveSelectedContextEnginePluginIdFromConfig(
+    plugins,
+    plugins.slots.contextEngine,
+    records,
+    normalizeId,
+  );
+  return {
+    ...plugins,
+    contextEngineOwnerId: selectedOwner
+      ? normalizePluginPolicyId(normalizeId(selectedOwner))
+      : null,
+  };
+}
+
+/** Canonicalizes one plugin entry and its policy-list ids before a targeted mutation. */
+export function normalizePluginTargetConfig(
+  config: OpenClawConfig,
+  pluginId: string,
+): OpenClawConfig {
+  const normalizedId = normalizePluginId(pluginId);
+  const normalized = normalizePluginsConfig(config.plugins);
+  const rawEntries = config.plugins?.entries ?? {};
+  const hasTargetEntry = Object.keys(rawEntries).some(
+    (entryId) => normalizePluginId(entryId) === normalizedId,
+  );
+  const entries = Object.fromEntries(
+    Object.entries(rawEntries).filter(([entryId]) => normalizePluginId(entryId) !== normalizedId),
+  );
+  if (hasTargetEntry) {
+    const { config: pluginConfig, ...entry } = normalized.entries[normalizedId] ?? {};
+    entries[normalizedId] = {
+      // Auth/setup compares this authored candidate after it is persisted as JSON.
+      // Absent optional runtime fields must not become non-round-trippable own keys.
+      ...Object.fromEntries(Object.entries(entry).filter(([, value]) => value !== undefined)),
+      ...(isRecord(pluginConfig) ? { config: pluginConfig } : {}),
+    };
+  }
+  return {
+    ...config,
+    plugins: {
+      ...config.plugins,
+      ...(Array.isArray(config.plugins?.allow) ? { allow: normalized.allow } : {}),
+      ...(Array.isArray(config.plugins?.deny) ? { deny: normalized.deny } : {}),
+      entries,
+    },
+  };
+}
 
 export function createPluginActivationSource(params: {
   config?: OpenClawConfig;
@@ -155,13 +292,24 @@ export function createPluginActivationSource(params: {
 }
 
 const hasExplicitMemorySlot = (plugins?: OpenClawConfig["plugins"]) =>
-  Boolean(plugins?.slots && Object.prototype.hasOwnProperty.call(plugins.slots, "memory"));
+  Boolean(plugins?.slots && Object.hasOwn(plugins.slots, "memory"));
 
 const hasExplicitMemoryEntry = (plugins?: OpenClawConfig["plugins"]) =>
-  Boolean(plugins?.entries && Object.prototype.hasOwnProperty.call(plugins.entries, "memory-core"));
+  Boolean(plugins?.entries && Object.hasOwn(plugins.entries, defaultSlotIdForKey("memory")));
 
-export const hasExplicitPluginConfig = (plugins?: OpenClawConfig["plugins"]) =>
-  hasExplicitPluginConfigShared(plugins);
+export function hasExplicitPluginConfig(plugins?: OpenClawConfig["plugins"]): boolean {
+  if (!plugins) {
+    return false;
+  }
+  return (
+    typeof plugins.enabled === "boolean" ||
+    (Array.isArray(plugins.allow) && plugins.allow.length > 0) ||
+    (Array.isArray(plugins.deny) && plugins.deny.length > 0) ||
+    (Array.isArray(plugins.load?.paths) && plugins.load.paths.length > 0) ||
+    Boolean(plugins.slots && Object.keys(plugins.slots).length > 0) ||
+    Boolean(plugins.entries && Object.keys(plugins.entries).length > 0)
+  );
+}
 
 export function applyTestPluginDefaults(
   cfg: OpenClawConfig,
@@ -172,27 +320,14 @@ export function applyTestPluginDefaults(
   }
   const plugins = cfg.plugins;
   const explicitConfig = hasExplicitPluginConfig(plugins);
-  if (explicitConfig) {
-    if (hasExplicitMemorySlot(plugins) || hasExplicitMemoryEntry(plugins)) {
-      return cfg;
-    }
-    return {
-      ...cfg,
-      plugins: {
-        ...plugins,
-        slots: {
-          ...plugins?.slots,
-          memory: "none",
-        },
-      },
-    };
+  if (explicitConfig && (hasExplicitMemorySlot(plugins) || hasExplicitMemoryEntry(plugins))) {
+    return cfg;
   }
-
   return {
     ...cfg,
     plugins: {
       ...plugins,
-      enabled: false,
+      ...(!explicitConfig ? { enabled: false } : {}),
       slots: {
         ...plugins?.slots,
         memory: "none",
@@ -205,250 +340,49 @@ export function isTestDefaultMemorySlotDisabled(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  if (!env.VITEST) {
-    return false;
-  }
-  const plugins = cfg.plugins;
-  if (hasExplicitMemorySlot(plugins) || hasExplicitMemoryEntry(plugins)) {
-    return false;
-  }
-  return true;
-}
-
-function resolveExplicitPluginSelection(params: {
-  id: string;
-  origin: PluginOrigin;
-  config: NormalizedPluginsConfig;
-  rootConfig?: OpenClawConfig;
-}): { explicitlyEnabled: boolean; cause?: PluginExplicitSelectionCause } {
-  if (params.config.entries[params.id]?.enabled === true) {
-    return { explicitlyEnabled: true, cause: "enabled-in-config" };
-  }
-  if (
-    params.origin === "bundled" &&
-    isBundledChannelEnabledByChannelConfig(params.rootConfig, params.id)
-  ) {
-    return { explicitlyEnabled: true, cause: "bundled-channel-enabled-in-config" };
-  }
-  if (params.config.slots.memory === params.id) {
-    return { explicitlyEnabled: true, cause: "selected-memory-slot" };
-  }
-  if (params.config.slots.contextEngine === params.id) {
-    return { explicitlyEnabled: true, cause: "selected-context-engine-slot" };
-  }
-  if (params.origin !== "bundled" && params.config.allow.includes(params.id)) {
-    return { explicitlyEnabled: true, cause: "selected-in-allowlist" };
-  }
-  return { explicitlyEnabled: false };
-}
-
-export function resolvePluginActivationState(params: {
-  id: string;
-  origin: PluginOrigin;
-  config: NormalizedPluginsConfig;
-  rootConfig?: OpenClawConfig;
-  enabledByDefault?: boolean;
-  activationSource?: PluginActivationConfigSource;
-  autoEnabledReason?: string;
-}): PluginActivationState {
-  const activationSource =
-    params.activationSource ??
-    createPluginActivationSource({
-      config: params.rootConfig,
-      plugins: params.config,
-    });
-  const explicitSelection = resolveExplicitPluginSelection({
-    id: params.id,
-    origin: params.origin,
-    config: activationSource.plugins,
-    rootConfig: activationSource.rootConfig,
-  });
-
-  if (!params.config.enabled) {
-    return toPluginActivationState({
-      enabled: false,
-      activated: false,
-      explicitlyEnabled: explicitSelection.explicitlyEnabled,
-      source: "disabled",
-      cause: "plugins-disabled",
-    });
-  }
-  if (params.config.deny.includes(params.id)) {
-    return toPluginActivationState({
-      enabled: false,
-      activated: false,
-      explicitlyEnabled: explicitSelection.explicitlyEnabled,
-      source: "disabled",
-      cause: "blocked-by-denylist",
-    });
-  }
-  const entry = params.config.entries[params.id];
-  if (entry?.enabled === false) {
-    return toPluginActivationState({
-      enabled: false,
-      activated: false,
-      explicitlyEnabled: explicitSelection.explicitlyEnabled,
-      source: "disabled",
-      cause: "disabled-in-config",
-    });
-  }
-  const explicitlyAllowed = params.config.allow.includes(params.id);
-  if (
-    params.origin === "workspace" &&
-    !explicitlyAllowed &&
-    entry?.enabled !== true &&
-    explicitSelection.cause !== "selected-context-engine-slot"
-  ) {
-    return toPluginActivationState({
-      enabled: false,
-      activated: false,
-      explicitlyEnabled: explicitSelection.explicitlyEnabled,
-      source: "disabled",
-      cause: "workspace-disabled-by-default",
-    });
-  }
-  if (params.config.slots.memory === params.id) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: true,
-      source: "explicit",
-      cause: "selected-memory-slot",
-    });
-  }
-  if (params.config.slots.contextEngine === params.id) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: true,
-      source: "explicit",
-      cause: "selected-context-engine-slot",
-    });
-  }
-  if (explicitSelection.cause === "bundled-channel-enabled-in-config") {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: true,
-      source: "explicit",
-      cause: explicitSelection.cause,
-    });
-  }
-  if (params.config.allow.length > 0 && !explicitlyAllowed) {
-    return toPluginActivationState({
-      enabled: false,
-      activated: false,
-      explicitlyEnabled: explicitSelection.explicitlyEnabled,
-      source: "disabled",
-      cause: "not-in-allowlist",
-    });
-  }
-  if (explicitSelection.explicitlyEnabled) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: true,
-      source: "explicit",
-      cause: explicitSelection.cause,
-    });
-  }
-  if (params.autoEnabledReason) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: false,
-      source: "auto",
-      reason: params.autoEnabledReason,
-    });
-  }
-  if (entry?.enabled === true) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: false,
-      source: "auto",
-      cause: "enabled-by-effective-config",
-    });
-  }
-  if (
-    params.origin === "bundled" &&
-    isBundledChannelEnabledByChannelConfig(params.rootConfig, params.id)
-  ) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: false,
-      source: "auto",
-      cause: "bundled-channel-configured",
-    });
-  }
-  if (params.origin === "bundled" && params.enabledByDefault === true) {
-    return toPluginActivationState({
-      enabled: true,
-      activated: true,
-      explicitlyEnabled: false,
-      source: "default",
-      cause: "bundled-default-enablement",
-    });
-  }
-  if (params.origin === "bundled") {
-    return toPluginActivationState({
-      enabled: false,
-      activated: false,
-      explicitlyEnabled: false,
-      source: "disabled",
-      cause: "bundled-disabled-by-default",
-    });
-  }
-  return toPluginActivationState({
-    enabled: true,
-    activated: true,
-    explicitlyEnabled: explicitSelection.explicitlyEnabled,
-    source: "default",
-  });
-}
-
-export function resolveEnableState(
-  id: string,
-  origin: PluginOrigin,
-  config: NormalizedPluginsConfig,
-  enabledByDefault?: boolean,
-): { enabled: boolean; reason?: string } {
-  return resolveEnableStateShared(
-    { id, origin, config, enabledByDefault },
-    resolvePluginActivationState,
+  return (
+    Boolean(env.VITEST) &&
+    !hasExplicitMemorySlot(cfg.plugins) &&
+    !hasExplicitMemoryEntry(cfg.plugins)
   );
-}
-
-export function isBundledChannelEnabledByChannelConfig(
-  cfg: OpenClawConfig | undefined,
-  pluginId: string,
-): boolean {
-  return isBundledChannelEnabledByChannelConfigShared(cfg, pluginId);
-}
-
-export function resolveEffectiveEnableState(params: {
-  id: string;
-  origin: PluginOrigin;
-  config: NormalizedPluginsConfig;
-  rootConfig?: OpenClawConfig;
-  enabledByDefault?: boolean;
-  activationSource?: PluginActivationConfigSource;
-}): { enabled: boolean; reason?: string } {
-  return resolveEnableStateResult(params, resolveEffectivePluginActivationState);
 }
 
 export function resolveEffectivePluginActivationState(params: {
   id: string;
   origin: PluginOrigin;
-  config: NormalizedPluginsConfig;
+  /** Omit when the runtime config already owns prepared plugin policy. */
+  config?: NormalizedPluginsConfig;
   rootConfig?: OpenClawConfig;
   enabledByDefault?: boolean;
   activationSource?: PluginActivationConfigSource;
   autoEnabledReason?: string;
+  channelIds?: readonly string[];
 }): PluginActivationState {
-  return resolvePluginActivationState(params);
+  return resolvePluginActivationStateShared({
+    ...params,
+    config: params.config ?? normalizePluginsConfig(params.rootConfig?.plugins),
+    allowBundledChannelExplicitBypassesAllowlist: true,
+  });
 }
+
+function toEnableStateResult(state: PluginActivationState): { enabled: boolean; reason?: string } {
+  return state.enabled ? { enabled: true } : { enabled: false, reason: state.reason };
+}
+
+export const resolveEnableState = (
+  id: string,
+  origin: PluginOrigin,
+  config: NormalizedPluginsConfig,
+  enabledByDefault?: boolean,
+): { enabled: boolean; reason?: string } =>
+  toEnableStateResult(
+    resolveEffectivePluginActivationState({ id, origin, config, enabledByDefault }),
+  );
+
+export const resolveEffectiveEnableState = (
+  params: Omit<Parameters<typeof resolveEffectivePluginActivationState>[0], "autoEnabledReason">,
+): { enabled: boolean; reason?: string } =>
+  toEnableStateResult(resolveEffectivePluginActivationState(params));
 
 export function resolveMemorySlotDecision(params: {
   id: string;

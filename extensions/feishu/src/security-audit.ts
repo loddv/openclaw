@@ -1,6 +1,9 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import { hasConfiguredSecretInput } from "openclaw/plugin-sdk/setup";
-import { asRecord, hasNonEmptyString } from "./comment-shared.js";
+import { hasConfiguredSecretInput } from "openclaw/plugin-sdk/secret-input";
+import {
+  asOptionalRecord as asRecord,
+  hasNonEmptyString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { OpenClawConfig } from "../runtime-api.js";
 
 function isFeishuDocToolEnabled(cfg: OpenClawConfig): boolean {
   const channels = asRecord(cfg.channels);

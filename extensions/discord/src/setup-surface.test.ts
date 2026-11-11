@@ -1,96 +1,63 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { installChannelDmPolicyContractSuite } from "openclaw/plugin-sdk/channel-test-helpers";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
-import { createDiscordSetupWizardBase } from "./setup-core.js";
+import { discordSetupWizard } from "./setup-core.js";
 
-const discordSetupWizard = createDiscordSetupWizardBase({
-  promptAllowFrom: async ({ cfg }) => cfg,
-  resolveAllowFromEntries: async ({ entries }) =>
-    entries.map((entry) => ({
-      input: entry,
-      resolved: false,
-      id: null,
-    })),
-  resolveGroupAllowlist: async ({ entries }) =>
-    entries.map((entry) => ({
-      input: entry,
-      resolved: false,
-    })),
+const config = (discord: NonNullable<OpenClawConfig["channels"]>["discord"]): OpenClawConfig => ({
+  channels: { discord },
 });
 
 describe("discordSetupWizard.dmPolicy", () => {
-  it("reads the named-account DM policy instead of the channel root", () => {
-    expect(
-      discordSetupWizard.dmPolicy?.getCurrent(
-        {
-          channels: {
-            discord: {
-              dmPolicy: "disabled",
-              accounts: {
-                alerts: {
-                  dmPolicy: "allowlist",
-                  token: "discord-token",
-                },
-              },
-            },
-          },
-        } as OpenClawConfig,
-        "alerts",
-      ),
-    ).toBe("allowlist");
-  });
-
-  it("reports account-scoped config keys for named accounts", () => {
-    expect(discordSetupWizard.dmPolicy?.resolveConfigKeys?.({}, "alerts")).toEqual({
-      policyKey: "channels.discord.accounts.alerts.dmPolicy",
-      allowFromKey: "channels.discord.accounts.alerts.allowFrom",
-    });
-  });
-
-  it('writes open policy state to the named account and preserves inherited allowFrom with "*"', () => {
-    const next = discordSetupWizard.dmPolicy?.setPolicy(
+  installChannelDmPolicyContractSuite({
+    dmPolicy: discordSetupWizard.dmPolicy!,
+    cases: [
       {
-        channels: {
-          discord: {
-            allowFrom: ["123"],
-            accounts: {
-              alerts: {
-                token: "discord-token",
-              },
-            },
-          },
-        },
-      } as OpenClawConfig,
-      "open",
-      "alerts",
-    );
-
-    expect(next?.channels?.discord?.dmPolicy).toBeUndefined();
-    expect(next?.channels?.discord?.accounts?.alerts?.dmPolicy).toBe("open");
-    expect(next?.channels?.discord?.accounts?.alerts?.allowFrom).toEqual(["123", "*"]);
+        name: "Discord named accounts",
+        channel: "discord",
+        accountId: "alerts",
+        accountConfig: { token: "discord-token" },
+        inheritedAllowFrom: ["123"],
+      },
+    ],
   });
 });
 
 describe("discordSetupWizard.status", () => {
   it("uses configured defaultAccount for omitted setup configured state", async () => {
     const configured = await discordSetupWizard.status.resolveConfigured({
-      cfg: {
-        channels: {
-          discord: {
-            defaultAccount: "work",
-            token: "discord-root-token",
-            accounts: {
-              alerts: {
-                token: "discord-alerts-token",
-              },
-              work: {
-                token: "",
-              },
-            },
-          },
+      cfg: config({
+        defaultAccount: "work",
+        token: "discord-root-token",
+        accounts: {
+          alerts: { token: "discord-alerts-token" },
+          work: { token: "" },
         },
-      } as OpenClawConfig,
+      }),
     });
 
     expect(configured).toBe(false);
+  });
+});
+
+describe("discordSetupWizard.groupAccess", () => {
+  it("writes resolved Discord channel rows to their selected guild and channel", () => {
+    const next = discordSetupWizard.groupAccess?.applyAllowlist?.({
+      cfg: config({ guilds: { existing: { channels: { keep: { enabled: true } } } } }),
+      accountId: "default",
+      resolved: [
+        {
+          input: "OpenClaw/#triage",
+          resolved: true,
+          guildId: "guild-1",
+          channelId: "channel-1",
+        },
+        { input: "missing", resolved: false },
+      ],
+    });
+
+    const guilds = next?.channels?.discord?.guilds;
+    expect(guilds?.["guild-1"]?.channels?.["channel-1"]).toEqual({ enabled: true });
+    expect(guilds?.["*"]).toBeUndefined();
+    expect(guilds?.existing?.channels?.keep).toEqual({ enabled: true });
   });
 });

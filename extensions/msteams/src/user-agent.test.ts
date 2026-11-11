@@ -1,31 +1,51 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Mock the runtime before importing buildUserAgent
-const mockRuntime = {
-  version: "2026.3.19",
-};
+const runtimeMockState = vi.hoisted(() => ({
+  getMSTeamsRuntime: vi.fn(),
+  runtime: { version: "2026.3.19" },
+}));
+const mockRuntime = runtimeMockState.runtime;
 
 vi.mock("./runtime.js", () => ({
-  getMSTeamsRuntime: vi.fn(() => mockRuntime),
+  getMSTeamsRuntime: runtimeMockState.getMSTeamsRuntime,
 }));
+
+vi.mock("../runtime-api.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../runtime-api.js")>();
+  return {
+    ...original,
+    fetchWithSsrFGuard: async (params: { url: string; init?: RequestInit }) => ({
+      response: await globalThis.fetch(params.url, params.init),
+      finalUrl: params.url,
+      release: async () => undefined,
+    }),
+  };
+});
 
 import { fetchGraphJson } from "./graph.js";
 import { getMSTeamsRuntime } from "./runtime.js";
-import { buildUserAgent, ensureUserAgentHeader, resetUserAgentCache } from "./user-agent.js";
+
+let buildUserAgent: typeof import("./user-agent.js").buildUserAgent;
+let ensureUserAgentHeader: typeof import("./user-agent.js").ensureUserAgentHeader;
+
+async function fetchGraphHeaders(headers?: Record<string, string>) {
+  const mockFetch = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ value: [] }));
+  vi.stubGlobal("fetch", mockFetch);
+  await fetchGraphJson({ token: "test-token", path: "/groups", headers });
+  expect(mockFetch).toHaveBeenCalledOnce();
+  return new Headers(mockFetch.mock.calls[0]?.[1]?.headers);
+}
 
 describe("buildUserAgent", () => {
-  beforeEach(() => {
-    resetUserAgentCache();
+  beforeEach(async () => {
+    vi.resetModules();
+    ({ buildUserAgent, ensureUserAgentHeader } = await import("./user-agent.js"));
     vi.mocked(getMSTeamsRuntime).mockReturnValue(mockRuntime as never);
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
-  });
-
-  it("returns teams.ts[apps]/<sdk> OpenClaw/<version> format", () => {
-    const ua = buildUserAgent();
-    expect(ua).toMatch(/^teams\.ts\[apps\]\/.+ OpenClaw\/2026\.3\.19$/);
   });
 
   it("reflects the runtime version", () => {
@@ -40,40 +60,18 @@ describe("buildUserAgent", () => {
     });
     const ua = buildUserAgent();
     expect(ua).toMatch(/OpenClaw\/unknown$/);
-    // SDK version should still be present
     expect(ua).toMatch(/^teams\.ts\[apps\]\//);
   });
 
   it("sends the generated User-Agent in Graph requests by default", async () => {
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ value: [] }),
-    });
-    vi.stubGlobal("fetch", mockFetch);
-
-    await fetchGraphJson({ token: "test-token", path: "/groups" });
-
-    expect(mockFetch).toHaveBeenCalledOnce();
-    const [, init] = mockFetch.mock.calls[0];
-    expect(init.headers["User-Agent"]).toMatch(/^teams\.ts\[apps\]\/.+ OpenClaw\/2026\.3\.19$/);
-    expect(init.headers).toHaveProperty("Authorization", "Bearer test-token");
+    const headers = await fetchGraphHeaders();
+    expect(headers.get("User-Agent")).toMatch(/^teams\.ts\[apps\]\/.+ OpenClaw\/2026\.3\.19$/);
+    expect(headers.get("Authorization")).toBe("Bearer test-token");
   });
 
   it("lets caller headers override the default Graph User-Agent", async () => {
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ value: [] }),
-    });
-    vi.stubGlobal("fetch", mockFetch);
-
-    await fetchGraphJson({
-      token: "test-token",
-      path: "/groups",
-      headers: { "User-Agent": "custom-agent/1.0" },
-    });
-
-    const [, init] = mockFetch.mock.calls[0];
-    expect(init.headers["User-Agent"]).toBe("custom-agent/1.0");
+    const headers = await fetchGraphHeaders({ "User-Agent": "custom-agent/1.0" });
+    expect(headers.get("User-Agent")).toBe("custom-agent/1.0");
   });
 
   it("adds the generated User-Agent to Headers instances without overwriting callers", () => {

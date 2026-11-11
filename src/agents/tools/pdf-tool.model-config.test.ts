@@ -1,78 +1,140 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { withPluginMetadataSnapshotScope } from "../../plugins/current-plugin-metadata-snapshot.js";
+import { finalizePluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.js";
+import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
+import * as modelConfigHelpers from "./model-config.helpers.js";
 import { resolvePdfModelConfigForTool } from "./pdf-tool.model-config.js";
-import { resetPdfToolAuthEnv, withTempPdfAgentDir } from "./pdf-tool.test-support.js";
 
-const ANTHROPIC_PDF_MODEL = "anthropic/claude-opus-4-6";
+const available = new Set<string>();
+const activeModel = {
+  provider: "openrouter",
+  model: "deepseek/deepseek-v4.1-flash",
+  supportsImages: true,
+};
+const resolve = (cfg: OpenClawConfig, active?: typeof activeModel) =>
+  resolvePdfModelConfigForTool({
+    cfg,
+    agentDir: "/tmp/openclaw-pdf-model-config",
+    activeModel: active,
+  });
 
-function withDefaultModel(primary: string): OpenClawConfig {
+function configuredProvider(
+  provider: string,
+  primary: string,
+  modelId?: string,
+  input: ("text" | "image")[] = ["text"],
+): OpenClawConfig {
   return {
     agents: { defaults: { model: { primary } } },
-  } as OpenClawConfig;
+    models: {
+      providers: {
+        [provider]: {
+          baseUrl: "https://example.com/v1",
+          models: modelId
+            ? [
+                {
+                  id: modelId,
+                  name: modelId,
+                  reasoning: false,
+                  input,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 32_000,
+                  maxTokens: 4_096,
+                },
+              ]
+            : [],
+        },
+      },
+    },
+  };
 }
 
-describe("resolvePdfModelConfigForTool", () => {
-  beforeEach(() => {
-    resetPdfToolAuthEnv();
-  });
+beforeEach(() => {
+  available.clear();
+  vi.spyOn(modelConfigHelpers, "hasProviderAuthForTool").mockImplementation(({ provider }) =>
+    available.has(provider),
+  );
+});
+afterEach(() => vi.restoreAllMocks());
 
-  afterEach(() => {
-    vi.unstubAllEnvs();
+it("uses the authenticated active vision model as a fallback", () => {
+  available.add("openrouter");
+  expect(
+    resolve(configuredProvider("openrouter", "anthropic/claude-sonnet-4-5"), activeModel),
+  ).toEqual({
+    primary: "openrouter/deepseek/deepseek-v4.1-flash",
   });
+});
 
-  it("returns null without any auth", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const cfg = withDefaultModel("openai/gpt-5.4");
-      expect(resolvePdfModelConfigForTool({ cfg, agentDir })).toBeNull();
-    });
-  });
-
-  it("prefers explicit pdfModel config", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const cfg = {
-        agents: {
-          defaults: {
-            model: { primary: "openai/gpt-5.4" },
-            pdfModel: { primary: ANTHROPIC_PDF_MODEL },
+it("does not select a provider that disables PDF image extraction", () => {
+  available.add("restricted");
+  const cfg = configuredProvider("restricted", "restricted/text");
+  const snapshot = finalizePluginMetadataSnapshot(
+    createPluginMetadataSnapshotFixture({
+      plugins: [
+        {
+          id: "restricted",
+          contracts: { mediaUnderstandingProviders: ["restricted"] },
+          mediaUnderstandingProviderMetadata: {
+            restricted: { capabilities: ["image"], documentModels: { pdf: { image: false } } },
           },
         },
-      } as OpenClawConfig;
-      expect(resolvePdfModelConfigForTool({ cfg, agentDir })).toEqual({
-        primary: ANTHROPIC_PDF_MODEL,
-      });
-    });
-  });
+      ],
+    }),
+  );
+  withPluginMetadataSnapshotScope(
+    snapshot,
+    () => {
+      expect(
+        resolve(cfg, { provider: "restricted", model: "vision", supportsImages: true }),
+      ).toBeNull();
+    },
+    { config: cfg, trustConfigIdentity: true },
+  );
+});
 
-  it("falls back to imageModel config when no pdfModel set", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const cfg = {
-        agents: {
-          defaults: {
-            model: { primary: "openai/gpt-5.4" },
-            imageModel: { primary: "openai/gpt-5.4-mini" },
-          },
-        },
-      } as OpenClawConfig;
-      expect(resolvePdfModelConfigForTool({ cfg, agentDir })).toEqual({
-        primary: "openai/gpt-5.4-mini",
-      });
-    });
-  });
+it("prefers the native PDF default over the active fallback", () => {
+  available.add("anthropic");
+  available.add("openrouter");
+  expect(
+    resolve(configuredProvider("openrouter", "anthropic/claude-opus-5"), activeModel)?.primary,
+  ).toBe("anthropic/claude-opus-5-5");
+});
 
-  it("prefers anthropic when available for native PDF support", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test");
-      vi.stubEnv("OPENAI_API_KEY", "openai-test");
-      const cfg = withDefaultModel("openai/gpt-5.4");
-      expect(resolvePdfModelConfigForTool({ cfg, agentDir })?.primary).toBe(ANTHROPIC_PDF_MODEL);
-    });
-  });
+it("falls back to explicit imageModel config", () => {
+  expect(
+    resolve({
+      agents: { defaults: { imageModel: { primary: "openai/gpt-5.4-mini" } } },
+    }),
+  ).toEqual({ primary: "openai/gpt-5.4-mini" });
+});
 
-  it("uses anthropic primary when provider is anthropic", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-test");
-      const cfg = withDefaultModel(ANTHROPIC_PDF_MODEL);
-      expect(resolvePdfModelConfigForTool({ cfg, agentDir })?.primary).toBe(ANTHROPIC_PDF_MODEL);
-    });
-  });
+it.each([
+  {
+    provider: "Minimax",
+    primary: "openai/gpt-5.4",
+    model: "MiniMax-M2.7-highspeed",
+    expected: {
+      primary: "minimax/MiniMax-M2.7-highspeed",
+      fallbacks: ["minimax-portal/MiniMax-M2.7"],
+    },
+  },
+  {
+    provider: "minimax-portal",
+    primary: "minimax-portal/MiniMax-M2.7",
+    model: undefined,
+    expected: { primary: "minimax-portal/MiniMax-M2.7", fallbacks: ["minimax/MiniMax-M2.7"] },
+  },
+])("selects a text-extraction model for $primary", ({ provider, primary, model, expected }) => {
+  available.add("minimax");
+  available.add("minimax-portal");
+  expect(resolve(configuredProvider(provider, primary, model))).toEqual(expected);
+});
+
+it("preserves slashes in an authenticated custom provider's configured vision model", () => {
+  available.add("hatchery");
+  expect(
+    resolve(configuredProvider("hatchery", "hatchery/text-1", "org/team/v1", ["text", "image"])),
+  ).toEqual({ primary: "hatchery/org/team/v1" });
 });

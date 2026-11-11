@@ -1,3 +1,4 @@
+import { convertMarkdownTables } from "../../../packages/markdown-core/src/tables.js";
 import { resolveEffectiveMessagesConfig, resolveHumanDelayConfig } from "../../agents/identity.js";
 import {
   chunkByNewline,
@@ -14,156 +15,308 @@ import {
   shouldComputeCommandAuthorized,
 } from "../../auto-reply/command-detection.js";
 import { shouldHandleTextCommands } from "../../auto-reply/commands-registry.js";
-import { withReplyDispatcher } from "../../auto-reply/dispatch.js";
 import {
-  formatAgentEnvelope,
-  formatInboundEnvelope,
-  resolveEnvelopeFormatOptions,
-} from "../../auto-reply/envelope.js";
+  settleReplyDispatcher,
+  withReplyDispatcher,
+} from "../../auto-reply/dispatch-dispatcher.js";
+import { formatAgentEnvelope, resolveEnvelopeFormatOptions } from "../../auto-reply/envelope.js";
+import type {
+  GetReplyOptions,
+  TurnAdoptionLifecycle,
+} from "../../auto-reply/get-reply-options.types.js";
 import {
   createInboundDebouncer,
   resolveInboundDebounceMs,
 } from "../../auto-reply/inbound-debounce.js";
-import { dispatchReplyFromConfig } from "../../auto-reply/reply/dispatch-from-config.js";
 import { finalizeInboundContext } from "../../auto-reply/reply/inbound-context.js";
 import {
   buildMentionRegexes,
   matchesMentionPatterns,
   matchesMentionWithExplicit,
 } from "../../auto-reply/reply/mentions.js";
-import { dispatchReplyWithBufferedBlockDispatcher } from "../../auto-reply/reply/provider-dispatcher.js";
 import { createReplyDispatcherWithTyping } from "../../auto-reply/reply/reply-dispatcher.js";
-import { removeAckReactionAfterReply, shouldAckReaction } from "../../channels/ack-reactions.js";
+import {
+  createAckReactionHandle,
+  removeAckReactionAfterReply,
+  removeAckReactionHandleAfterReply,
+  shouldAckReaction,
+} from "../../channels/ack-reactions.js";
 import { resolveCommandAuthorizedFromAuthorizers } from "../../channels/command-gating.js";
+import { buildChannelInboundEventContext } from "../../channels/inbound-event/context.js";
 import {
   implicitMentionKindWhen,
   resolveInboundMentionDecision,
 } from "../../channels/mention-gating.js";
 import {
+  createChannelIngressPolicyResolver,
+  resolveChannelIngressPolicy,
+  resolveStableChannelIngressPolicy,
+} from "../../channels/message-access/runtime.js";
+import {
   setChannelConversationBindingIdleTimeoutBySessionKey,
+  setChannelConversationBindingIdleTimeoutBySessionKeyAsync,
   setChannelConversationBindingMaxAgeBySessionKey,
+  setChannelConversationBindingMaxAgeBySessionKeyAsync,
 } from "../../channels/plugins/conversation-bindings.js";
 import { loadChannelOutboundAdapter } from "../../channels/plugins/outbound/load.js";
 import { recordInboundSession } from "../../channels/session.js";
+import type {
+  ChannelTurnDeliveryAdapter,
+  ChannelTurnResult,
+  RunChannelTurnParams,
+} from "../../channels/turn/types.js";
 import {
   resolveChannelGroupPolicy,
   resolveChannelGroupRequireMention,
 } from "../../config/group-policy.js";
 import { resolveMarkdownTableMode } from "../../config/markdown-tables.js";
+import { resolveSessionStorePathCore } from "../../config/sessions.js";
 import {
-  readSessionUpdatedAt,
-  recordSessionMetaFromInbound,
-  resolveStorePath,
-  updateLastRoute,
-} from "../../config/sessions.js";
+  resolveSessionEntryResetFreshness,
+  resolveSessionEntryResetFreshnessAsync,
+} from "../../config/sessions/entry-freshness.js";
+import { recordInboundSessionMeta } from "../../config/sessions/session-accessor.js";
+import { readSessionUpdatedAtInWorker } from "../../config/sessions/session-entry-read-runtime.js";
 import { getChannelActivity, recordChannelActivity } from "../../infra/channel-activity.js";
-import { createSubsystemLogger } from "../../logging.js";
-import { convertMarkdownTables } from "../../markdown/tables.js";
-import { fetchRemoteMedia } from "../../media/fetch.js";
-import { saveMediaBuffer } from "../../media/store.js";
+import { readRemoteMediaBuffer, saveRemoteMedia, saveResponseMedia } from "../../media/fetch.js";
+import { deleteMediaBuffer, saveMediaBuffer } from "../../media/store.js";
 import { buildPairingReply } from "../../pairing/pairing-messages.js";
 import {
   readChannelAllowFromStore,
+  removeChannelAllowFromStoreEntry,
   upsertChannelPairingRequest,
 } from "../../pairing/pairing-store.js";
+import {
+  publicChannelTurn,
+  publicChannelTurnParams,
+  type PublicChannelTurnParams,
+} from "../../plugin-sdk/reply-options.js";
+import { copyMutableSessionEntry } from "../../plugin-sdk/session-store-runtime-internal.js";
+import {
+  readSessionUpdatedAt,
+  updateLastRoute,
+  updateLastRouteWithAuthority,
+} from "../../plugin-sdk/session-store-runtime.js";
 import { buildAgentSessionKey, resolveAgentRoute } from "../../routing/resolve-route.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
-import type {
-  PluginRuntimeChannelContextEvent,
-  PluginRuntimeChannelContextKey,
-} from "./types-channel.js";
+import { createLazyRuntimeMethod, createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
+import { pluginInstanceInvocation } from "../plugin-instance-invocation.js";
+import {
+  getPluginInstanceOwner,
+  getPluginOriginalValue,
+  getPluginValueInstance,
+} from "../plugin-instance-scope.js";
+import type { PluginInstanceConsumer } from "../plugin-instance.types.js";
+import { createChannelRuntimeContextRegistry } from "./channel-runtime-contexts.js";
+import { getPluginRuntimeGenerationRegistry } from "./generation-state.js";
 import type { PluginRuntime } from "./types.js";
 
-type StoredRuntimeContext = {
-  token: symbol;
-  context: unknown;
-  normalizedKey: {
-    channelId: string;
-    accountId?: string;
-    capability: string;
-  };
-};
-
-const log = createSubsystemLogger("plugins/runtime-channel");
-
-function normalizeRuntimeContextString(value: string | null | undefined): string {
-  return normalizeOptionalString(value) ?? "";
+// Text and registration helpers must not initialize the agent dispatch graph.
+const dispatchLowLevelChannelReplyFromConfig = createLazyRuntimeMethod(
+  createLazyRuntimeModule(() => import("../../auto-reply/reply/dispatch-from-config.js")),
+  (runtime) => runtime.dispatchLowLevelChannelReplyFromConfig,
+);
+const dispatchReplyWithBufferedBlockDispatcherCore = createLazyRuntimeMethod(
+  createLazyRuntimeModule(() => import("../../auto-reply/reply/provider-dispatcher.js")),
+  (runtime) => runtime.dispatchReplyWithBufferedBlockDispatcherCore,
+);
+const loadChannelTurnLifecycle = createLazyRuntimeModule(
+  () => import("../../channels/turn/lifecycle.js"),
+);
+const dispatchAssembledChannelTurnCore = createLazyRuntimeMethod(
+  loadChannelTurnLifecycle,
+  (runtime) => runtime.dispatchAssembledChannelTurn,
+);
+function bindChannelCallbacks<T extends object>(callbacks: T, consumer: PluginInstanceConsumer): T {
+  const instance = getPluginValueInstance(consumer.wrap(() => undefined))!;
+  const original = getPluginOriginalValue(callbacks, instance);
+  // SAFETY: Only the creating instance can restore this callback object's original shape.
+  const owned = consumer.wrap((original ?? callbacks) as T);
+  return new Proxy(owned, {
+    get: (target, key) =>
+      consumer.run(() => {
+        const value: unknown = Reflect.get(target, key, target);
+        return value && typeof value === "object"
+          ? (getPluginOriginalValue(value, instance) ?? value)
+          : value;
+      }),
+  });
 }
-
-function normalizeRuntimeContextKey(params: PluginRuntimeChannelContextKey): {
-  mapKey: string;
-  normalizedKey: {
-    channelId: string;
-    accountId?: string;
-    capability: string;
-  };
-} | null {
-  const channelId = normalizeRuntimeContextString(params.channelId);
-  const capability = normalizeRuntimeContextString(params.capability);
-  const accountId = normalizeRuntimeContextString(params.accountId);
-  if (!channelId || !capability) {
-    return null;
-  }
+type ChannelDeliveryCustody = { deferred: boolean };
+function bindChannelAdoption(
+  source: TurnAdoptionLifecycle | undefined,
+  consumer: PluginInstanceConsumer,
+  custody: ChannelDeliveryCustody,
+): TurnAdoptionLifecycle {
   return {
-    mapKey: `${channelId}\u0000${accountId}\u0000${capability}`,
-    normalizedKey: {
-      channelId,
-      capability,
-      ...(accountId ? { accountId } : {}),
+    ...source,
+    onAdopted: source?.onAdopted ?? (() => {}),
+    onDeferred: () => {
+      const accepted = source?.onDeferred?.();
+      if (accepted !== false) {
+        custody.deferred = true;
+      }
+      return accepted;
+    },
+    onSettled: async () => {
+      try {
+        await source?.onSettled?.();
+      } finally {
+        if (custody.deferred) {
+          consumer.release();
+        }
+      }
     },
   };
 }
 
-function doesRuntimeContextWatcherMatch(params: {
-  watcher: {
-    channelId?: string;
-    accountId?: string;
-    capability?: string;
-  };
-  event: PluginRuntimeChannelContextEvent;
-}): boolean {
-  if (params.watcher.channelId && params.watcher.channelId !== params.event.key.channelId) {
-    return false;
+function bindChannelDelivery<
+  T extends {
+    delivery: object;
+    replyOptions?: GetReplyOptions;
+    turnAdoptionLifecycle?: TurnAdoptionLifecycle;
+  },
+>(params: T, consumer?: PluginInstanceConsumer, custody?: ChannelDeliveryCustody): T {
+  let replyOptions = params.replyOptions;
+  let adoption: TurnAdoptionLifecycle | undefined;
+  const source = params.turnAdoptionLifecycle ?? replyOptions?.turnAdoptionLifecycle;
+  if (consumer && custody && (source || replyOptions?.onQueuedFollowupReplyBatch)) {
+    // Queued observers and source delivery outlive dispatch; settlement releases both.
+    adoption = bindChannelAdoption(source, consumer, custody);
+    replyOptions = { ...replyOptions, turnAdoptionLifecycle: adoption };
   }
-  if (
-    params.watcher.accountId !== undefined &&
-    params.watcher.accountId !== (params.event.key.accountId ?? "")
-  ) {
-    return false;
-  }
-  if (params.watcher.capability && params.watcher.capability !== params.event.key.capability) {
-    return false;
-  }
-  return true;
-}
-
-export function createRuntimeChannel(): PluginRuntime["channel"] {
-  const runtimeContexts = new Map<string, StoredRuntimeContext>();
-  const runtimeContextWatchers = new Set<{
-    filter: {
-      channelId?: string;
-      accountId?: string;
-      capability?: string;
-    };
-    onEvent: (event: PluginRuntimeChannelContextEvent) => void;
-  }>();
-  const emitRuntimeContextEvent = (event: PluginRuntimeChannelContextEvent) => {
-    for (const watcher of runtimeContextWatchers) {
-      if (!doesRuntimeContextWatcherMatch({ watcher: watcher.filter, event })) {
-        continue;
+  return consumer
+    ? {
+        ...params,
+        delivery: consumer.wrap(params.delivery),
+        ...(adoption ? { turnAdoptionLifecycle: bindChannelCallbacks(adoption, consumer) } : {}),
+        ...(replyOptions ? { replyOptions: bindChannelCallbacks(replyOptions, consumer) } : {}),
       }
-      try {
-        watcher.onEvent(event);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        log.error(
-          `runtime context watcher failed during ${event.type} ` +
-            `channel=${event.key.channelId} capability=${event.key.capability}` +
-            (event.key.accountId ? ` account=${event.key.accountId}` : "") +
-            `: ${message}`,
+    : params;
+}
+async function withChannelDeliveryCustody<T, R>(
+  params: T,
+  dispatch: (
+    params: T,
+    consumer?: PluginInstanceConsumer,
+    custody?: ChannelDeliveryCustody,
+  ) => Promise<R>,
+): Promise<R> {
+  const invocation = pluginInstanceInvocation.getStore();
+  const owner = invocation && getPluginInstanceOwner(invocation.instance);
+  const generation = getPluginRuntimeGenerationRegistry();
+  const consumer = owner?.instance?.retainConsumer(
+    undefined,
+    generation?.plugins.includes(owner.record) ? generation : owner.registry,
+  );
+  const custody: ChannelDeliveryCustody = { deferred: false };
+  try {
+    return await dispatch(params, consumer, custody);
+  } finally {
+    if (!custody.deferred) {
+      consumer?.release();
+    }
+  }
+}
+const dispatchAssembledChannelTurn: PluginRuntime["channel"]["inbound"]["dispatchReply"] = (
+  params,
+) =>
+  withChannelDeliveryCustody(params, (turn, consumer, custody) =>
+    dispatchAssembledChannelTurnCore(
+      publicChannelTurn(bindChannelDelivery(turn, consumer, custody)),
+    ),
+  );
+const loadPreparedChannelTurn = createLazyRuntimeModule(
+  () => import("../../channels/turn/execution.js"),
+);
+const runPreparedChannelTurn: PluginRuntime["channel"]["inbound"]["runPreparedReply"] = async (
+  params,
+) => (await loadPreparedChannelTurn()).runPreparedChannelTurn(params);
+const runChannelTurnCore = createLazyRuntimeMethod(
+  createLazyRuntimeModule(() => import("../../channels/turn/run-channel-turn.js")),
+  (runtime) => runtime.runChannelTurn,
+  // SAFETY: Forwarding async overloads unchanged preserves the raw-event and dispatch-result generics.
+) as typeof import("../../channels/turn/run-channel-turn.js").runChannelTurn;
+const runChannelTurn = ((params: Parameters<typeof runChannelTurnCore>[0]) =>
+  withChannelDeliveryCustody(params, (turn, consumer, custody) => {
+    if (!consumer || !custody) {
+      return runChannelTurnCore(publicChannelTurnParams(turn));
+    }
+    const adapter = bindChannelCallbacks(turn.adapter, consumer);
+    const resolveTurn: typeof adapter.resolveTurn = async (...args) => {
+      const resolved = await adapter.resolveTurn(...args);
+      const instance = getPluginValueInstance(consumer.wrap(() => undefined))!;
+      // SAFETY: Exact-owner restoration preserves the adapter's resolved turn contract.
+      const original = (getPluginOriginalValue(resolved, instance) ?? resolved) as typeof resolved;
+      if (!("delivery" in original)) {
+        return original;
+      }
+      if (turn.turnAdoptionLifecycle) {
+        // Core assembly selects this top-level lifecycle, not the resolved turn's.
+        // Prepared dispatch closures keep their original exact lifecycle identity.
+        preparedTurn.turnAdoptionLifecycle = bindChannelCallbacks(
+          bindChannelAdoption(turn.turnAdoptionLifecycle, consumer, custody),
+          consumer,
         );
       }
-    }
+      return bindChannelDelivery(original, consumer, custody);
+    };
+    const preparedTurn = publicChannelTurnParams({
+      ...turn,
+      adapter: new Proxy(adapter, {
+        get: (target, key) =>
+          key === "resolveTurn" ? resolveTurn : Reflect.get(target, key, target),
+      }),
+    });
+    return runChannelTurnCore(preparedTurn);
+    // SAFETY: Forwarding async overloads unchanged preserves raw-event and dispatch-result generics.
+  })) as typeof import("../../channels/turn/run-channel-turn.js").runChannelTurn;
+
+export function createRuntimeChannel(options?: {
+  dispatchReplyFromConfig?: typeof dispatchLowLevelChannelReplyFromConfig;
+}): PluginRuntime["channel"] {
+  const runInbound = <TRaw, TResult>(
+    params: PublicChannelTurnParams<TRaw, TResult, ChannelTurnDeliveryAdapter>,
+  ): Promise<ChannelTurnResult<TResult>> => {
+    // SAFETY: Core's implementation handles both delivery adapters while preserving the result type.
+    const run = runChannelTurn as (
+      value: RunChannelTurnParams<TRaw, TResult, ChannelTurnDeliveryAdapter>,
+    ) => Promise<ChannelTurnResult<TResult>>;
+    return run(params);
+  };
+  const dispatchInbound: PluginRuntime["channel"]["inbound"]["dispatch"] = (params) =>
+    withChannelDeliveryCustody(params, async (turn, consumer, custody) =>
+      (await loadChannelTurnLifecycle()).dispatchRoutedChannelTurn({
+        ...publicChannelTurn(bindChannelDelivery(turn, consumer, custody)),
+        ...(options?.dispatchReplyFromConfig
+          ? { dispatchReplyFromConfig: options.dispatchReplyFromConfig }
+          : {}),
+      }),
+    );
+  const inboundRuntime = {
+    ingress: {
+      createResolver: createChannelIngressPolicyResolver,
+      resolve: resolveChannelIngressPolicy,
+      resolveStable: resolveStableChannelIngressPolicy,
+    },
+    buildContext: buildChannelInboundEventContext,
+    run: runInbound,
+    runPreparedReply: runPreparedChannelTurn,
+    dispatch: dispatchInbound,
+    dispatchReply: dispatchAssembledChannelTurn,
+  } satisfies PluginRuntime["channel"]["inbound"];
+  const sessionRuntime = {
+    resolveStorePath: resolveSessionStorePathCore,
+    readSessionUpdatedAt,
+    readSessionUpdatedAtAsync: readSessionUpdatedAtInWorker,
+    // Plugin runtime property names are a shipped contract; the implementations
+    // route through the session accessor boundary.
+    recordSessionMetaFromInbound: (params: Parameters<typeof recordInboundSessionMeta>[0]) =>
+      recordInboundSessionMeta(params).then(copyMutableSessionEntry),
+    recordInboundSession,
+    updateLastRoute,
+    updateLastRouteWithAuthority,
+    resolveEntryResetFreshness: resolveSessionEntryResetFreshness,
+    resolveEntryResetFreshnessAsync: resolveSessionEntryResetFreshnessAsync,
   };
   const channelRuntime = {
     text: {
@@ -179,16 +332,19 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
       convertMarkdownTables,
     },
     reply: {
-      dispatchReplyWithBufferedBlockDispatcher,
+      dispatchReplyWithBufferedBlockDispatcher: (params) =>
+        dispatchReplyWithBufferedBlockDispatcherCore(publicChannelTurn(params)),
       createReplyDispatcherWithTyping,
       resolveEffectiveMessagesConfig,
       resolveHumanDelayConfig,
-      dispatchReplyFromConfig,
+      dispatchReplyFromConfig: (params) =>
+        (options?.dispatchReplyFromConfig ?? dispatchLowLevelChannelReplyFromConfig)(
+          publicChannelTurn(params),
+        ),
       withReplyDispatcher,
+      settleReplyDispatcher,
       finalizeInboundContext,
       formatAgentEnvelope,
-      /** @deprecated Prefer `BodyForAgent` + structured user-context blocks (do not build plaintext envelopes for prompts). */
-      formatInboundEnvelope,
       resolveEnvelopeFormatOptions,
     },
     routing: {
@@ -199,31 +355,29 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
       buildPairingReply,
       readAllowFromStore: ({ channel, accountId, env }) =>
         readChannelAllowFromStore(channel, env, accountId),
-      upsertPairingRequest: ({ channel, id, accountId, meta, env, pairingAdapter }) =>
-        upsertChannelPairingRequest({
+      removeAllowFromStoreEntry: ({ channel, entry, accountId, env, pairingAdapter }) =>
+        removeChannelAllowFromStoreEntry({
           channel,
-          id,
+          entry,
           accountId,
-          meta,
           env,
           pairingAdapter,
         }),
+      upsertPairingRequest: upsertChannelPairingRequest,
     },
     media: {
-      fetchRemoteMedia,
+      readRemoteMediaBuffer,
+      fetchRemoteMedia: readRemoteMediaBuffer,
+      saveRemoteMedia,
+      saveResponseMedia,
       saveMediaBuffer,
+      deleteMediaBuffer,
     },
     activity: {
       record: recordChannelActivity,
       get: getChannelActivity,
     },
-    session: {
-      resolveStorePath,
-      readSessionUpdatedAt,
-      recordSessionMetaFromInbound,
-      recordInboundSession,
-      updateLastRoute,
-    },
+    session: sessionRuntime,
     mentions: {
       buildMentionRegexes,
       matchesMentionPatterns,
@@ -232,8 +386,10 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
       resolveInboundMentionDecision,
     },
     reactions: {
+      createAckReactionHandle,
       shouldAckReaction,
       removeAckReactionAfterReply,
+      removeAckReactionHandleAfterReply,
     },
     groups: {
       resolveGroupPolicy: resolveChannelGroupPolicy,
@@ -252,91 +408,16 @@ export function createRuntimeChannel(): PluginRuntime["channel"] {
     outbound: {
       loadAdapter: loadChannelOutboundAdapter,
     },
+    inbound: inboundRuntime,
+    turn: inboundRuntime,
     threadBindings: {
-      setIdleTimeoutBySessionKey: ({ channelId, targetSessionKey, accountId, idleTimeoutMs }) =>
-        setChannelConversationBindingIdleTimeoutBySessionKey({
-          channelId,
-          targetSessionKey,
-          accountId,
-          idleTimeoutMs,
-        }),
-      setMaxAgeBySessionKey: ({ channelId, targetSessionKey, accountId, maxAgeMs }) =>
-        setChannelConversationBindingMaxAgeBySessionKey({
-          channelId,
-          targetSessionKey,
-          accountId,
-          maxAgeMs,
-        }),
+      setIdleTimeoutBySessionKeyAsync: setChannelConversationBindingIdleTimeoutBySessionKeyAsync,
+      setMaxAgeBySessionKeyAsync: setChannelConversationBindingMaxAgeBySessionKeyAsync,
+      setIdleTimeoutBySessionKey: setChannelConversationBindingIdleTimeoutBySessionKey,
+      setMaxAgeBySessionKey: setChannelConversationBindingMaxAgeBySessionKey,
     },
-    runtimeContexts: {
-      register: (params) => {
-        const normalized = normalizeRuntimeContextKey(params);
-        if (!normalized) {
-          return { dispose: () => {} };
-        }
-        if (params.abortSignal?.aborted) {
-          return { dispose: () => {} };
-        }
-        const token = Symbol(normalized.mapKey);
-        let disposed = false;
-        const dispose = () => {
-          if (disposed) {
-            return;
-          }
-          disposed = true;
-          const current = runtimeContexts.get(normalized.mapKey);
-          if (!current || current.token !== token) {
-            return;
-          }
-          runtimeContexts.delete(normalized.mapKey);
-          emitRuntimeContextEvent({
-            type: "unregistered",
-            key: normalized.normalizedKey,
-          });
-        };
-        params.abortSignal?.addEventListener("abort", dispose, { once: true });
-        if (params.abortSignal?.aborted) {
-          dispose();
-          return { dispose };
-        }
-        runtimeContexts.set(normalized.mapKey, {
-          token,
-          context: params.context,
-          normalizedKey: normalized.normalizedKey,
-        });
-        if (disposed) {
-          return { dispose };
-        }
-        emitRuntimeContextEvent({
-          type: "registered",
-          key: normalized.normalizedKey,
-          context: params.context,
-        });
-        return { dispose };
-      },
-      get: <T = unknown>(params: PluginRuntimeChannelContextKey) => {
-        const normalized = normalizeRuntimeContextKey(params);
-        if (!normalized) {
-          return undefined;
-        }
-        return runtimeContexts.get(normalized.mapKey)?.context as T | undefined;
-      },
-      watch: (params) => {
-        const watcher = {
-          filter: {
-            ...(params.channelId?.trim() ? { channelId: params.channelId.trim() } : {}),
-            ...(params.accountId != null ? { accountId: params.accountId.trim() } : {}),
-            ...(params.capability?.trim() ? { capability: params.capability.trim() } : {}),
-          },
-          onEvent: params.onEvent,
-        };
-        runtimeContextWatchers.add(watcher);
-        return () => {
-          runtimeContextWatchers.delete(watcher);
-        };
-      },
-    },
+    runtimeContexts: createChannelRuntimeContextRegistry(),
   } satisfies PluginRuntime["channel"];
 
-  return channelRuntime as PluginRuntime["channel"];
+  return channelRuntime;
 }

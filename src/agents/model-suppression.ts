@@ -1,39 +1,41 @@
+import type { ModelApi } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveProviderBuiltInModelSuppression } from "../plugins/provider-runtime.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
-import { normalizeProviderId } from "./provider-id.js";
+import { buildManifestBuiltInModelSuppressionResolver } from "../plugins/manifest-model-suppression.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 
-function resolveBuiltInModelSuppression(params: {
+export function resolveBuiltInModelSuppressionFromManifest(params: {
   provider?: string | null;
   id?: string | null;
   baseUrl?: string | null;
+  api?: ModelApi;
   config?: OpenClawConfig;
+  unconditionalOnly?: boolean;
+  workspaceDir?: string;
+  metadataSnapshot?: PluginMetadataSnapshot;
 }) {
-  const provider = normalizeProviderId(params.provider ?? "");
-  const modelId = normalizeLowercaseStringOrEmpty(params.id);
-  if (!provider || !modelId) {
-    return undefined;
-  }
-  return resolveProviderBuiltInModelSuppression({
-    ...(params.config ? { config: params.config } : {}),
+  return buildManifestBuiltInModelSuppressionResolver({
     env: process.env,
-    context: {
-      ...(params.config ? { config: params.config } : {}),
-      env: process.env,
-      provider,
-      modelId,
-      ...(params.baseUrl ? { baseUrl: params.baseUrl } : {}),
-    },
-  });
+    config: params.config,
+    workspaceDir: params.workspaceDir,
+    metadataSnapshot: params.metadataSnapshot,
+  })(params);
 }
 
-export function shouldSuppressBuiltInModel(params: {
+/**
+ * Return true only for unconditional manifest suppressions.
+ * Inline model entries may override conditional suppressions, but not absolute
+ * provider capability blocks.
+ */
+export function shouldUnconditionallySuppress(params: {
   provider?: string | null;
   id?: string | null;
-  baseUrl?: string | null;
   config?: OpenClawConfig;
-}) {
-  return resolveBuiltInModelSuppression(params)?.suppress ?? false;
+  workspaceDir?: string;
+}): boolean {
+  return (
+    resolveBuiltInModelSuppressionFromManifest({ ...params, unconditionalOnly: true })?.suppress ??
+    false
+  );
 }
 
 export function buildSuppressedBuiltInModelError(params: {
@@ -41,6 +43,18 @@ export function buildSuppressedBuiltInModelError(params: {
   id?: string | null;
   baseUrl?: string | null;
   config?: OpenClawConfig;
+  workspaceDir?: string;
 }): string | undefined {
-  return resolveBuiltInModelSuppression(params)?.errorMessage;
+  return resolveBuiltInModelSuppressionFromManifest(params)?.errorMessage;
+}
+
+export function buildShouldSuppressBuiltInModelCore(params: {
+  config?: OpenClawConfig;
+  metadataSnapshot?: PluginMetadataSnapshot;
+}): (input: { provider?: string | null; id?: string | null; baseUrl?: string | null }) => boolean {
+  const resolver = buildManifestBuiltInModelSuppressionResolver({
+    env: process.env,
+    ...params,
+  });
+  return (input) => resolver(input)?.suppress ?? false;
 }

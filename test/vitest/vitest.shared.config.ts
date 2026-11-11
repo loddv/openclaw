@@ -1,252 +1,77 @@
+import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { pluginSdkSubpaths } from "../../scripts/lib/plugin-sdk-entries.mjs";
-import {
-  detectVitestHostInfo as detectVitestHostInfoImpl,
-  isCiLikeEnv,
-  resolveLocalVitestMaxWorkers as resolveLocalVitestMaxWorkersImpl,
-  resolveLocalVitestScheduling as resolveLocalVitestSchedulingImpl,
-} from "../../scripts/lib/vitest-local-scheduling.mjs";
+import { createStateSchemaInlinePlugin } from "../../scripts/lib/state-schema-inline-plugin.mts";
+import { controlUiSolidPlugin } from "../../ui/config/control-ui-solid.ts";
 import {
   BUNDLED_PLUGIN_ROOT_DIR,
   BUNDLED_PLUGIN_TEST_GLOB,
 } from "./vitest.bundled-plugin-paths.ts";
-import { loadVitestExperimentalConfig } from "./vitest.performance-config.ts";
-import { shouldPrintVitestThrottle } from "./vitest.system-load.ts";
+import { createVitestDeclaredInputsPlugin } from "./vitest.declared-inputs.ts";
+import { nodeVitestConfig, repoRoot, resolveRepoRootPath } from "./vitest.node-base.ts";
+import { sharedVitestExcludePatterns } from "./vitest.pattern-file.ts";
+import { createVitestResolveConfig } from "./vitest.resolve.ts";
+import { compiledSubprocessesPlugin } from "./vitest.worker-artifacts.ts";
 
-type VitestHostInfo = {
-  cpuCount?: number;
-  loadAverage1m?: number;
-  totalMemoryBytes?: number;
-};
-
-export type OpenClawVitestPool = "forks" | "threads";
-
-export type LocalVitestScheduling = {
-  maxWorkers: number;
-  fileParallelism: boolean;
-  throttledBySystem: boolean;
-};
-
-export const jsdomOptimizedDeps = {
-  optimizer: {
-    web: {
-      enabled: true,
-      include: ["lit", "lit-html", "@lit/reactive-element", "marked"] as string[],
-    },
-  },
-};
-
-function detectVitestHostInfo(): Required<VitestHostInfo> {
-  return detectVitestHostInfoImpl() as Required<VitestHostInfo>;
-}
-
-export function resolveLocalVitestMaxWorkers(
-  env: Record<string, string | undefined> = process.env,
-  system: VitestHostInfo = detectVitestHostInfo(),
-  pool: OpenClawVitestPool = resolveDefaultVitestPool(env),
-): number {
-  return resolveLocalVitestMaxWorkersImpl(env, system, pool);
-}
-
-export function resolveLocalVitestScheduling(
-  env: Record<string, string | undefined> = process.env,
-  system: VitestHostInfo = detectVitestHostInfo(),
-  pool: OpenClawVitestPool = resolveDefaultVitestPool(env),
-): LocalVitestScheduling {
-  return resolveLocalVitestSchedulingImpl(env, system, pool) as LocalVitestScheduling;
-}
-
-export function resolveDefaultVitestPool(
-  _env: Record<string, string | undefined> = process.env,
-): OpenClawVitestPool {
-  return "threads";
-}
-
-export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+export {
+  repoRoot,
+  resolveRepoRootPath,
+  resolveSharedVitestWorkerConfig,
+} from "./vitest.node-base.ts";
+export type { LocalVitestScheduling } from "./vitest.node-base.ts";
 export const nonIsolatedRunnerPath = path.join(repoRoot, "test", "non-isolated-runner.ts");
-export function resolveRepoRootPath(value: string): string {
-  return path.isAbsolute(value) ? value : path.join(repoRoot, value);
-}
-const isCI = isCiLikeEnv(process.env);
-const isWindows = process.platform === "win32";
-const defaultPool = resolveDefaultVitestPool();
-const localScheduling = resolveLocalVitestScheduling(
-  process.env,
-  detectVitestHostInfo(),
-  defaultPool,
-);
-const ciWorkers = isWindows ? 2 : 3;
-
-if (!isCI && localScheduling.throttledBySystem && shouldPrintVitestThrottle(process.env)) {
-  console.error(
-    `[vitest] throttling local workers to ${localScheduling.maxWorkers}${
-      localScheduling.fileParallelism ? "" : " with file parallelism disabled"
-    } because the host already looks busy.`,
-  );
-}
+const vitestConfigFiles = fs
+  .readdirSync(path.join(repoRoot, "test", "vitest"), { withFileTypes: true })
+  .filter((entry) => entry.isFile() && /\.(?:mjs|mts|ts)$/u.test(entry.name))
+  .map((entry) => `test/vitest/${entry.name}`)
+  .toSorted((left, right) => left.localeCompare(right));
 
 export const sharedVitestConfig = {
-  root: repoRoot,
-  envFile: false,
-  resolve: {
-    alias: [
-      {
-        find: "openclaw/extension-api",
-        replacement: path.join(repoRoot, "src", "extensionAPI.ts"),
-      },
-      ...pluginSdkSubpaths.map((subpath) => ({
-        find: `openclaw/plugin-sdk/${subpath}`,
-        replacement: path.join(repoRoot, "src", "plugin-sdk", `${subpath}.ts`),
-      })),
-      ...pluginSdkSubpaths.map((subpath) => ({
-        find: `@openclaw/plugin-sdk/${subpath}`,
-        replacement: path.join(repoRoot, "packages", "plugin-sdk", "src", `${subpath}.ts`),
-      })),
-      {
-        find: "openclaw/plugin-sdk",
-        replacement: path.join(repoRoot, "src", "plugin-sdk", "index.ts"),
-      },
-    ],
-  },
+  ...nodeVitestConfig,
+  plugins: [
+    ...nodeVitestConfig.plugins,
+    // Node tests also import UI renderers. Keep their compiler off non-UI sources.
+    ...controlUiSolidPlugin([
+      `${repoRoot.replaceAll("\\", "/")}/ui/**/*.tsx`,
+      `${repoRoot.replaceAll("\\", "/")}/extensions/*/browser/**/*.tsx`,
+      `${repoRoot.replaceAll("\\", "/")}/extensions/*/src/control-ui.tsx`,
+    ]),
+    createStateSchemaInlinePlugin(repoRoot),
+    createVitestDeclaredInputsPlugin(repoRoot),
+    compiledSubprocessesPlugin(),
+  ],
+  resolve: createVitestResolveConfig(repoRoot),
   test: {
-    dir: repoRoot,
-    testTimeout: 120_000,
-    hookTimeout: isWindows ? 180_000 : 120_000,
-    unstubEnvs: true,
-    unstubGlobals: true,
-    isolate: false,
-    pool: defaultPool,
+    ...nodeVitestConfig.test,
     runner: nonIsolatedRunnerPath,
-    maxWorkers: isCI ? ciWorkers : localScheduling.maxWorkers,
-    fileParallelism: isCI ? true : localScheduling.fileParallelism,
+    // Vitest matches these with picomatch against absolute changed-file paths, so every entry
+    // must resolve absolute; relative entries silently never match. Explicit lane files keep
+    // watcher registration working (chokidar v4+ ignores globs in watcher.add) while the glob
+    // keeps match coverage for files added after config load.
     forceRerunTriggers: [
       "package.json",
       "pnpm-lock.yaml",
+      "vitest.config.ts",
       "test/setup.ts",
+      "test/setup.env.ts",
       "test/setup.shared.ts",
       "test/setup.extensions.ts",
       "test/setup-openclaw-runtime.ts",
-      "test/vitest/vitest.channel-paths.mjs",
-      "test/vitest/vitest.channels.config.ts",
-      "test/vitest/vitest.acp.config.ts",
-      "test/vitest/vitest.boundary.config.ts",
-      "test/vitest/vitest.bundled.config.ts",
-      "test/vitest/vitest.cli.config.ts",
-      "vitest.config.ts",
-      "test/vitest/vitest.contracts.config.ts",
-      "test/vitest/vitest.cron.config.ts",
-      "test/vitest/vitest.daemon.config.ts",
-      "test/vitest/vitest.e2e.config.ts",
-      "test/vitest/vitest.extension-acpx-paths.mjs",
-      "test/vitest/vitest.extension-acpx.config.ts",
-      "test/vitest/vitest.extension-bluebubbles-paths.mjs",
-      "test/vitest/vitest.extension-bluebubbles.config.ts",
-      "test/vitest/vitest.extension-channels.config.ts",
-      "test/vitest/vitest.extension-diffs-paths.mjs",
-      "test/vitest/vitest.extension-diffs.config.ts",
-      "test/vitest/vitest.extension-feishu-paths.mjs",
-      "test/vitest/vitest.extension-feishu.config.ts",
-      "test/vitest/vitest.extension-irc-paths.mjs",
-      "test/vitest/vitest.extension-irc.config.ts",
-      "test/vitest/vitest.extension-mattermost-paths.mjs",
-      "test/vitest/vitest.extension-mattermost.config.ts",
-      "test/vitest/vitest.extension-matrix-paths.mjs",
-      "test/vitest/vitest.extension-matrix.config.ts",
-      "test/vitest/vitest.extension-memory-paths.mjs",
-      "test/vitest/vitest.extension-memory.config.ts",
-      "test/vitest/vitest.extension-messaging-paths.mjs",
-      "test/vitest/vitest.extension-messaging.config.ts",
-      "test/vitest/vitest.extension-msteams-paths.mjs",
-      "test/vitest/vitest.extension-msteams.config.ts",
-      "test/vitest/vitest.extensions.config.ts",
-      "test/vitest/vitest.gateway.config.ts",
-      "test/vitest/vitest.gateway-core.config.ts",
-      "test/vitest/vitest.gateway-client.config.ts",
-      "test/vitest/vitest.gateway-methods.config.ts",
-      "test/vitest/vitest.gateway-server.config.ts",
-      "test/vitest/vitest.hooks.config.ts",
-      "test/vitest/vitest.infra.config.ts",
-      "test/vitest/vitest.live.config.ts",
-      "test/vitest/vitest.media.config.ts",
-      "test/vitest/vitest.media-understanding.config.ts",
-      "test/vitest/vitest.performance-config.ts",
-      "test/vitest/vitest.unit-fast.config.ts",
-      "test/vitest/vitest.unit-fast-paths.mjs",
-      "test/vitest/vitest.scoped-config.ts",
-      "test/vitest/vitest.shared-core.config.ts",
-      "test/vitest/vitest.shared.config.ts",
-      "test/vitest/vitest.tooling.config.ts",
-      "test/vitest/vitest.tui.config.ts",
-      "test/vitest/vitest.ui.config.ts",
-      "test/vitest/vitest.utils.config.ts",
-      "test/vitest/vitest.unit.config.ts",
-      "test/vitest/vitest.unit-paths.mjs",
-      "test/vitest/vitest.runtime-config.config.ts",
-      "test/vitest/vitest.secrets.config.ts",
-      "test/vitest/vitest.plugin-sdk.config.ts",
-      "test/vitest/vitest.plugins.config.ts",
-      "test/vitest/vitest.extension-telegram-paths.mjs",
-      "test/vitest/vitest.extension-telegram.config.ts",
-      "test/vitest/vitest.extension-voice-call-paths.mjs",
-      "test/vitest/vitest.extension-voice-call.config.ts",
-      "test/vitest/vitest.extension-whatsapp-paths.mjs",
-      "test/vitest/vitest.extension-whatsapp.config.ts",
-      "test/vitest/vitest.extension-zalo-paths.mjs",
-      "test/vitest/vitest.extension-zalo.config.ts",
-      "test/vitest/vitest.extension-provider-paths.mjs",
-      "test/vitest/vitest.extension-providers.config.ts",
-      "test/vitest/vitest.logging.config.ts",
-      "test/vitest/vitest.process.config.ts",
-      "test/vitest/vitest.tasks.config.ts",
-      "test/vitest/vitest.wizard.config.ts",
-    ],
+      ...vitestConfigFiles,
+      "test/vitest/**/*.{ts,mts,mjs}",
+    ].map(resolveRepoRootPath),
     include: [
       "src/**/*.test.ts",
       BUNDLED_PLUGIN_TEST_GLOB,
       "packages/**/*.test.ts",
       "test/**/*.test.ts",
-      "ui/src/ui/app-chat.test.ts",
-      "ui/src/ui/chat/**/*.test.ts",
-      "ui/src/ui/views/agents-utils.test.ts",
-      "ui/src/ui/views/channels.test.ts",
-      "ui/src/ui/views/chat.test.ts",
-      "ui/src/ui/views/nodes.devices.test.ts",
-      "ui/src/ui/views/skills.test.ts",
-      "ui/src/ui/views/dreams.test.ts",
-      "ui/src/ui/views/usage-render-details.test.ts",
-      "ui/src/ui/controllers/agents.test.ts",
-      "ui/src/ui/controllers/chat.test.ts",
-      "ui/src/ui/controllers/skills.test.ts",
-      "ui/src/ui/controllers/sessions.test.ts",
-      "ui/src/ui/views/sessions.test.ts",
-      "ui/src/ui/app-tool-stream.node.test.ts",
-      "ui/src/ui/app-gateway.sessions.node.test.ts",
-      "ui/src/ui/chat/slash-command-executor.node.test.ts",
+      "ui/src/pages/chat/tool-stream.node.test.ts",
     ],
     setupFiles: [resolveRepoRootPath("test/setup.ts")],
-    exclude: [
-      "dist/**",
-      "test/fixtures/**",
-      "apps/macos/**",
-      "apps/macos/.build/**",
-      "**/node_modules/**",
-      "**/vendor/**",
-      "dist/OpenClaw.app/**",
-      "**/*.live.test.ts",
-      "**/*.e2e.test.ts",
-    ],
+    exclude: [...sharedVitestExcludePatterns],
     coverage: {
       provider: "v8" as const,
       reporter: ["text", "lcov"],
       all: false,
-      thresholds: {
-        lines: 70,
-        functions: 70,
-        branches: 55,
-        statements: 70,
-      },
-      include: ["./src/**/*.ts"],
       exclude: [
         `${BUNDLED_PLUGIN_ROOT_DIR}/**`,
         "apps/**",
@@ -256,7 +81,6 @@ export const sharedVitestConfig = {
         "src/entry.ts",
         "src/index.ts",
         "src/runtime.ts",
-        "src/channel-web.ts",
         "src/logging.ts",
         "src/cli/**",
         "src/commands/**",
@@ -274,42 +98,33 @@ export const sharedVitestConfig = {
         "src/providers/**",
         "src/secrets/**",
         "src/agents/model-scan.ts",
-        "src/agents/pi-embedded-runner.ts",
+        "src/agents/embedded-agent-runner.ts",
         "src/agents/sandbox-paths.ts",
         "src/agents/sandbox.ts",
-        "src/agents/skills-install.ts",
-        "src/agents/pi-tool-definition-adapter.ts",
+        "src/agents/agent-tool-definition-adapter.ts",
         "src/agents/tools/discord-actions*.ts",
-        "src/agents/tools/slack-actions.ts",
-        "src/infra/state-migrations.ts",
-        "src/infra/skills-remote.ts",
         "src/infra/update-check.ts",
         "src/infra/ports-inspect.ts",
         "src/infra/outbound/outbound-session.ts",
-        "src/memory/batch-gemini.ts",
         "src/gateway/control-ui.ts",
-        "src/gateway/server-bridge.ts",
         "src/gateway/server-channels.ts",
         "src/gateway/server-methods/config.ts",
         "src/gateway/server-methods/send.ts",
         "src/gateway/server-methods/skills.ts",
-        "src/gateway/server-methods/talk.ts",
+        "src/gateway/talk/handlers/index.ts",
         "src/gateway/server-methods/web.ts",
         "src/gateway/server-methods/wizard.ts",
         "src/gateway/call.ts",
-        "src/process/tau-rpc.ts",
         "src/process/exec.ts",
         "src/tui/**",
         "src/wizard/**",
         "src/browser/**",
-        "src/channels/web/**",
         "src/webchat/**",
         "src/gateway/server.ts",
         "src/gateway/client.ts",
-        "src/gateway/protocol/**",
+        "packages/gateway-protocol/src/**",
         "src/infra/tailscale.ts",
       ],
     },
-    ...loadVitestExperimentalConfig(),
   },
 };

@@ -1,4 +1,6 @@
+// Lazily resolves optional service modules without eager runtime imports.
 import { isTruthyEnvValue } from "../infra/env.js";
+import { toSafeImportPath } from "../shared/import-specifier.js";
 
 type LazyServiceModule = Record<string, unknown>;
 
@@ -6,6 +8,7 @@ export type LazyPluginServiceHandle = {
   stop: () => Promise<void>;
 };
 
+// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Dynamic service exports are typed by the caller.
 function resolveExport<T>(mod: LazyServiceModule, names: string[]): T | null {
   for (const name of names) {
     const value = mod[name];
@@ -33,7 +36,7 @@ export async function startLazyPluginServiceModule(params: {
   const overrideEnvVar = params.overrideEnvVar?.trim();
   const override = overrideEnvVar ? process.env[overrideEnvVar]?.trim() : undefined;
   const loadOverrideModule =
-    params.loadOverrideModule ?? (async (specifier: string) => await import(specifier));
+    params.loadOverrideModule ?? ((specifier: string) => import(toSafeImportPath(specifier)));
   const validatedOverride =
     override && params.validateOverrideSpecifier
       ? params.validateOverrideSpecifier(override)

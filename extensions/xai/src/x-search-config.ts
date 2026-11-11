@@ -1,42 +1,28 @@
-import type { OpenClawConfig } from "@openclaw/plugin-sdk/config-runtime";
-import { isRecord } from "./tool-config-shared.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { resolveProviderWebSearchPluginConfig } from "openclaw/plugin-sdk/provider-web-search-config-contract";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 type JsonRecord = Record<string, unknown>;
 
-function cloneRecord<T extends JsonRecord | undefined>(value: T): T {
-  if (!value) {
-    return value;
-  }
-  return { ...value } as T;
-}
-
-export function resolveLegacyXSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const web = config?.tools?.web as Record<string, unknown> | undefined;
-  const xSearch = web?.x_search;
-  return isRecord(xSearch) ? cloneRecord(xSearch) : undefined;
-}
-
-export function resolvePluginXSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const pluginConfig = config?.plugins?.entries?.xai?.config;
-  if (!isRecord(pluginConfig?.xSearch)) {
-    return undefined;
-  }
-  return cloneRecord(pluginConfig.xSearch);
+function baseUrlFallback(config?: JsonRecord): JsonRecord | undefined {
+  return typeof config?.baseUrl === "string" && config.baseUrl.trim()
+    ? { baseUrl: config.baseUrl }
+    : undefined;
 }
 
 export function resolveEffectiveXSearchConfig(config?: OpenClawConfig): JsonRecord | undefined {
-  const legacy = resolveLegacyXSearchConfig(config);
-  const pluginOwned = resolvePluginXSearchConfig(config);
-  if (!legacy) {
-    return pluginOwned;
-  }
-  if (!pluginOwned) {
-    return legacy;
-  }
-  return {
-    ...legacy,
-    ...pluginOwned,
+  const pluginWebSearchBaseUrl = baseUrlFallback(
+    resolveProviderWebSearchPluginConfig(config, "xai"),
+  );
+  const pluginOwned = config?.plugins?.entries?.xai?.config?.xSearch;
+  const merged = {
+    ...pluginWebSearchBaseUrl,
+    ...(isRecord(pluginOwned) ? pluginOwned : undefined),
   };
+  if (Object.keys(merged).length === 0) {
+    return undefined;
+  }
+  return merged;
 }
 
 export function setPluginXSearchConfigValue(

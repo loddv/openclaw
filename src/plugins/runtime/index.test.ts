@@ -1,270 +1,121 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../../agents/defaults.js";
-import { onAgentEvent } from "../../infra/agent-events.js";
-import { requestHeartbeatNow } from "../../infra/heartbeat-wake.js";
-import * as execModule from "../../process/exec.js";
-import { onSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
-import { VERSION } from "../../version.js";
 import {
-  clearGatewaySubagentRuntime,
-  createPluginRuntime,
-  setGatewaySubagentRuntime,
-} from "./index.js";
+  resetConfigRuntimeState,
+  setRuntimeConfigSnapshot,
+  type OpenClawConfig,
+} from "../../config/config.js";
+import { createContext } from "../../gateway/server-plugin-in-process-dispatch.test-support.js";
+import { withPluginRuntimeGatewayRequestScope } from "./gateway-request-scope.js";
 
-function createCommandResult() {
-  return {
-    pid: 12345,
-    stdout: "hello\n",
-    stderr: "",
-    code: 0,
-    signal: null,
-    killed: false,
-    noOutputTimedOut: false,
-    termination: "exit" as const,
-  };
-}
+const runtimeModelAuthMocks = vi.hoisted(() => ({
+  getApiKeyForModel: vi.fn(),
+  getRuntimeAuthForModelCore: vi.fn(),
+  resolveProviderRuntimeApiKey: vi.fn(),
+}));
+// mock-isolation: Exercise the lazy runtime facade without loading credential-backed model auth.
+vi.mock("./runtime-model-auth.runtime.js", () => runtimeModelAuthMocks);
+// mock-isolation: Gateway presence must not initialize server orchestration.
+vi.mock("../../gateway/server-plugins.js", () => {
+  throw new Error("Gateway availability must not load server plugin orchestration");
+});
 
-function createGatewaySubagentRuntime() {
-  return {
-    run: vi.fn(),
-    waitForRun: vi.fn(),
-    getSessionMessages: vi.fn(),
-    getSession: vi.fn(),
-    deleteSession: vi.fn(),
-  };
-}
-
-function expectRuntimeShape(
-  assertRuntime: (runtime: ReturnType<typeof createPluginRuntime>) => void,
-) {
-  const runtime = createPluginRuntime();
-  assertRuntime(runtime);
-}
-
-function expectGatewaySubagentRunFailure(
-  runtime: ReturnType<typeof createPluginRuntime>,
-  params: { sessionKey: string; message: string },
-) {
-  expect(() => runtime.subagent.run(params)).toThrow(
-    "Plugin runtime subagent methods are only available during a gateway request.",
-  );
-}
-
-function expectRuntimeValue<T>(
-  readValue: (runtime: ReturnType<typeof createPluginRuntime>) => T,
-  expected: T,
-) {
-  expect(readValue(createPluginRuntime())).toBe(expected);
-}
-
-function expectRuntimeSubagentRun(
-  runtime: ReturnType<typeof createPluginRuntime>,
-  params: { sessionKey: string; message: string },
-) {
-  return runtime.subagent.run(params);
-}
-
-function createGatewaySubagentRunFixture(params?: { allowGatewaySubagentBinding?: boolean }) {
-  const run = vi.fn().mockResolvedValue({ runId: "run-1" });
-  const runtime = params?.allowGatewaySubagentBinding
-    ? createPluginRuntime({ allowGatewaySubagentBinding: true })
-    : createPluginRuntime();
-
-  setGatewaySubagentRuntime({
-    ...createGatewaySubagentRuntime(),
-    run,
-  });
-
-  return { run, runtime };
-}
-
-function expectFunctionKeys(value: Record<string, unknown>, keys: readonly string[]) {
-  keys.forEach((key) => {
-    expect(typeof value[key]).toBe("function");
-  });
-}
-
-function expectRunCommandOutcome(params: {
-  runtime: ReturnType<typeof createPluginRuntime>;
-  expected: "resolve" | "reject";
-  commandResult: ReturnType<typeof createCommandResult>;
-}) {
-  const command = params.runtime.system.runCommandWithTimeout(["echo", "hello"], {
-    timeoutMs: 1000,
-  });
-  if (params.expected === "resolve") {
-    return expect(command).resolves.toEqual(params.commandResult);
-  }
-  return expect(command).rejects.toThrow("boom");
-}
+import { createPluginRuntime } from "./index.js";
 
 describe("plugin runtime command execution", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    clearGatewaySubagentRuntime();
+    Object.values(runtimeModelAuthMocks).forEach((mock) => mock.mockReset());
+    resetConfigRuntimeState();
   });
 
-  it.each([
-    {
-      name: "exposes runtime.system.runCommandWithTimeout by default",
-      mockKind: "resolve" as const,
-      expected: "resolve" as const,
-    },
-    {
-      name: "forwards runtime.system.runCommandWithTimeout errors",
-      mockKind: "reject" as const,
-      expected: "reject" as const,
-    },
-  ] as const)("$name", async ({ mockKind, expected }) => {
-    const commandResult = createCommandResult();
-    const runCommandWithTimeoutMock = vi.spyOn(execModule, "runCommandWithTimeout");
-    if (mockKind === "resolve") {
-      runCommandWithTimeoutMock.mockResolvedValue(commandResult);
-    } else {
-      runCommandWithTimeoutMock.mockRejectedValue(new Error("boom"));
-    }
+  it("resolves thinking policy with configured model compat from runtime config", () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT 5.4 via GMN",
+      reasoning: true,
+      compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+    };
+    const providers = { gmn: { baseUrl: "https://gmn.example.com/v1", models: [model] } };
+    setRuntimeConfigSnapshot({ models: { providers } } as unknown as OpenClawConfig);
 
     const runtime = createPluginRuntime();
-    await expectRunCommandOutcome({ runtime, expected, commandResult });
-    expect(runCommandWithTimeoutMock).toHaveBeenCalledWith(["echo", "hello"], { timeoutMs: 1000 });
+    const policy = runtime.agent.resolveThinkingPolicy({ provider: "gmn", model: "gpt-5.4" });
+
+    expect(policy.levels.map((level) => level.id)).toContain("xhigh");
   });
 
-  it.each([
-    {
-      name: "exposes runtime.events.onAgentEvent",
-      readValue: (runtime: ReturnType<typeof createPluginRuntime>) => runtime.events.onAgentEvent,
-      expected: onAgentEvent,
-    },
-    {
-      name: "exposes runtime.events.onSessionTranscriptUpdate",
-      readValue: (runtime: ReturnType<typeof createPluginRuntime>) =>
-        runtime.events.onSessionTranscriptUpdate,
-      expected: onSessionTranscriptUpdate,
-    },
-    {
-      name: "exposes runtime.system.requestHeartbeatNow",
-      readValue: (runtime: ReturnType<typeof createPluginRuntime>) =>
-        runtime.system.requestHeartbeatNow,
-      expected: requestHeartbeatNow,
-    },
-    {
-      name: "exposes runtime.version from the shared VERSION constant",
-      readValue: (runtime: ReturnType<typeof createPluginRuntime>) => runtime.version,
-      expected: VERSION,
-    },
-  ] as const)("$name", ({ readValue, expected }) => {
-    expectRuntimeValue(readValue, expected);
+  it("includes persisted session exec overrides in sandbox authority", () => {
+    const runtime = createPluginRuntime();
+    vi.spyOn(runtime.agent.session, "getSessionEntry").mockReturnValue({
+      sessionId: "session",
+      updatedAt: 1,
+      execHost: "gateway",
+    });
+    const config: OpenClawConfig = {
+      agents: { defaults: { sandbox: { mode: "all", scope: "session", workspaceAccess: "rw" } } },
+      tools: { elevated: { enabled: false } },
+    };
+
+    const scope = {
+      agentId: "main",
+      sessionKey: "agent:main:subagent:workboard-card",
+    };
+    const result = runtime.sandbox.resolveWorkspaceAuthority({ config, ...scope });
+
+    expect(result.confinementError).toContain("outside the sandbox");
   });
 
-  it.each([
-    {
-      name: "exposes runtime.mediaUnderstanding helpers and keeps stt as an alias",
-      assert: (runtime: ReturnType<typeof createPluginRuntime>) => {
-        expectFunctionKeys(runtime.mediaUnderstanding as Record<string, unknown>, [
-          "runFile",
-          "describeImageFile",
-          "describeImageFileWithModel",
-          "describeVideoFile",
-        ]);
-        expect(runtime.mediaUnderstanding.transcribeAudioFile).toBe(
-          runtime.stt.transcribeAudioFile,
+  it("modelAuth wrappers preserve workspace scope while stripping credential steering", async () => {
+    const runtime = createPluginRuntime();
+    const model = {
+      id: "workspace-cloud/model",
+      provider: "workspace-cloud",
+    };
+    const cfg: OpenClawConfig = { plugins: { allow: ["workspace-cloud"] } };
+    const scope = {
+      cfg,
+      workspaceDir: "/tmp/workspace",
+      agentDir: "/tmp/agent",
+      store: { version: 1, profiles: {} },
+    };
+    for (const [method, mockName, apiKey] of [
+      ["getApiKeyForModel", "getApiKeyForModel", "model-key"],
+      ["getRuntimeAuthForModel", "getRuntimeAuthForModelCore", "runtime-key"],
+      ["resolveApiKeyForProvider", "resolveProviderRuntimeApiKey", "provider-key"],
+    ] as const) {
+      const mock = runtimeModelAuthMocks[mockName];
+      const target =
+        method === "resolveApiKeyForProvider" ? { provider: "workspace-cloud" } : { model };
+      mock.mockResolvedValue({ apiKey, source: "workspace cloud credentials", mode: "api-key" });
+      const auth = await runtime.modelAuth[method]({ ...scope, ...target } as never);
+      expect(auth.apiKey).toBe(apiKey);
+      expect(mock).toHaveBeenCalledWith({ ...target, cfg, workspaceDir: scope.workspaceDir });
+    }
+  });
+
+  it("keeps subagent unavailable by default", () => {
+    expect(() =>
+      createPluginRuntime().subagent.run({ sessionKey: "s-1", message: "hello" }),
+    ).toThrow("Plugin runtime subagent methods are only available during a gateway request.");
+  });
+
+  it("reads Gateway availability from the request scope without loading server orchestration", async () => {
+    const runtime = createPluginRuntime();
+    await expect(runtime.gateway.isAvailable()).resolves.toBe(false);
+    const context = createContext();
+    await withPluginRuntimeGatewayRequestScope(
+      { context, isWebchatConnect: () => false },
+      async () => {
+        await expect(runtime.gateway.isAvailable()).resolves.toBe(true);
+        await withPluginRuntimeGatewayRequestScope(
+          { context, resolveGatewayContext: () => undefined, isWebchatConnect: () => false },
+          async () => expect(await runtime.gateway.isAvailable()).toBe(false),
         );
       },
-    },
-    {
-      name: "exposes runtime.imageGeneration helpers",
-      assert: (runtime: ReturnType<typeof createPluginRuntime>) => {
-        expectFunctionKeys(runtime.imageGeneration as Record<string, unknown>, [
-          "generate",
-          "listProviders",
-        ]);
-      },
-    },
-    {
-      name: "exposes runtime.webSearch helpers",
-      assert: (runtime: ReturnType<typeof createPluginRuntime>) => {
-        expectFunctionKeys(runtime.webSearch as Record<string, unknown>, [
-          "listProviders",
-          "search",
-        ]);
-      },
-    },
-    {
-      name: "exposes canonical runtime.tasks.runs and runtime.tasks.flows while keeping legacy TaskFlow aliases",
-      assert: (runtime: ReturnType<typeof createPluginRuntime>) => {
-        expectFunctionKeys(runtime.tasks.runs as Record<string, unknown>, [
-          "bindSession",
-          "fromToolContext",
-        ]);
-        expectFunctionKeys(runtime.tasks.flows as Record<string, unknown>, [
-          "bindSession",
-          "fromToolContext",
-        ]);
-        expectFunctionKeys(runtime.tasks.flow as Record<string, unknown>, [
-          "bindSession",
-          "fromToolContext",
-        ]);
-        expect(runtime.taskFlow).toBe(runtime.tasks.flow);
-      },
-    },
-    {
-      name: "exposes runtime.agent host helpers",
-      assert: (runtime: ReturnType<typeof createPluginRuntime>) => {
-        expect(runtime.agent.defaults).toEqual({
-          model: DEFAULT_MODEL,
-          provider: DEFAULT_PROVIDER,
-        });
-        expectFunctionKeys(runtime.agent as Record<string, unknown>, [
-          "runEmbeddedAgent",
-          "runEmbeddedPiAgent",
-          "resolveAgentDir",
-        ]);
-        expectFunctionKeys(runtime.agent.session as Record<string, unknown>, [
-          "resolveSessionFilePath",
-        ]);
-      },
-    },
-    {
-      name: "exposes runtime.modelAuth with raw and runtime-ready auth helpers",
-      assert: (runtime: ReturnType<typeof createPluginRuntime>) => {
-        expect(runtime.modelAuth).toBeDefined();
-        expectFunctionKeys(runtime.modelAuth as Record<string, unknown>, [
-          "getApiKeyForModel",
-          "getRuntimeAuthForModel",
-          "resolveApiKeyForProvider",
-        ]);
-      },
-    },
-  ] as const)("$name", ({ assert }) => {
-    expectRuntimeShape(assert);
-  });
-
-  it("modelAuth wrappers strip agentDir and store to prevent credential steering", async () => {
-    // The wrappers should not forward agentDir or store from plugin callers.
-    // We verify this by checking the wrapper functions exist and are not the
-    // raw implementations (they are wrapped, not direct references).
-    const { getApiKeyForModel: rawGetApiKey } = await import("../../agents/model-auth.js");
-    const runtime = createPluginRuntime();
-    // Wrappers should NOT be the same reference as the raw functions
-    expect(runtime.modelAuth.getApiKeyForModel).not.toBe(rawGetApiKey);
-  });
-
-  it("keeps subagent unavailable by default even after gateway initialization", async () => {
-    const { runtime } = createGatewaySubagentRunFixture();
-
-    expectGatewaySubagentRunFailure(runtime, { sessionKey: "s-1", message: "hello" });
-  });
-
-  it("late-binds to the gateway subagent when explicitly enabled", async () => {
-    const { run, runtime } = createGatewaySubagentRunFixture({
-      allowGatewaySubagentBinding: true,
-    });
-
-    await expect(
-      expectRuntimeSubagentRun(runtime, { sessionKey: "s-2", message: "hello" }),
-    ).resolves.toEqual({
-      runId: "run-1",
-    });
-    expect(run).toHaveBeenCalledWith({ sessionKey: "s-2", message: "hello" });
+    );
+    await expect(runtime.gateway.isAvailable()).resolves.toBe(false);
+    expect(() => runtime.nodes.openDuplex({ nodeId: "node-1", command: "image.bridge" })).toThrow(
+      "only available inside the Gateway",
+    );
   });
 });

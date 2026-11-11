@@ -1,11 +1,10 @@
-import type { ModelRegistry } from "@mariozechner/pi-coding-agent";
-import type {
-  ProviderResolveDynamicModelContext,
-  ProviderRuntimeModel,
-} from "openclaw/plugin-sdk/plugin-entry";
-import { describe, expect, it } from "vitest";
-import { resolveProviderPluginChoice } from "../../src/plugins/provider-auth-choice.runtime.js";
-import { registerSingleProviderPlugin } from "../../test/helpers/plugins/plugin-registration.js";
+import type { ProviderRuntimeModel } from "openclaw/plugin-sdk/plugin-entry";
+import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  createProviderDynamicModelContext,
+  runSingleProviderCatalog,
+} from "../test-support/provider-model-test-helpers.js";
 import fireworksPlugin from "./index.js";
 import {
   FIREWORKS_BASE_URL,
@@ -13,163 +12,92 @@ import {
   FIREWORKS_DEFAULT_MAX_TOKENS,
   FIREWORKS_DEFAULT_MODEL_ID,
 } from "./provider-catalog.js";
+import { resolveThinkingProfile } from "./provider-policy-api.js";
 
-function createDynamicContext(params: {
-  provider: string;
-  modelId: string;
-  models: ProviderRuntimeModel[];
-}): ProviderResolveDynamicModelContext {
-  return {
-    provider: params.provider,
-    modelId: params.modelId,
-    modelRegistry: {
-      find(providerId: string, modelId: string) {
-        return (
-          params.models.find(
-            (model) =>
-              model.provider === providerId && model.id.toLowerCase() === modelId.toLowerCase(),
-          ) ?? null
-        );
-      },
-    } as ModelRegistry,
-  };
-}
+const makeModel = (overrides: Partial<ProviderRuntimeModel> = {}): ProviderRuntimeModel => ({
+  id: FIREWORKS_DEFAULT_MODEL_ID,
+  name: FIREWORKS_DEFAULT_MODEL_ID,
+  provider: "fireworks",
+  api: "openai-completions",
+  baseUrl: FIREWORKS_BASE_URL,
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
+  maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS,
+  ...overrides,
+});
 
 describe("fireworks provider plugin", () => {
-  it("registers Fireworks with api-key auth wizard metadata", async () => {
-    const provider = await registerSingleProviderPlugin(fireworksPlugin);
-    const resolved = resolveProviderPluginChoice({
-      providers: [provider],
-      choice: "fireworks-api-key",
-    });
-
-    expect(provider.id).toBe("fireworks");
-    expect(provider.label).toBe("Fireworks");
-    expect(provider.aliases).toEqual(["fireworks-ai"]);
-    expect(provider.envVars).toEqual(["FIREWORKS_API_KEY"]);
-    expect(provider.auth).toHaveLength(1);
-    expect(resolved?.provider.id).toBe("fireworks");
-    expect(resolved?.method.id).toBe("api-key");
+  let provider: Awaited<ReturnType<typeof registerSingleProviderPlugin>>;
+  beforeEach(async () => {
+    provider = await registerSingleProviderPlugin(fireworksPlugin);
   });
+  const resolveModel = (modelId: string, models = [makeModel()]) =>
+    provider.resolveDynamicModel?.(
+      createProviderDynamicModelContext({ provider: "fireworks", modelId, models }),
+    );
+  const thinkingProfile = (modelId: string) =>
+    provider.resolveThinkingProfile?.({ provider: "fireworks", modelId });
 
-  it("builds the Fireworks Fire Pass starter catalog", async () => {
-    const provider = await registerSingleProviderPlugin(fireworksPlugin);
-    const catalog = await provider.catalog?.run({
-      config: {},
-      env: {},
-      resolveProviderApiKey: () => ({ apiKey: "test-key" }),
-      resolveProviderAuth: () => ({
-        apiKey: "test-key",
-        mode: "api_key",
-        source: "env",
-      }),
-    } as never);
-
-    expect(catalog && "provider" in catalog).toBe(true);
-    if (!catalog || !("provider" in catalog)) {
-      throw new Error("expected single-provider catalog");
-    }
-
-    expect(catalog.provider.api).toBe("openai-completions");
-    expect(catalog.provider.baseUrl).toBe(FIREWORKS_BASE_URL);
-    expect(catalog.provider.models?.map((model) => model.id)).toEqual([FIREWORKS_DEFAULT_MODEL_ID]);
-    expect(catalog.provider.models?.[0]).toMatchObject({
-      reasoning: false,
-      input: ["text", "image"],
+  it("builds the static Fireworks catalog", async () => {
+    const catalog = await runSingleProviderCatalog({ catalog: provider.staticCatalog });
+    expect(catalog).toMatchObject({ api: "openai-completions", baseUrl: FIREWORKS_BASE_URL });
+    expect(catalog.models).toHaveLength(1);
+    expect(catalog.models?.[0]).toMatchObject({
+      id: "accounts/fireworks/routers/glm-5p3-fast",
+      name: "GLM 5.3 Fast",
+      reasoning: true,
+      input: ["text"],
       contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
       maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS,
     });
   });
 
-  it("resolves forward-compat Fireworks model ids from the default template", async () => {
-    const provider = await registerSingleProviderPlugin(fireworksPlugin);
-    const resolved = provider.resolveDynamicModel?.(
-      createDynamicContext({
-        provider: "fireworks",
-        modelId: "accounts/fireworks/models/qwen3.6-plus",
-        models: [
-          {
-            id: FIREWORKS_DEFAULT_MODEL_ID,
-            name: FIREWORKS_DEFAULT_MODEL_ID,
-            provider: "fireworks",
-            api: "openai-completions",
-            baseUrl: FIREWORKS_BASE_URL,
-            reasoning: true,
-            input: ["text", "image"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
-            maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS,
-          },
-        ],
-      }),
-    );
-
+  it.each([
+    undefined,
+    makeModel({
+      api: "openai-responses",
+      baseUrl: "https://models.example.test/v1",
+      headers: { "X-Route": "custom-template" },
+      contextWindow: 64_000,
+      maxTokens: 16_000,
+      cost: { input: 2, output: 3, cacheRead: 1, cacheWrite: 0 },
+    }),
+  ])("resolves forward-compat models with template %j", (model) => {
+    const template = model ?? makeModel();
+    const id = "accounts/fireworks/models/qwen3.6-plus";
+    const resolved = resolveModel(id, model ? [model] : []);
     expect(resolved).toMatchObject({
-      provider: "fireworks",
-      id: "accounts/fireworks/models/qwen3.6-plus",
-      api: "openai-completions",
-      baseUrl: FIREWORKS_BASE_URL,
-      reasoning: true,
+      ...template,
+      id,
+      name: id,
+      input: ["text", "image"],
     });
+    expect(resolved?.headers).toEqual(template.headers);
   });
 
-  it("disables reasoning metadata for Fireworks Kimi dynamic models", async () => {
-    const provider = await registerSingleProviderPlugin(fireworksPlugin);
-    const resolved = provider.resolveDynamicModel?.(
-      createDynamicContext({
-        provider: "fireworks",
-        modelId: "accounts/fireworks/models/kimi-k2p5",
-        models: [
-          {
-            id: FIREWORKS_DEFAULT_MODEL_ID,
-            name: FIREWORKS_DEFAULT_MODEL_ID,
-            provider: "fireworks",
-            api: "openai-completions",
-            baseUrl: FIREWORKS_BASE_URL,
-            reasoning: false,
-            input: ["text", "image"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
-            maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS,
-          },
-        ],
-      }),
-    );
-
-    expect(resolved).toMatchObject({
-      provider: "fireworks",
-      id: "accounts/fireworks/models/kimi-k2p5",
-      reasoning: false,
-    });
+  it.each([
+    ["kimi-k2p5-synthetic-test", false, ["text", "image"]],
+    ["glm-5p1", true, ["text"]],
+  ] as const)("sets reasoning and input metadata for %s", (name, reasoning, input) => {
+    const id = `accounts/fireworks/models/${name}`;
+    expect(resolveModel(id)).toMatchObject({ provider: "fireworks", id, reasoning, input });
   });
 
-  it("disables reasoning metadata for Fireworks Kimi k2.5 aliases", async () => {
-    const provider = await registerSingleProviderPlugin(fireworksPlugin);
-    const resolved = provider.resolveDynamicModel?.(
-      createDynamicContext({
-        provider: "fireworks",
-        modelId: "accounts/fireworks/routers/kimi-k2.5-turbo",
-        models: [
-          {
-            id: FIREWORKS_DEFAULT_MODEL_ID,
-            name: FIREWORKS_DEFAULT_MODEL_ID,
-            provider: "fireworks",
-            api: "openai-completions",
-            baseUrl: FIREWORKS_BASE_URL,
-            reasoning: false,
-            input: ["text", "image"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
-            maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS,
-          },
-        ],
-      }),
-    );
+  it("defers manifest catalog models to core static-catalog resolution", () => {
+    expect(resolveModel(FIREWORKS_DEFAULT_MODEL_ID)).toBeUndefined();
+  });
 
-    expect(resolved).toMatchObject({
-      provider: "fireworks",
-      id: "accounts/fireworks/routers/kimi-k2.5-turbo",
-      reasoning: false,
-    });
+  it("exposes off-only thinking policy for Fireworks Kimi models", () => {
+    const modelId = "accounts/fireworks/models/kimi-k2.6-synthetic-test";
+    const offOnly = { levels: [{ id: "off" }], defaultLevel: "off" };
+    expect(thinkingProfile("accounts/fireworks/routers/kimi-k2.6-synthetic-test")).toEqual(offOnly);
+    expect(thinkingProfile(modelId)).toEqual(offOnly);
+    expect(thinkingProfile(FIREWORKS_DEFAULT_MODEL_ID)).toBeUndefined();
+    expect(resolveThinkingProfile({ modelId })).toEqual(offOnly);
+    expect(
+      resolveThinkingProfile({ modelId: "accounts/fireworks/models/qwen3.6-plus" }),
+    ).toBeUndefined();
   });
 });

@@ -1,5 +1,7 @@
+// Live probes provider response headers used for request-id diagnostics.
 import { beforeAll, describe, expect, it } from "vitest";
 import {
+  resolveLiveCacheModel,
   LIVE_CACHE_TEST_ENABLED,
   logLiveCache,
   resolveLiveDirectModel,
@@ -13,15 +15,11 @@ describeLive("provider response headers (live)", () => {
     let fixture: Awaited<ReturnType<typeof resolveLiveDirectModel>>;
 
     beforeAll(async () => {
-      fixture = await resolveLiveDirectModel({
-        provider: "openai",
-        api: "openai-responses",
-        envVar: "OPENCLAW_LIVE_OPENAI_CACHE_MODEL",
-        preferredModelIds: ["gpt-5.4-mini", "gpt-5.4", "gpt-5.4"],
-      });
+      fixture = await resolveLiveCacheModel("openai");
     }, 120_000);
 
     it("returns request-id style headers from Responses", async () => {
+      // Raw fetch keeps provider response headers visible outside SDK wrappers.
       const response = await withLiveCacheHeartbeat(
         fetch("https://api.openai.com/v1/responses", {
           method: "POST",
@@ -49,7 +47,8 @@ describeLive("provider response headers (live)", () => {
       logLiveCache(
         `openai headers x-request-id=${requestId ?? "(missing)"} openai-processing-ms=${processingMs ?? "(missing)"} ${rateLimitHeaders.join(" ")}`.trim(),
       );
-      expect(requestId).toBeTruthy();
+      expect(typeof requestId).toBe("string");
+      expect(requestId?.trim()).not.toBe("");
     }, 120_000);
   });
 
@@ -57,12 +56,7 @@ describeLive("provider response headers (live)", () => {
     let fixture: Awaited<ReturnType<typeof resolveLiveDirectModel>>;
 
     beforeAll(async () => {
-      fixture = await resolveLiveDirectModel({
-        provider: "anthropic",
-        api: "anthropic-messages",
-        envVar: "OPENCLAW_LIVE_ANTHROPIC_CACHE_MODEL",
-        preferredModelIds: ["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-haiku-3-5"],
-      });
+      fixture = await resolveLiveCacheModel("anthropic");
     }, 120_000);
 
     it("returns request-id from Messages", async () => {
@@ -87,7 +81,8 @@ describeLive("provider response headers (live)", () => {
 
       const requestId = response.headers.get("request-id");
       logLiveCache(`anthropic headers request-id=${requestId ?? "(missing)"}`);
-      expect(requestId).toBeTruthy();
+      expect(typeof requestId).toBe("string");
+      expect(requestId?.trim()).not.toBe("");
     }, 120_000);
   });
 });

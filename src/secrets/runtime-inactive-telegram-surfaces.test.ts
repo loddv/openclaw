@@ -1,8 +1,29 @@
+/** Tests inactive Telegram SecretRefs remain unresolved and diagnostic-only. */
 import { describe, expect, it } from "vitest";
 import "./runtime-telegram.test-support.ts";
 import { asConfig, setupSecretsRuntimeSnapshotTestHooks } from "./runtime.test-support.ts";
 
 const { prepareSecretsRuntimeSnapshot } = setupSecretsRuntimeSnapshotTestHooks();
+
+function expectWarningPaths(
+  snapshot: Awaited<ReturnType<typeof prepareSecretsRuntimeSnapshot>>,
+  expectedPaths: string[],
+): void {
+  const warningPaths = new Set(snapshot.warnings.map((warning) => warning.path));
+  for (const expectedPath of expectedPaths) {
+    expect(warningPaths.has(expectedPath)).toBe(true);
+  }
+}
+
+function requireTelegramConfig(
+  snapshot: Awaited<ReturnType<typeof prepareSecretsRuntimeSnapshot>>,
+) {
+  const config = snapshot.config.channels?.telegram;
+  if (!config) {
+    throw new Error("expected Telegram runtime config");
+  }
+  return config;
+}
 
 describe("secrets runtime snapshot inactive telegram surfaces", () => {
   it("skips inactive Telegram refs and emits diagnostics", async () => {
@@ -12,6 +33,7 @@ describe("secrets runtime snapshot inactive telegram surfaces", () => {
           telegram: {
             botToken: { source: "env", provider: "default", id: "DISABLED_TELEGRAM_BASE_TOKEN" },
             accounts: {
+              default: { enabled: false },
               disabled: {
                 enabled: false,
                 botToken: {
@@ -29,16 +51,14 @@ describe("secrets runtime snapshot inactive telegram surfaces", () => {
       loadablePluginOrigins: new Map(),
     });
 
-    expect(snapshot.config.channels?.telegram?.botToken).toEqual({
+    expect(requireTelegramConfig(snapshot).botToken).toEqual({
       source: "env",
       provider: "default",
       id: "DISABLED_TELEGRAM_BASE_TOKEN",
     });
-    expect(snapshot.warnings.map((warning) => warning.path)).toEqual(
-      expect.arrayContaining([
-        "channels.telegram.botToken",
-        "channels.telegram.accounts.disabled.botToken",
-      ]),
-    );
+    expectWarningPaths(snapshot, [
+      "channels.telegram.botToken",
+      "channels.telegram.accounts.disabled.botToken",
+    ]);
   });
 });

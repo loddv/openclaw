@@ -1,12 +1,18 @@
+/** Best-effort provider stream parameter overrides for an agent command. */
 export type AgentStreamParams = {
-  /** Provider stream params override (best-effort). */
   temperature?: number;
+  topP?: number;
   maxTokens?: number;
-  /** Provider fast-mode override (best-effort). */
+  /** Stop sequences forwarded to the provider (best-effort). */
+  stop?: string[];
   fastMode?: boolean;
+  responseFormat?: Record<string, unknown>;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  seed?: number;
 };
 
-// Simplified tool definition for client-provided tools (OpenResponses hosted tools)
+/** Simplified tool definition for client-provided OpenResponses hosted tools. */
 export type ClientToolDefinition = {
   type: "function";
   function: {

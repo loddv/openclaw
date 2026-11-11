@@ -1,8 +1,15 @@
 #!/usr/bin/env node
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import ts from "typescript";
+import * as ts from "typescript/ast";
+import {
+  collectSourceFiles,
+  collectStronglyConnectedComponents,
+  formatCycle,
+} from "./lib/import-cycle-graph.ts";
+import { createNativeTypeScriptParser } from "./lib/native-typescript.mts";
+import { visitModuleSpecifiers } from "./lib/ts-guard-utils.mts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const scanRoots = ["src", "extensions", "scripts"] as const;
@@ -13,14 +20,6 @@ const declarationSourcePattern = /\.d\.[cm]?ts$/;
 const ignoredPathPartPattern =
   /(^|\/)(node_modules|dist|build|coverage|\.artifacts|\.git|assets)(\/|$)/;
 
-function normalizeRepoPath(filePath: string): string {
-  return path.relative(repoRoot, filePath).split(path.sep).join("/");
-}
-
-function cycleSignature(files: readonly string[]): string {
-  return files.toSorted((left, right) => left.localeCompare(right)).join("\n");
-}
-
 function shouldSkipRepoPath(repoPath: string): boolean {
   return (
     ignoredPathPartPattern.test(repoPath) ||
@@ -28,23 +27,6 @@ function shouldSkipRepoPath(repoPath: string): boolean {
     generatedSourcePattern.test(repoPath) ||
     declarationSourcePattern.test(repoPath)
   );
-}
-
-function collectSourceFiles(root: string): string[] {
-  const repoPath = normalizeRepoPath(root);
-  if (shouldSkipRepoPath(repoPath)) {
-    return [];
-  }
-  const stats = statSync(root);
-  if (stats.isFile()) {
-    return sourceExtensions.some((extension) => repoPath.endsWith(extension)) ? [repoPath] : [];
-  }
-  if (!stats.isDirectory()) {
-    return [];
-  }
-  return readdirSync(root, { withFileTypes: true })
-    .flatMap((entry) => collectSourceFiles(path.join(root, entry.name)))
-    .toSorted((left, right) => left.localeCompare(right));
 }
 
 function createSourceResolver(files: readonly string[]) {
@@ -57,6 +39,7 @@ function createSourceResolver(files: readonly string[]) {
     if (file.endsWith(".ts")) {
       pathMap.set(`${extensionless}.js`, file);
     } else if (file.endsWith(".tsx")) {
+      pathMap.set(`${extensionless}.js`, file);
       pathMap.set(`${extensionless}.jsx`, file);
     } else if (file.endsWith(".mts")) {
       pathMap.set(`${extensionless}.mjs`, file);
@@ -69,8 +52,14 @@ function createSourceResolver(files: readonly string[]) {
       return null;
     }
     const base = path.posix.normalize(path.posix.join(path.posix.dirname(importer), specifier));
+    if (fileSet.has(base)) {
+      return base;
+    }
+    const mappedBase = pathMap.get(base);
+    if (mappedBase) {
+      return mappedBase;
+    }
     const candidates = [
-      base,
       ...sourceExtensions.map((extension) => `${base}${extension}`),
       `${base}/index.ts`,
       `${base}/index.tsx`,
@@ -94,7 +83,7 @@ function importDeclarationHasRuntimeEdge(node: ts.ImportDeclaration): boolean {
   if (!node.importClause) {
     return true;
   }
-  if (node.importClause.isTypeOnly) {
+  if (node.importClause.phaseModifier === ts.SyntaxKind.TypeKeyword) {
     return false;
   }
   const bindings = node.importClause.namedBindings;
@@ -118,147 +107,49 @@ function exportDeclarationHasRuntimeEdge(node: ts.ExportDeclaration): boolean {
 function collectRuntimeStaticImports(
   file: string,
   resolveSource: ReturnType<typeof createSourceResolver>,
+  sourceFile: ts.SourceFile,
 ) {
-  const sourceFile = ts.createSourceFile(
-    file,
-    readFileSync(path.join(repoRoot, file), "utf8"),
-    ts.ScriptTarget.Latest,
-    true,
-  );
   const imports: string[] = [];
-  const visit = (node: ts.Node) => {
-    let specifier: string | undefined;
-    let include = false;
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-      specifier = node.moduleSpecifier.text;
-      include = importDeclarationHasRuntimeEdge(node);
-    } else if (
-      ts.isExportDeclaration(node) &&
-      node.moduleSpecifier &&
-      ts.isStringLiteral(node.moduleSpecifier)
-    ) {
-      specifier = node.moduleSpecifier.text;
-      include = exportDeclarationHasRuntimeEdge(node);
-    }
+  visitModuleSpecifiers(sourceFile, ({ node, specifier }) => {
+    const include =
+      (ts.isImportDeclaration(node) && importDeclarationHasRuntimeEdge(node)) ||
+      (ts.isExportDeclaration(node) && exportDeclarationHasRuntimeEdge(node));
     if (include && specifier) {
       const resolved = resolveSource(file, specifier);
       if (resolved) {
         imports.push(resolved);
       }
     }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
+  });
   return imports.toSorted((left, right) => left.localeCompare(right));
 }
 
-function collectStronglyConnectedComponents(
-  graph: ReadonlyMap<string, readonly string[]>,
-): string[][] {
-  let nextIndex = 0;
-  const stack: string[] = [];
-  const onStack = new Set<string>();
-  const indexByNode = new Map<string, number>();
-  const lowLinkByNode = new Map<string, number>();
-  const components: string[][] = [];
-
-  const visit = (node: string) => {
-    indexByNode.set(node, nextIndex);
-    lowLinkByNode.set(node, nextIndex);
-    nextIndex += 1;
-    stack.push(node);
-    onStack.add(node);
-
-    for (const next of graph.get(node) ?? []) {
-      if (!indexByNode.has(next)) {
-        visit(next);
-        lowLinkByNode.set(node, Math.min(lowLinkByNode.get(node)!, lowLinkByNode.get(next)!));
-      } else if (onStack.has(next)) {
-        lowLinkByNode.set(node, Math.min(lowLinkByNode.get(node)!, indexByNode.get(next)!));
-      }
-    }
-
-    if (lowLinkByNode.get(node) !== indexByNode.get(node)) {
-      return;
-    }
-    const component: string[] = [];
-    let current: string | undefined;
-    do {
-      current = stack.pop();
-      if (!current) {
-        throw new Error("Import cycle stack underflow");
-      }
-      onStack.delete(current);
-      component.push(current);
-    } while (current !== node);
-    if (component.length > 1 || (graph.get(node) ?? []).includes(node)) {
-      components.push(component.toSorted((left, right) => left.localeCompare(right)));
-    }
-  };
-
-  for (const node of graph.keys()) {
-    if (!indexByNode.has(node)) {
-      visit(node);
-    }
-  }
-  return components.toSorted(
-    (left, right) =>
-      right.length - left.length || cycleSignature(left).localeCompare(cycleSignature(right)),
-  );
-}
-
-function findCycleWitness(
-  component: readonly string[],
-  graph: ReadonlyMap<string, readonly string[]>,
-): string[] {
-  const componentSet = new Set(component);
-  const start = component[0];
-  if (!start) {
-    return [];
-  }
-  const activePath: string[] = [];
-  const visited = new Set<string>();
-  const visit = (node: string): string[] | null => {
-    activePath.push(node);
-    visited.add(node);
-    for (const next of graph.get(node) ?? []) {
-      if (!componentSet.has(next)) {
-        continue;
-      }
-      const existingIndex = activePath.indexOf(next);
-      if (existingIndex >= 0) {
-        return [...activePath.slice(existingIndex), next];
-      }
-      if (!visited.has(next)) {
-        const result = visit(next);
-        if (result) {
-          return result;
-        }
-      }
-    }
-    activePath.pop();
-    return null;
-  };
-  return visit(start) ?? component;
-}
-
-function formatCycle(
-  component: readonly string[],
-  graph: ReadonlyMap<string, readonly string[]>,
-): string {
-  const witness = findCycleWitness(component, graph);
-  return witness.map((file, index) => `${index === 0 ? "  " : "  -> "}${file}`).join("\n");
-}
-
 function main(): number {
-  const files = scanRoots.flatMap((root) => collectSourceFiles(path.join(repoRoot, root)));
-  const resolveSource = createSourceResolver(files);
-  const graph = new Map(
-    files.map((file): [string, string[]] => [
-      file,
-      collectRuntimeStaticImports(file, resolveSource),
-    ]),
+  using parser = createNativeTypeScriptParser({ cwd: repoRoot });
+  const files = scanRoots.flatMap((root) =>
+    collectSourceFiles(path.join(repoRoot, root), {
+      repoRoot,
+      sourceExtensions,
+      shouldSkipRepoPath,
+    }),
   );
+  const resolveSource = createSourceResolver(files);
+  const graph = new Map<string, string[]>();
+  // Native snapshots reload their root list. Keep only one bounded batch of syntax trees.
+  const batchSize = 32;
+  for (let offset = 0; offset < files.length; offset += batchSize) {
+    const batch = files.slice(offset, offset + batchSize);
+    const sourceFiles = parser.parseSourceFiles(
+      batch.map((file) => ({
+        fileName: file,
+        text: readFileSync(path.join(repoRoot, file), "utf8"),
+      })),
+    );
+    for (const [index, sourceFile] of sourceFiles.entries()) {
+      const file = batch[index]!;
+      graph.set(file, collectRuntimeStaticImports(file, resolveSource, sourceFile));
+    }
+  }
   const components = collectStronglyConnectedComponents(graph);
 
   console.log(`Import cycle check: ${components.length} runtime value cycle(s).`);

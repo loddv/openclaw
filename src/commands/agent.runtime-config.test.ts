@@ -1,157 +1,270 @@
-import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import "./agent-command.test-mocks.js";
-import "../cron/isolated-agent.mocks.js";
-import { __testing as agentCommandTesting } from "../agents/agent-command.js";
-import { resolveSession } from "../agents/command/session.js";
-import * as commandConfigResolutionModule from "../cli/command-config-resolution.js";
-import type { OpenClawConfig } from "../config/config.js";
-import * as configModule from "../config/config.js";
-import {
-  mockSharedAgentCommandConfig,
-  resetSharedAgentCommandRuntimeState,
-  runtime,
-  withSharedAgentCommandTempHome,
-} from "./agent-runtime-config.test-support.js";
+import { resolveAgentRuntimeConfig } from "../agents/agent-runtime-config.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
+import { createThrowingTestRuntime } from "./test-runtime-config-helpers.js";
 
-vi.mock("../agents/command/session-store.js", () => {
-  return {
-    updateSessionStoreAfterAgentRun: vi.fn(async () => undefined),
-  };
-});
+type ConfigSnapshotForWrite = {
+  snapshot: { valid: boolean; resolved: OpenClawConfig };
+  writeOptions: { basePluginMetadataSnapshot?: PluginMetadataSnapshot };
+};
 
-const configSpy = vi.spyOn(configModule, "loadConfig");
-const readConfigFileSnapshotForWriteSpy = vi.spyOn(configModule, "readConfigFileSnapshotForWrite");
+type ResolveCommandConfigParams = Parameters<
+  typeof import("../cli/command-config-resolution.runtime.js").resolveCommandConfigWithSecrets
+>[0];
 
-async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
-  return withSharedAgentCommandTempHome("openclaw-agent-", fn);
+const loadConfigMock = vi.hoisted(() => vi.fn<() => OpenClawConfig>());
+const readConfigFileSnapshotForWriteMock = vi.hoisted(() =>
+  vi.fn<() => Promise<ConfigSnapshotForWrite>>(),
+);
+// mock-isolation: Secret-resolution cases control runtime/source snapshots without real config IO.
+vi.mock("../config/io.js", () => ({
+  captureRuntimeConfigAsyncReader: () => async () => loadConfigMock(),
+  getRuntimeConfig: loadConfigMock,
+  loadConfig: loadConfigMock,
+  readConfigFileSnapshotForWrite: readConfigFileSnapshotForWriteMock,
+}));
+
+vi.mock("../cli/command-secret-targets.js", () => ({
+  getAgentRuntimeCommandSecretTargetIds: (params?: { includeChannelTargets?: boolean }) =>
+    new Set([
+      "models.providers.*.apiKey",
+      ...(params?.includeChannelTargets === true ? ["channels.telegram.botToken"] : []),
+    ]),
+  getAgentRuntimeOptionalCommandSecretPaths: () =>
+    new Set(["plugins.entries.firecrawl.config.webFetch.apiKey"]),
+  getScopedChannelsCommandSecretTargets: (params: {
+    config: OpenClawConfig;
+    channel?: string;
+    accountId?: string;
+    defaultAccountWhenMissing?: boolean;
+  }) => {
+    const channelConfig = params.config.channels?.[params.channel ?? ""] as
+      | { defaultAccount?: string }
+      | undefined;
+    const accountId =
+      params.accountId ??
+      (params.defaultAccountWhenMissing ? (channelConfig?.defaultAccount ?? "default") : undefined);
+    return {
+      targetIds: new Set(
+        params.channel === "telegram"
+          ? ["channels.telegram.botToken", "channels.telegram.accounts.*.botToken"]
+          : params.channel === "discord"
+            ? ["channels.discord.token"]
+            : [],
+      ),
+      ...(params.channel === "telegram" && accountId
+        ? {
+            allowedPaths: new Set([
+              "channels.telegram.botToken",
+              `channels.telegram.accounts.${accountId}.botToken`,
+            ]),
+          }
+        : {}),
+    };
+  },
+}));
+
+vi.mock("../secrets/target-registry.js", () => ({
+  discoverConfigSecretTargetsByIds: (
+    config: OpenClawConfig,
+    targetIds: Iterable<string>,
+  ): Array<{ path: string }> => {
+    const ids = new Set(targetIds);
+    return ids.has("models.providers.*.apiKey") && config.models?.providers?.openai?.apiKey
+      ? [{ path: "models.providers.openai.apiKey" }]
+      : [];
+  },
+}));
+
+const setRuntimeConfigSnapshotMock = vi.hoisted(() =>
+  vi.fn<(cfg: OpenClawConfig, sourceConfig: OpenClawConfig) => void>(),
+);
+vi.mock("../config/runtime-snapshot.js", () => ({
+  getRuntimeConfigSourceSnapshot: () => null,
+  registerRuntimeConfigSnapshotPreparer: vi.fn(),
+  setRuntimeConfigSnapshot: setRuntimeConfigSnapshotMock,
+}));
+
+const getActiveSecretsRuntimeConfigSnapshotMock = vi.hoisted(() =>
+  vi.fn<typeof import("../secrets/runtime-state.js").getActiveSecretsRuntimeConfigSnapshot>(),
+);
+vi.mock("../secrets/runtime-state.js", () => ({
+  getActiveSecretsRuntimeConfigSnapshot: getActiveSecretsRuntimeConfigSnapshotMock,
+}));
+const prepareSecretsRuntimeSnapshotMock = vi.hoisted(() =>
+  vi.fn(
+    async (params: {
+      config: OpenClawConfig;
+      assignmentConfig: OpenClawConfig;
+      pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "plugins" | "manifestRegistry">;
+    }) => ({
+      sourceConfig: params.config,
+      config: params.assignmentConfig,
+      authStores: [],
+      authStoreCredentialsRevision: 0,
+      authStoreSnapshotsRevision: 0,
+      warnings: [],
+      webTools: {},
+    }),
+  ),
+);
+const activateSecretsRuntimeSnapshotMock = vi.hoisted(() => vi.fn());
+vi.mock("../secrets/runtime.js", () => ({
+  prepareSecretsRuntimeSnapshot: prepareSecretsRuntimeSnapshotMock,
+  activateSecretsRuntimeSnapshot: activateSecretsRuntimeSnapshotMock,
+}));
+
+const resolveCommandConfigWithSecretsMock = vi.hoisted(() =>
+  vi.fn<
+    (params: ResolveCommandConfigParams) => Promise<{
+      resolvedConfig: OpenClawConfig;
+      effectiveConfig: OpenClawConfig;
+      diagnostics: never[];
+    }>
+  >(),
+);
+vi.mock("../cli/command-config-resolution.runtime.js", () => ({
+  resolveCommandConfigWithSecrets: resolveCommandConfigWithSecretsMock,
+}));
+
+const runtime = createThrowingTestRuntime();
+
+function mockConfig(cfg: OpenClawConfig = {}): OpenClawConfig {
+  loadConfigMock.mockReturnValue(cfg);
+  return cfg;
 }
 
-function mockConfig(
-  home: string,
-  storePath: string,
-  agentOverrides?: Parameters<typeof mockSharedAgentCommandConfig>[3],
-) {
-  return mockSharedAgentCommandConfig(configSpy, home, storePath, agentOverrides);
+const secretRef = (id: string) => ({ source: "env" as const, provider: "default", id });
+function modelConfig(apiKey: string | ReturnType<typeof secretRef>): OpenClawConfig["models"] {
+  return { providers: { openai: { baseUrl: "https://api.openai.com/v1", apiKey, models: [] } } };
+}
+function telegramConfig(defaultAccount?: string): OpenClawConfig["channels"] {
+  return {
+    telegram: {
+      ...(defaultAccount ? { defaultAccount } : { botToken: secretRef("TELEGRAM_BOT_TOKEN") }),
+      accounts: {
+        ops: { botToken: secretRef("TELEGRAM_OPS_TOKEN") },
+        chat: { botToken: secretRef("TELEGRAM_CHAT_TOKEN") },
+      },
+    },
+  };
+}
+function resolveSecretsWith(config: OpenClawConfig) {
+  resolveCommandConfigWithSecretsMock.mockResolvedValueOnce({
+    resolvedConfig: config,
+    effectiveConfig: config,
+    diagnostics: [],
+  });
 }
 
 beforeEach(() => {
-  resetSharedAgentCommandRuntimeState(readConfigFileSnapshotForWriteSpy);
+  vi.clearAllMocks();
+  getActiveSecretsRuntimeConfigSnapshotMock.mockImplementation(() => ({
+    config: loadConfigMock(),
+    sourceConfig: loadConfigMock(),
+    configRefsPrepared: true,
+  }));
+  readConfigFileSnapshotForWriteMock.mockResolvedValue({
+    snapshot: { valid: false, resolved: {} as OpenClawConfig },
+    writeOptions: {},
+  });
 });
 
 describe("agentCommand runtime config", () => {
+  it("materializes auth-profile refs for standalone local runs", async () => {
+    const loadedConfig = mockConfig();
+    const sourceConfig = { ...loadedConfig, secrets: { providers: {} } } as OpenClawConfig;
+    const pluginMetadataSnapshot = {
+      plugins: [],
+      manifestRegistry: { plugins: [], diagnostics: [] },
+    } as unknown as PluginMetadataSnapshot;
+    readConfigFileSnapshotForWriteMock.mockResolvedValue({
+      snapshot: { valid: true, resolved: sourceConfig },
+      writeOptions: { basePluginMetadataSnapshot: pluginMetadataSnapshot },
+    });
+    getActiveSecretsRuntimeConfigSnapshotMock.mockReturnValue(null);
+
+    await resolveAgentRuntimeConfig(runtime);
+
+    expect(prepareSecretsRuntimeSnapshotMock).toHaveBeenCalledWith({
+      config: sourceConfig,
+      assignmentConfig: loadedConfig,
+      includeConfigRefs: false,
+      pluginMetadataSnapshot,
+    });
+    expect(prepareSecretsRuntimeSnapshotMock.mock.calls[0]?.[0].pluginMetadataSnapshot).toBe(
+      pluginMetadataSnapshot,
+    );
+    expect(activateSecretsRuntimeSnapshotMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceConfig, config: loadedConfig }),
+    );
+    expect(setRuntimeConfigSnapshotMock).not.toHaveBeenCalled();
+  });
+
   it("sets runtime snapshots from source config before embedded agent run", async () => {
-    await withTempHome(async (home) => {
-      const setRuntimeConfigSnapshotSpy = vi.spyOn(configModule, "setRuntimeConfigSnapshot");
+    const loadedConfig = mockConfig({ models: modelConfig(secretRef("OPENAI_API_KEY")) });
+    const sourceConfig = structuredClone(loadedConfig);
+    const resolvedConfig = {
+      ...loadedConfig,
+      models: modelConfig("sk-resolved-runtime"), // pragma: allowlist secret
+    };
 
-      const store = path.join(home, "sessions.json");
-      const loadedConfig = {
-        agents: {
-          defaults: {
-            model: { primary: "anthropic/claude-opus-4-6" },
-            models: { "anthropic/claude-opus-4-6": {} },
-            workspace: path.join(home, "openclaw"),
-          },
-        },
-        session: { store, mainKey: "main" },
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
-      const sourceConfig = {
-        ...loadedConfig,
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
-      const resolvedConfig = {
-        ...loadedConfig,
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: "sk-resolved-runtime", // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
-
-      configSpy.mockReturnValue(loadedConfig);
-      readConfigFileSnapshotForWriteSpy.mockResolvedValue({
-        snapshot: { valid: true, resolved: sourceConfig },
-        writeOptions: {},
-      } as Awaited<ReturnType<typeof configModule.readConfigFileSnapshotForWrite>>);
-      const resolveConfigWithSecretsSpy = vi
-        .spyOn(commandConfigResolutionModule, "resolveCommandConfigWithSecrets")
-        .mockResolvedValueOnce({
-          resolvedConfig,
-          effectiveConfig: resolvedConfig,
-          diagnostics: [],
-        });
-
-      const prepared = await agentCommandTesting.resolveAgentRuntimeConfig(runtime);
-
-      expect(resolveConfigWithSecretsSpy).toHaveBeenCalledWith({
-        config: loadedConfig,
-        commandName: "agent",
-        targetIds: expect.objectContaining({
-          has: expect.any(Function),
-        }),
-        runtime,
-      });
-      const targetIds = resolveConfigWithSecretsSpy.mock.calls[0]?.[0].targetIds;
-      expect(targetIds.has("models.providers.*.apiKey")).toBe(true);
-      expect(targetIds.has("channels.telegram.botToken")).toBe(false);
-      expect(setRuntimeConfigSnapshotSpy).toHaveBeenCalledWith(resolvedConfig, sourceConfig);
-      expect(prepared.cfg).toBe(resolvedConfig);
+    getActiveSecretsRuntimeConfigSnapshotMock.mockReturnValue({
+      config: loadedConfig,
+      sourceConfig,
+      configRefsPrepared: true,
     });
+    resolveSecretsWith(resolvedConfig);
+
+    const prepared = await resolveAgentRuntimeConfig(runtime);
+
+    expect(resolveCommandConfigWithSecretsMock).toHaveBeenCalledWith({
+      config: loadedConfig,
+      commandName: "agent",
+      targetIds: new Set(["models.providers.*.apiKey"]),
+      optionalActivePaths: new Set(["plugins.entries.firecrawl.config.webFetch.apiKey"]),
+      runtime,
+    });
+    expect(setRuntimeConfigSnapshotMock).toHaveBeenCalledWith(resolvedConfig, sourceConfig);
+    expect(prepared).toBe(resolvedConfig);
   });
 
-  it("includes channel secret targets when delivery is requested", async () => {
-    await withTempHome(async (home) => {
-      const store = path.join(home, "sessions.json");
-      const loadedConfig = mockConfig(home, store);
-      const resolveConfigWithSecretsSpy = vi
-        .spyOn(commandConfigResolutionModule, "resolveCommandConfigWithSecrets")
-        .mockResolvedValueOnce({
-          resolvedConfig: loadedConfig,
-          effectiveConfig: loadedConfig,
-          diagnostics: [],
-        });
-
-      await agentCommandTesting.resolveAgentRuntimeConfig(runtime, {
-        runtimeTargetsChannelSecrets: true,
-      });
-
-      const targetIds = resolveConfigWithSecretsSpy.mock.calls[0]?.[0].targetIds;
-      expect(targetIds.has("channels.telegram.botToken")).toBe(true);
+  it.each(["default", "selected"])("scopes routing secrets to the %s account", async (scope) => {
+    const selected = scope === "selected";
+    const loadedConfig = mockConfig({
+      channels: telegramConfig(selected ? undefined : "ops"),
+      ...(selected ? { models: modelConfig(secretRef("OPENAI_API_KEY")) } : {}),
     });
+    resolveSecretsWith(loadedConfig);
+    await resolveAgentRuntimeConfig(runtime, {
+      runtimeChannelSecretScope: { channel: "telegram", ...(selected ? { accountId: "ops" } : {}) },
+    });
+    expect(resolveCommandConfigWithSecretsMock.mock.calls[0]?.[0].allowedPaths).toEqual(
+      new Set([
+        ...(selected ? ["models.providers.openai.apiKey"] : []),
+        "channels.telegram.botToken",
+        "channels.telegram.accounts.ops.botToken",
+      ]),
+    );
   });
 
-  it("derives a fresh session from --to", async () => {
-    await withTempHome(async (home) => {
-      const store = path.join(home, "sessions.json");
-      const cfg = mockConfig(home, store);
+  it.each([
+    ["global", { memory: memoryConfig("MEMORY_HEADER") }],
+    [
+      "per-agent",
+      { agents: { entries: { personal: { memory: memoryConfig("AGENT_MEMORY_HEADER") } } } },
+    ],
+  ] as const)("resolves command secrets for %s memory headers", async (_scope, config) => {
+    const loadedConfig = mockConfig(config as unknown as OpenClawConfig);
+    resolveSecretsWith(loadedConfig);
 
-      const resolved = resolveSession({ cfg, to: "+1555" });
+    await resolveAgentRuntimeConfig(runtime);
 
-      expect(resolved.storePath).toBe(store);
-      expect(resolved.sessionKey).toBeTruthy();
-      expect(resolved.sessionId).toBeTruthy();
-      expect(resolved.isNewSession).toBe(true);
-    });
+    expect(resolveCommandConfigWithSecretsMock).toHaveBeenCalledTimes(1);
   });
 });
+
+function memoryConfig(id: string) {
+  return { search: { remote: { headers: { Authorization: secretRef(id) } } } };
+}

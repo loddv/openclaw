@@ -1,78 +1,131 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { PAIRING_SETUP_BOOTSTRAP_PROFILE } from "../shared/device-bootstrap-profile.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
+import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
+import { overbroadBootstrapProfile } from "./device-bootstrap-profile.test-support.js";
 import { issueDeviceBootstrapToken, verifyDeviceBootstrapToken } from "./device-bootstrap.js";
+import { approveBootstrapDevicePairing, approveDevicePairing } from "./device-pairing-approval.js";
 import {
-  approveBootstrapDevicePairing,
-  approveDevicePairing,
-  clearDevicePairing,
+  requireValue,
+  requestPairing as requestPairingInStateDir,
+  mutatePairedDevice,
+} from "./device-pairing-fixtures.test-support.js";
+import { withDevicePairingLock } from "./device-pairing-lock.js";
+import { updatePairedNodeBins, updatePairedNodeSessionHost } from "./device-pairing-node-facts.js";
+import { approveNodePairing, requestNodePairing } from "./device-pairing-node.js";
+import {
+  loadDevicePairingStoreState,
+  persistDeviceBootstrapTokenRecords,
+  persistDevicePairingStoreState,
+} from "./device-pairing-store.js";
+import {
   ensureDeviceToken,
+  revokeDeviceToken,
+  rotateDeviceToken,
+  verifyDeviceToken,
+} from "./device-pairing-tokens.js";
+import {
   getPairedDevice,
-  hasEffectivePairedDeviceRole,
+  hasPairedCardRenderer,
   listEffectivePairedDeviceRoles,
   listDevicePairing,
   removePairedDevice,
   requestDevicePairing,
-  revokeDeviceToken,
-  rotateDeviceToken,
+  resolveNodePairingGeneration,
   updatePairedDeviceMetadata,
-  verifyDeviceToken,
-  type PairedDevice,
-  type RotateDeviceTokenResult,
+  updatePairedDevicePresence,
 } from "./device-pairing.js";
-import { resolvePairingPaths } from "./pairing-files.js";
+import { loadApnsRegistration, registerApnsRegistration } from "./push-apns.js";
 
-async function setupPairedOperatorDevice(baseDir: string, scopes: string[]) {
-  const request = await requestDevicePairing(
-    {
-      deviceId: "device-1",
-      publicKey: "public-key-1",
-      role: "operator",
-      scopes,
-    },
+function requestPairing(
+  request: Partial<Parameters<typeof requestDevicePairing>[0]>,
+  stateDir = baseDir,
+) {
+  return requestPairingInStateDir(request, stateDir);
+}
+
+function requestBootstrap(patch: Partial<Parameters<typeof requestDevicePairing>[0]> = {}) {
+  return requestPairing(
+    { role: "node", roles: ["node"], scopes: [], silent: true, ...patch },
     baseDir,
   );
-  await approveDevicePairing(request.request.requestId, { callerScopes: scopes }, baseDir);
 }
 
-async function setupPairedNodeDevice(baseDir: string) {
-  const request = await requestDevicePairing(
-    {
-      deviceId: "node-1",
-      publicKey: "public-key-node-1",
-      role: "node",
-      scopes: [],
-    },
+type RotateDeviceTokenResult = Awaited<ReturnType<typeof rotateDeviceToken>>;
+
+function requestOperator(scopes: string[]) {
+  return requestPairing({ role: "operator", scopes }, baseDir);
+}
+
+const nodeIdentity = { deviceId: "node-1", publicKey: "public-key-node-1", role: "node" };
+const browserIdentity = {
+  deviceId: "browser-device-1",
+  publicKey: "public-key-browser-1",
+  clientId: "openclaw-control-ui",
+  clientMode: "webchat",
+};
+
+async function pairDevice(
+  scopes: string[],
+  identity: Partial<Parameters<typeof requestDevicePairing>[0]> = {},
+) {
+  const { request } = await requestPairing({ role: "operator", scopes, ...identity }, baseDir);
+  await approveRequest(request, scopes);
+}
+
+function approveRequest(request: { requestId: string }, callerScopes: string[]) {
+  return approveDevicePairing(request.requestId, { callerScopes }, baseDir);
+}
+
+function approveBootstrap(
+  request: { requestId: string },
+  profile = PAIRING_SETUP_BOOTSTRAP_PROFILE,
+  options: Parameters<typeof approveBootstrapDevicePairing>[2] = {},
+) {
+  return approveBootstrapDevicePairing(request.requestId, profile, options, baseDir);
+}
+
+async function pairNodeSurface(commands: string[]) {
+  await pairDevice([], nodeIdentity);
+  const pending = await requestNodePairing(
+    { nodeId: "node-1", platform: "darwin", commands },
     baseDir,
   );
-  await approveDevicePairing(request.request.requestId, { callerScopes: [] }, baseDir);
+  await approveNodePairing(
+    pending.request.requestId,
+    { callerScopes: ["operator.pairing", "operator.admin"] },
+    baseDir,
+  );
+  return requireValue(
+    resolveNodePairingGeneration(await getPairedDevice("node-1", baseDir)),
+    "expected node generation",
+  );
 }
 
-async function setupOperatorToken(scopes: string[]) {
-  const baseDir = await makeDevicePairingDir();
-  await setupPairedOperatorDevice(baseDir, scopes);
-  const paired = await getPairedDevice("device-1", baseDir);
-  const token = requireToken(paired?.tokens?.operator?.token);
-  return { baseDir, token };
-}
-
-function verifyOperatorToken(params: { baseDir: string; token: string; scopes: string[] }) {
-  return verifyDeviceToken({
-    deviceId: "device-1",
-    token: params.token,
-    role: "operator",
-    scopes: params.scopes,
-    baseDir: params.baseDir,
+function registerPush(nodeId: string) {
+  return registerApnsRegistration({
+    nodeId,
+    transport: "direct",
+    token: "ABCD1234ABCD1234ABCD1234ABCD1234",
+    topic: "ai.openclaw.ios",
+    environment: "sandbox",
+    baseDir,
   });
 }
 
+async function setupOperatorToken(scopes: string[]) {
+  await pairDevice(scopes);
+  const paired = await getPairedDevice("device-1", baseDir);
+  return requireToken(paired?.tokens?.operator?.token);
+}
+
+function verifyOperatorToken(token: string, scopes: string[]) {
+  return verifyDeviceToken({ deviceId: "device-1", role: "operator", token, scopes, baseDir });
+}
+
 function requireToken(token: string | undefined): string {
-  expect(typeof token).toBe("string");
-  if (typeof token !== "string") {
-    throw new Error("expected device token to be issued");
-  }
-  return token;
+  expect(token).toBeTypeOf("string");
+  return requireValue(token, "expected device token");
 }
 
 function requireRotatedEntry(result: RotateDeviceTokenResult) {
@@ -83,318 +136,140 @@ function requireRotatedEntry(result: RotateDeviceTokenResult) {
   return result.entry;
 }
 
-async function overwritePairedOperatorTokenScopes(baseDir: string, scopes: string[]) {
-  const { pairedPath } = resolvePairingPaths(baseDir, "devices");
-  const pairedByDeviceId = JSON.parse(await readFile(pairedPath, "utf8")) as Record<
-    string,
-    PairedDevice
-  >;
-  const device = pairedByDeviceId["device-1"];
-  expect(device?.tokens?.operator).toBeDefined();
-  if (!device?.tokens?.operator) {
-    throw new Error("expected paired operator token");
-  }
-  device.tokens.operator.scopes = scopes;
-  await writeFile(pairedPath, JSON.stringify(pairedByDeviceId, null, 2));
-}
-
-async function mutatePairedDevice(
-  baseDir: string,
-  deviceId: string,
-  mutate: (device: PairedDevice) => void,
-) {
-  const { pairedPath } = resolvePairingPaths(baseDir, "devices");
-  const pairedByDeviceId = JSON.parse(await readFile(pairedPath, "utf8")) as Record<
-    string,
-    PairedDevice
-  >;
-  const device = pairedByDeviceId[deviceId];
-  expect(device).toBeDefined();
-  if (!device) {
-    throw new Error(`expected paired device ${deviceId}`);
-  }
-  mutate(device);
-  await writeFile(pairedPath, JSON.stringify(pairedByDeviceId, null, 2));
-}
-
-async function clearPairedOperatorApprovalBaseline(baseDir: string) {
+async function setOperatorScopes(baseDir: string, scopes: string[]) {
   await mutatePairedDevice(baseDir, "device-1", (device) => {
-    delete device.approvedScopes;
-    delete device.scopes;
+    const operatorToken = requireValue(device.tokens?.operator, "expected paired operator token");
+    operatorToken.scopes = scopes;
   });
+}
+
+// Tampers with a persisted pending request through the store layer; the domain
+// module has no API for rewriting pending timestamps.
+function mutatePendingRequest(
+  baseDir: string,
+  requestId: string,
+  mutate: (pending: { ts: number; refreshedAtMs?: number; scopes?: string[] }) => void,
+) {
+  const state = loadDevicePairingStoreState(baseDir);
+  const pending = requireValue(state.pendingById[requestId], "expected pending pairing request");
+  mutate(pending);
+  persistDevicePairingStoreState(state, baseDir, "pending");
 }
 
 const suiteRootTracker = createSuiteTempRootTracker({ prefix: "openclaw-device-pairing-" });
-
-async function makeDevicePairingDir(): Promise<string> {
-  return await suiteRootTracker.make("case");
-}
+let baseDir = "";
 
 describe("device pairing tokens", () => {
   beforeAll(async () => {
-    await suiteRootTracker.setup();
+    baseDir = await suiteRootTracker.setup();
+  });
+
+  beforeEach(async () => {
+    vi.stubEnv("OPENCLAW_STATE_DIR", baseDir);
+    await withDevicePairingLock(async () => {});
+    persistDevicePairingStoreState({ pendingById: {}, pairedByDeviceId: {} }, baseDir, "both");
+    persistDeviceBootstrapTokenRecords({}, baseDir);
   });
 
   afterAll(async () => {
+    await closeStateDatabaseForTest();
     await suiteRootTracker.cleanup();
   });
 
-  test("reuses existing pending requests for the same device", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const first = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-      },
-      baseDir,
-    );
-    const second = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-      },
-      baseDir,
-    );
-
+  test("re-requests keep one pending request alive past the pending TTL without churning requestIds", async () => {
+    // Keepalive extends the TTL without changing approval ordering or request identity.
+    const request = () => requestOperator(["operator.read"]);
+    const first = await request();
     expect(first.created).toBe(true);
-    expect(second.created).toBe(false);
-    expect(second.request.requestId).toBe(first.request.requestId);
-  });
+    const refreshed = await request();
+    expect(refreshed.created).toBe(false);
 
-  test("re-requesting with identical params preserves the original ts to prevent queue-jumping", async () => {
-    // Regression: refreshPendingDevicePairingRequest must not bump ts to Date.now().
-    // An attacker who reconnects with the same key/role/scopes could otherwise
-    // silently move their request to the top of the implicit --latest approval queue.
-    const baseDir = await makeDevicePairingDir();
-    const first = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.read"],
-      },
-      baseDir,
-    );
-    const originalTs = first.request.ts;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const second = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.read"],
-      },
-      baseDir,
-    );
+    // Simulate hours of aging since creation while retries kept the keepalive fresh.
+    const createdTs = Date.now() - 60 * 60 * 1000;
+    mutatePendingRequest(baseDir, first.request.requestId, (pending) => {
+      expect(pending.refreshedAtMs).toBeGreaterThanOrEqual(pending.ts);
+      pending.ts = createdTs;
+    });
 
-    expect(second.created).toBe(false);
-    expect(second.request.requestId).toBe(first.request.requestId);
-    expect(second.request.ts).toBe(originalTs);
+    const third = await request();
+    expect(third.created).toBe(false);
+    expect(third.request.requestId).toBe(first.request.requestId);
+    expect(third.request.ts).toBe(createdTs);
+    // The keepalive is store-internal; it must not leak into protocol payloads.
+    expect("refreshedAtMs" in third.request).toBe(false);
+
+    mutatePendingRequest(baseDir, first.request.requestId, (pending) => {
+      pending.refreshedAtMs = createdTs;
+    });
+    expect((await listDevicePairing(baseDir)).pending).toHaveLength(0);
   });
 
   test("supersedes pending requests when requested roles/scopes change", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const first = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "node",
-        scopes: [],
-      },
-      baseDir,
-    );
-    const second = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.read", "operator.write"],
-      },
-      baseDir,
-    );
+    const first = await requestPairing({ role: "node", scopes: [], silent: false });
+    const second = await requestPairing({
+      role: "operator",
+      scopes: ["operator.read", "operator.write"],
+      silent: true,
+    });
 
     expect(second.created).toBe(true);
     expect(second.request.requestId).not.toBe(first.request.requestId);
-    expect(second.request.role).toBe("operator");
-    expect(second.request.roles).toEqual(expect.arrayContaining(["node", "operator"]));
-    expect(second.request.scopes).toEqual(
-      expect.arrayContaining(["operator.read", "operator.write"]),
-    );
+    expect(second.superseded).toEqual([
+      { requestId: first.request.requestId, deviceId: "device-1" },
+    ]);
+    expect(second.request).toMatchObject({
+      role: "operator",
+      silent: false,
+      roles: expect.arrayContaining(["node", "operator"]),
+      scopes: expect.arrayContaining(["operator.read", "operator.write"]),
+    });
 
     const list = await listDevicePairing(baseDir);
     expect(list.pending).toHaveLength(1);
     expect(list.pending[0]?.requestId).toBe(second.request.requestId);
 
-    await approveDevicePairing(
-      second.request.requestId,
-      { callerScopes: ["operator.read", "operator.write"] },
-      baseDir,
-    );
+    await approveRequest(second.request, ["operator.read", "operator.write"]);
     const paired = await getPairedDevice("device-1", baseDir);
-    expect(paired?.roles).toEqual(expect.arrayContaining(["node", "operator"]));
-    expect(paired?.scopes).toEqual(expect.arrayContaining(["operator.read", "operator.write"]));
+    expect(paired).toMatchObject({
+      roles: expect.arrayContaining(["node", "operator"]),
+      scopes: expect.arrayContaining(["operator.read", "operator.write"]),
+    });
   });
 
-  test("approves mixed node and operator requests with admin caller scopes", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        roles: ["node", "operator"],
-        scopes: ["operator.read", "operator.write", "operator.talk.secrets"],
-      },
-      baseDir,
-    );
+  test("does not widen a down-scoped operator token when approving a scope upgrade", async () => {
+    await pairDevice(["operator.read", "operator.write"]);
+    await setOperatorScopes(baseDir, ["operator.read"]);
+    const upgrade = await requestOperator(["operator.talk.secrets"]);
 
-    await expect(
-      approveDevicePairing(
-        request.request.requestId,
-        { callerScopes: ["operator.admin", "operator.pairing"] },
-        baseDir,
-      ),
-    ).resolves.toMatchObject({
-      status: "approved",
-      requestId: request.request.requestId,
-    });
-
-    const paired = await getPairedDevice("device-1", baseDir);
-    expect(paired && listEffectivePairedDeviceRoles(paired)).toEqual(["node", "operator"]);
-    expect(paired?.tokens?.node?.scopes).toEqual([]);
-    expect(paired?.tokens?.operator?.scopes).toEqual([
+    await approveRequest(upgrade.request, [
       "operator.read",
       "operator.talk.secrets",
       "operator.write",
     ]);
-    await expect(
-      verifyDeviceToken({
-        deviceId: "device-1",
-        token: requireToken(paired?.tokens?.node?.token),
-        role: "node",
-        scopes: [],
-        baseDir,
-      }),
-    ).resolves.toEqual({ ok: true });
-    await expect(
-      verifyDeviceToken({
-        deviceId: "device-1",
-        token: requireToken(paired?.tokens?.operator?.token),
-        role: "operator",
-        scopes: ["operator.read"],
-        baseDir,
-      }),
-    ).resolves.toEqual({ ok: true });
-  });
-
-  test("preserves requested non-operator scopes on newly minted role tokens", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "node",
-        scopes: ["node.exec"],
-      },
-      baseDir,
-    );
-
-    await expect(approveDevicePairing(request.request.requestId, baseDir)).resolves.toMatchObject({
-      status: "approved",
-      requestId: request.request.requestId,
-    });
 
     const paired = await getPairedDevice("device-1", baseDir);
-    expect(paired?.tokens?.node?.scopes).toEqual(["node.exec"]);
-    await expect(
-      verifyDeviceToken({
-        deviceId: "device-1",
-        token: requireToken(paired?.tokens?.node?.token),
-        role: "node",
-        scopes: ["node.exec"],
-        baseDir,
-      }),
-    ).resolves.toEqual({ ok: true });
+    expect(paired).toMatchObject({
+      approvedScopes: ["operator.read", "operator.write", "operator.talk.secrets"],
+      tokens: { operator: { scopes: ["operator.read", "operator.talk.secrets"] } },
+    });
   });
 
-  test.each([
-    {
-      name: "node custom scope",
-      roles: ["node"],
-      scopes: ["vault.admin"],
-      scope: "vault.admin",
-      callerScopes: [],
-    },
-    {
-      name: "operator custom scope",
-      roles: ["operator"],
-      scopes: ["vault.admin"],
-      scope: "vault.admin",
-      callerScopes: ["operator.pairing"],
-    },
-    {
-      name: "node requesting operator scope",
-      roles: ["node"],
-      scopes: ["operator.read"],
-      scope: "operator.read",
-      callerScopes: ["operator.read"],
-    },
-  ])("rejects requested scopes outside requested roles: $name", async (params) => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        roles: params.roles,
-        scopes: params.scopes,
-      },
-      baseDir,
-    );
-
-    await expect(
-      approveDevicePairing(
-        request.request.requestId,
-        { callerScopes: params.callerScopes },
-        baseDir,
-      ),
-    ).resolves.toEqual({
+  test("rejects operator scopes requested only for a node role", async () => {
+    const { request } = await requestPairing({ roles: ["node"], scopes: ["operator.read"] });
+    await expect(approveRequest(request, ["operator.read"])).resolves.toEqual({
       status: "forbidden",
       reason: "scope-outside-requested-roles",
-      scope: params.scope,
+      scope: "operator.read",
     });
     await expect(getPairedDevice("device-1", baseDir)).resolves.toBeNull();
   });
 
   test("preserves existing non-operator scopes during operator-only mixed-role repairs", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const initial = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "node",
-        scopes: ["node.exec"],
-      },
-      baseDir,
-    );
-    await expect(approveDevicePairing(initial.request.requestId, baseDir)).resolves.toMatchObject({
-      status: "approved",
-      requestId: initial.request.requestId,
-    });
+    const initial = await requestPairing({ role: "node", scopes: ["node.exec"] });
+    await approveDevicePairing(initial.request.requestId, baseDir);
 
-    const repair = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        roles: ["node", "operator"],
-        scopes: ["operator.read"],
-      },
-      baseDir,
-    );
-    await expect(
-      approveDevicePairing(repair.request.requestId, { callerScopes: ["operator.read"] }, baseDir),
-    ).resolves.toMatchObject({
-      status: "approved",
-      requestId: repair.request.requestId,
-    });
+    const repair = await requestPairing({ roles: ["node", "operator"], scopes: ["operator.read"] });
+    await approveRequest(repair.request, ["operator.read"]);
 
     const paired = await getPairedDevice("device-1", baseDir);
     expect(paired?.tokens?.node?.scopes).toEqual(["node.exec"]);
@@ -410,81 +285,41 @@ describe("device pairing tokens", () => {
     ).resolves.toEqual({ ok: true });
   });
 
-  test("keeps superseded requests interactive when an existing pending request is interactive", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const first = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "node",
-        scopes: [],
-        silent: false,
-      },
-      baseDir,
-    );
-    expect(first.request.silent).toBe(false);
-
-    const second = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.read"],
-        silent: true,
-      },
-      baseDir,
-    );
-
-    expect(second.created).toBe(true);
-    expect(second.request.requestId).not.toBe(first.request.requestId);
-    expect(second.request.silent).toBe(false);
-  });
-
   test("rejects bootstrap token replay before pending scope escalation can be approved", async () => {
-    const baseDir = await makeDevicePairingDir();
     const issued = await issueDeviceBootstrapToken({
       baseDir,
       roles: ["operator"],
-      scopes: ["operator.read"],
+      scopes: ["operator.approvals", "operator.read", "operator.write"],
     });
 
+    const params = {
+      token: issued.token,
+      deviceId: "device-1",
+      publicKey: "public-key-1",
+      role: "operator",
+      baseDir,
+    };
     await expect(
       verifyDeviceBootstrapToken({
-        token: issued.token,
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
+        ...params,
         scopes: ["operator.read"],
-        baseDir,
       }),
     ).resolves.toEqual({ ok: true });
 
-    const first = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.read"],
-      },
-      baseDir,
-    );
+    const first = await requestOperator(["operator.read"]);
 
     await expect(
       verifyDeviceBootstrapToken({
-        token: issued.token,
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.admin"],
-        baseDir,
+        ...params,
+        scopes: ["operator.write", "operator.approvals"],
       }),
     ).resolves.toEqual({ ok: false, reason: "bootstrap_token_invalid" });
 
-    await approveDevicePairing(
-      first.request.requestId,
-      { callerScopes: ["operator.read"] },
-      baseDir,
-    );
+    const pending = await listDevicePairing(baseDir);
+    expect(pending.pending).toHaveLength(1);
+    expect(pending.pending[0]?.scopes).toEqual(["operator.read"]);
+
+    await approveRequest(first.request, ["operator.read"]);
     const paired = await getPairedDevice("device-1", baseDir);
     expect(paired?.scopes).toEqual(["operator.read"]);
     expect(paired?.approvedScopes).toEqual(["operator.read"]);
@@ -492,47 +327,33 @@ describe("device pairing tokens", () => {
   });
 
   test("fails closed for operator approvals when caller scopes are omitted", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-        scopes: ["operator.admin"],
-      },
-      baseDir,
-    );
+    const { request } = await requestOperator(["operator.admin"]);
 
-    await expect(approveDevicePairing(request.request.requestId, baseDir)).resolves.toEqual({
+    await expect(approveDevicePairing(request.requestId, baseDir)).resolves.toEqual({
       status: "forbidden",
       reason: "caller-scopes-required",
       scope: "operator.admin",
     });
 
-    await expect(
-      approveDevicePairing(
-        request.request.requestId,
-        {
-          callerScopes: ["operator.admin"],
-        },
-        baseDir,
-      ),
-    ).resolves.toEqual(
-      expect.objectContaining({
-        status: "approved",
-        requestId: request.request.requestId,
-      }),
-    );
+    const approved = await approveRequest(request, ["operator.admin"]);
+    expect(approved).toMatchObject({ status: "approved", requestId: request.requestId });
   });
 
-  test("metadata refresh cannot mutate approved role and scope fields", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedNodeDevice(baseDir);
+  test("metadata refresh cannot change authority and repair preserves owner metadata", async () => {
+    await pairDevice([], nodeIdentity);
+    const before = await getPairedDevice("node-1", baseDir);
+    const metadata = {
+      displayName: "renamed-node",
+      operatorLabel: "Kitchen Mac",
+      platform: "iOS 26.5.0",
+      lastSeenAtMs: 4321,
+      lastSeenReason: "bg_app_refresh",
+    };
 
     await updatePairedDeviceMetadata(
       "node-1",
       {
-        displayName: "renamed-node",
+        ...metadata,
         role: "operator",
         roles: ["operator"],
         scopes: ["operator.admin"],
@@ -543,482 +364,492 @@ describe("device pairing tokens", () => {
       baseDir,
     );
 
+    expect(await getPairedDevice("node-1", baseDir)).toEqual({ ...before, ...metadata });
+    const repair = await requestPairing({
+      ...nodeIdentity,
+      scopes: [],
+      displayName: "fresh-client-name",
+    });
+    await approveRequest(repair.request, []);
+    expect(await getPairedDevice("node-1", baseDir)).toMatchObject({
+      operatorLabel: metadata.operatorLabel,
+      lastSeenAtMs: metadata.lastSeenAtMs,
+      lastSeenReason: metadata.lastSeenReason,
+      displayName: "fresh-client-name",
+    });
+  });
+
+  test("stale node presence cannot update a replacement pairing generation", async () => {
+    const original = await pairNodeSurface(["system.run"]);
+    await expect(updatePairedNodeBins("node-1", ["retired-bin"], original, baseDir)).resolves.toBe(
+      true,
+    );
+    await expect(
+      updatePairedNodeSessionHost({
+        nodeId: "node-1",
+        sessionHost: true,
+        expectedPairingGeneration: original,
+        isConnectionCurrent: () => true,
+        baseDir,
+      }),
+    ).resolves.toBe(true);
+
+    const rotated = await rotateDeviceToken({
+      deviceId: "node-1",
+      role: "node",
+      scopes: [],
+      baseDir,
+    });
+    expect(rotated.ok).toBe(true);
+    const replacement = resolveNodePairingGeneration(await getPairedDevice("node-1", baseDir));
+    expect(replacement?.key).not.toBe(original.key);
+
+    await expect(
+      updatePairedDevicePresence(
+        "node-1",
+        { lastSeenAtMs: 4321, lastSeenReason: "bg_app_refresh" },
+        original,
+        baseDir,
+      ),
+    ).resolves.toBe(false);
     const paired = await getPairedDevice("node-1", baseDir);
-    expect(paired?.displayName).toBe("renamed-node");
-    expect(paired?.publicKey).toBe("public-key-node-1");
-    expect(paired?.role).toBe("node");
-    expect(paired?.roles).toEqual(["node"]);
-    expect(paired?.scopes).toEqual([]);
-    expect(paired?.approvedScopes).toEqual([]);
-    expect(paired?.tokens?.node).toBeTruthy();
-    expect(paired?.tokens?.operator).toBeUndefined();
+    expect(paired?.nodeSurface?.bins).toBeUndefined();
+    expect(paired?.nodeSurface?.sessionHost).toBeUndefined();
+    expect(paired?.lastSeenAtMs).toBeUndefined();
+    expect(paired?.lastSeenReason).toBeUndefined();
   });
 
-  test("generates base64url device tokens with 256-bit entropy output length", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
+  test("requires authority for inherited scopes before approving a scopeless repair", async () => {
+    await pairDevice(["operator.admin"]);
+    const before = await getPairedDevice("device-1", baseDir);
 
-    const paired = await getPairedDevice("device-1", baseDir);
-    const token = requireToken(paired?.tokens?.operator?.token);
-    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(Buffer.from(token, "base64url")).toHaveLength(32);
-  });
+    const repair = await requestPairing({ role: "operator" });
 
-  test("allows down-scoping from admin and preserves approved scope baseline", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
-
-    const downscoped = await rotateDeviceToken({
-      deviceId: "device-1",
-      role: "operator",
-      scopes: ["operator.read"],
-      baseDir,
+    await expect(approveRequest(repair.request, ["operator.pairing"])).resolves.toEqual({
+      status: "forbidden",
+      reason: "caller-missing-scope",
+      scope: "operator.admin",
     });
-    expect(downscoped.ok).toBe(true);
-    let paired = await getPairedDevice("device-1", baseDir);
-    expect(paired?.tokens?.operator?.scopes).toEqual(["operator.read"]);
-    expect(paired?.scopes).toEqual(["operator.admin"]);
-    expect(paired?.approvedScopes).toEqual(["operator.admin"]);
 
-    const reused = await rotateDeviceToken({
-      deviceId: "device-1",
-      role: "operator",
-      baseDir,
+    const after = await getPairedDevice("device-1", baseDir);
+    expect(after?.tokens?.operator?.token).toEqual(before?.tokens?.operator?.token);
+    expect(after?.tokens?.operator?.scopes).toEqual([
+      "operator.admin",
+      "operator.read",
+      "operator.write",
+    ]);
+    await expect(approveRequest(repair.request, ["operator.admin"])).resolves.toMatchObject({
+      status: "approved",
     });
-    expect(reused.ok).toBe(true);
-    paired = await getPairedDevice("device-1", baseDir);
-    expect(paired?.tokens?.operator?.scopes).toEqual(["operator.read"]);
-  });
-
-  test("preserves existing token scopes when approving a repair without requested scopes", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
-
-    const repair = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "operator",
-      },
-      baseDir,
-    );
-    await approveDevicePairing(
-      repair.request.requestId,
-      { callerScopes: ["operator.admin"] },
-      baseDir,
-    );
-
-    const paired = await getPairedDevice("device-1", baseDir);
-    expect(paired?.scopes).toEqual(["operator.admin"]);
-    expect(paired?.approvedScopes).toEqual(["operator.admin"]);
-    expect(paired?.tokens?.operator?.scopes).toEqual([
+    const approved = await getPairedDevice("device-1", baseDir);
+    expect(approved?.scopes).toEqual(["operator.admin"]);
+    expect(approved?.approvedScopes).toEqual(["operator.admin"]);
+    expect(approved?.tokens?.operator?.scopes).toEqual([
       "operator.admin",
       "operator.read",
       "operator.write",
     ]);
   });
 
-  test("rejects scope escalation when rotating a token and leaves state unchanged", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
+  test.each([
+    {
+      name: "scope escalation",
+      scopes: ["operator.read"],
+      request: { role: "operator", scopes: ["operator.admin"] },
+      expected: { ok: false, reason: "scope-outside-approved-baseline" },
+    },
+    {
+      name: "caller scope ceiling",
+      scopes: ["operator.admin"],
+      request: { role: "operator", callerScopes: ["operator.pairing"] },
+      expected: { ok: false, reason: "caller-missing-scope", scope: "operator.admin" },
+    },
+    {
+      name: "unapproved role",
+      scopes: ["operator.pairing"],
+      request: { role: "node" },
+      expected: { ok: false, reason: "unknown-device-or-role" },
+    },
+  ])(
+    "rejects rotation for $name without changing the paired device",
+    async ({ scopes, request, expected }) => {
+      await pairDevice(scopes);
+      const before = await getPairedDevice("device-1", baseDir);
+      await expect(
+        rotateDeviceToken({ deviceId: "device-1", ...request, baseDir }),
+      ).resolves.toEqual(expected);
+      expect(await getPairedDevice("device-1", baseDir)).toEqual(before);
+    },
+  );
+
+  test("revokes effective roles only when the caller holds the token scopes", async () => {
+    await pairDevice(["operator.admin"]);
     const before = await getPairedDevice("device-1", baseDir);
 
-    const rotated = await rotateDeviceToken({
+    const revoked = await revokeDeviceToken({
       deviceId: "device-1",
       role: "operator",
-      scopes: ["operator.admin"],
+      callerScopes: ["operator.pairing"],
       baseDir,
     });
-    expect(rotated).toEqual({ ok: false, reason: "scope-outside-approved-baseline" });
+    expect(revoked).toEqual({ ok: false, reason: "caller-missing-scope", scope: "operator.admin" });
 
     const after = await getPairedDevice("device-1", baseDir);
     expect(after?.tokens?.operator?.token).toEqual(before?.tokens?.operator?.token);
-    expect(after?.tokens?.operator?.scopes).toEqual(["operator.read"]);
-    expect(after?.scopes).toEqual(["operator.read"]);
-    expect(after?.approvedScopes).toEqual(["operator.read"]);
-  });
-
-  test("rejects scope escalation when ensuring a token and leaves state unchanged", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
-    const before = await getPairedDevice("device-1", baseDir);
-
-    const ensured = await ensureDeviceToken({
-      deviceId: "device-1",
-      role: "operator",
-      scopes: ["operator.admin"],
-      baseDir,
-    });
-    expect(ensured).toBeNull();
-
-    const after = await getPairedDevice("device-1", baseDir);
-    expect(after?.tokens?.operator?.token).toEqual(before?.tokens?.operator?.token);
-    expect(after?.tokens?.operator?.scopes).toEqual(["operator.read"]);
-    expect(after?.scopes).toEqual(["operator.read"]);
-    expect(after?.approvedScopes).toEqual(["operator.read"]);
-  });
-
-  test("preserves explicit empty scope baselines for node device tokens", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedNodeDevice(baseDir);
-
-    const paired = await getPairedDevice("node-1", baseDir);
-    expect(paired?.scopes).toEqual([]);
-    expect(paired?.approvedScopes).toEqual([]);
-
-    const seededToken = requireToken(paired?.tokens?.node?.token);
+    expect(after?.tokens?.operator?.revokedAtMs).toBeUndefined();
     await expect(
-      ensureDeviceToken({
-        deviceId: "node-1",
-        role: "node",
-        scopes: [],
+      revokeDeviceToken({
+        deviceId: "device-1",
+        role: "operator",
+        callerScopes: ["operator.admin"],
         baseDir,
       }),
-    ).resolves.toEqual(expect.objectContaining({ token: seededToken, scopes: [] }));
+    ).resolves.toMatchObject({
+      ok: true,
+      entry: { role: "operator", revokedAtMs: expect.any(Number) },
+    });
+    const paired = requireValue(
+      await getPairedDevice("device-1", baseDir),
+      "expected revoked device",
+    );
+    expect(paired.tokens?.operator?.revokedAtMs).toBeTypeOf("number");
+    expect(paired.roles).toContain("operator");
+    expect(listEffectivePairedDeviceRoles(paired)).toEqual([]);
+  });
 
-    await expect(
+  test("binds shared-auth browser tokens to their issuing generation through upgrades and rotation", async () => {
+    await pairDevice(["operator.read"], browserIdentity);
+    const params = { deviceId: "browser-device-1", role: "operator" };
+    const verify = (token: string, generation: string, scopes = ["operator.read"]) =>
       verifyDeviceToken({
-        deviceId: "node-1",
-        token: seededToken,
-        role: "node",
-        scopes: [],
-        baseDir,
-      }),
-    ).resolves.toEqual({ ok: true });
+        ...params,
+        token,
+        scopes,
+        requiredSharedGatewaySessionGeneration: generation,
+      });
+    const legacy = await getPairedDevice(params.deviceId, baseDir);
+    const legacyToken = requireToken(legacy?.tokens?.operator?.token);
+    await expect(verify(legacyToken, "old-generation")).resolves.toEqual({
+      ok: false,
+      reason: "legacy-browser-token",
+    });
+
+    const oldIssuer = { kind: "shared-gateway-auth", generation: "old-generation" } as const;
+    const oldIssued = await ensureDeviceToken({
+      ...params,
+      scopes: ["operator.read"],
+      issuer: oldIssuer,
+    });
+    const oldToken = requireToken(oldIssued?.token);
+    expect(oldToken).not.toBe(legacyToken);
+    await expect(verify(oldToken, "old-generation")).resolves.toEqual({
+      ok: true,
+      issuer: oldIssuer,
+    });
+    await expect(verify(oldToken, "new-generation")).resolves.toEqual({
+      ok: false,
+      reason: "issuer-generation-stale",
+    });
+
+    const issuer = { kind: "shared-gateway-auth", generation: "new-generation" } as const;
+    const newIssued = await ensureDeviceToken({ ...params, scopes: ["operator.read"], issuer });
+    const newToken = requireToken(newIssued?.token);
+    expect(newToken).not.toBe(oldToken);
+    await expect(verify(newToken, "new-generation")).resolves.toEqual({ ok: true, issuer });
+
+    const upgrade = await requestPairing({
+      ...browserIdentity,
+      role: "operator",
+      scopes: ["operator.admin"],
+    });
+    await expect(approveRequest(upgrade.request, ["operator.admin"])).resolves.toMatchObject({
+      status: "approved",
+    });
+    const upgraded = await getPairedDevice(params.deviceId, baseDir);
+    const upgradedToken = requireToken(upgraded?.tokens?.operator?.token);
+    await expect(verify(upgradedToken, "new-generation", ["operator.admin"])).resolves.toEqual({
+      ok: true,
+      issuer,
+    });
+
+    const rotated = requireRotatedEntry(
+      await rotateDeviceToken({ ...params, scopes: ["operator.read"] }),
+    );
+    expect(rotated.scopes).toEqual(["operator.read"]);
+    expect((await getPairedDevice(params.deviceId, baseDir))?.approvedScopes).toEqual([
+      "operator.read",
+      "operator.admin",
+    ]);
+    await expect(verify(rotated.token, "new-generation")).resolves.toEqual({ ok: true, issuer });
+  });
+
+  test("keeps ambiguous legacy device tokens valid across shared gateway auth rotation", async () => {
+    const token = await setupOperatorToken(["operator.read"]);
+    const params = { deviceId: "device-1", role: "operator", scopes: ["operator.read"] };
+    const verify = (bearer: string) =>
+      verifyDeviceToken({
+        ...params,
+        token: bearer,
+        requiredSharedGatewaySessionGeneration: "new-generation",
+      });
+    await expect(verify(token)).resolves.toEqual({ ok: true });
+    const issuer = { kind: "shared-gateway-auth", generation: "new-generation" } as const;
+    const issued = await ensureDeviceToken({ ...params, issuer });
+    expect(issued?.token).not.toBe(token);
+    await expect(verify(requireToken(issued?.token))).resolves.toEqual({ ok: true, issuer });
+    const unbound = await ensureDeviceToken(params);
+    expect(unbound?.token).not.toBe(issued?.token);
+    expect(unbound?.issuer).toBeUndefined();
+    await expect(verify(requireToken(unbound?.token))).resolves.toEqual({ ok: true });
   });
 
   test("normalizes legacy node token scopes back to [] on re-approval", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedNodeDevice(baseDir);
-
+    await pairDevice([], nodeIdentity);
     await mutatePairedDevice(baseDir, "node-1", (device) => {
-      const nodeToken = device.tokens?.node;
-      expect(nodeToken).toBeDefined();
-      if (!nodeToken) {
-        throw new Error("expected paired node token");
-      }
+      const nodeToken = requireValue(device.tokens?.node, "expected paired node token");
       nodeToken.scopes = ["operator.read"];
     });
 
-    const repair = await requestDevicePairing(
-      {
-        deviceId: "node-1",
-        publicKey: "public-key-node-1",
-        role: "node",
-      },
-      baseDir,
-    );
-    await approveDevicePairing(repair.request.requestId, { callerScopes: [] }, baseDir);
+    const repair = await requestPairing(nodeIdentity);
+    await approveRequest(repair.request, []);
 
     const paired = await getPairedDevice("node-1", baseDir);
-    expect(paired?.scopes).toEqual([]);
-    expect(paired?.approvedScopes).toEqual([]);
-    expect(paired?.tokens?.node?.scopes).toEqual([]);
+    expect(paired?.scopes).toStrictEqual([]);
+    expect(paired?.approvedScopes).toStrictEqual([]);
+    expect(paired?.tokens?.node?.scopes).toStrictEqual([]);
   });
 
-  test("bootstrap pairing seeds node and operator device tokens explicitly", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "bootstrap-device-1",
-        publicKey: "bootstrap-public-key-1",
-        role: "node",
-        roles: ["node", "operator"],
-        scopes: [],
-        silent: true,
+  test("bootstrap pairing treats missing persisted scopes as an empty grant", async () => {
+    const { request } = await requestBootstrap({ role: "operator", roles: ["operator"] });
+    mutatePendingRequest(baseDir, request.requestId, (pending) => {
+      delete pending.scopes;
+    });
+
+    await approveBootstrap(request);
+
+    const paired = await getPairedDevice("device-1", baseDir);
+    expect(paired?.approvedScopes).toStrictEqual([]);
+    expect(paired?.tokens?.operator?.scopes).toStrictEqual([]);
+  });
+
+  test("bootstrap approval access metadata initializes paired device last-seen fields", async () => {
+    const { request } = await requestBootstrap({ displayName: "pending", remoteIp: "127.0.0.1" });
+    const firstSeenAtMs = Date.now();
+
+    await approveBootstrap(request, PAIRING_SETUP_BOOTSTRAP_PROFILE, {
+      accessMetadata: {
+        displayName: "connected",
+        remoteIp: "10.0.0.2",
+        lastSeenAtMs: firstSeenAtMs,
+        lastSeenReason: "connect",
       },
-      baseDir,
-    );
-
-    await expect(
-      approveBootstrapDevicePairing(
-        request.request.requestId,
-        PAIRING_SETUP_BOOTSTRAP_PROFILE,
-        baseDir,
-      ),
-    ).resolves.toEqual(expect.objectContaining({ status: "approved" }));
-
-    const paired = await getPairedDevice("bootstrap-device-1", baseDir);
-    expect(paired?.roles).toEqual(expect.arrayContaining(["node", "operator"]));
-    expect(paired?.approvedScopes).toEqual(
-      expect.arrayContaining(PAIRING_SETUP_BOOTSTRAP_PROFILE.scopes),
-    );
-    expect(paired?.tokens?.node?.scopes).toEqual([]);
-    expect(paired?.tokens?.operator?.scopes).toEqual(
-      expect.arrayContaining(PAIRING_SETUP_BOOTSTRAP_PROFILE.scopes),
-    );
-  });
-
-  test("bootstrap pairing keeps operator token scopes operator-only", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "bootstrap-device-operator-scope",
-        publicKey: "bootstrap-public-key-operator-scope",
-        role: "node",
-        roles: ["node", "operator"],
-        scopes: [],
-        silent: true,
-      },
-      baseDir,
-    );
-
-    await expect(
-      approveBootstrapDevicePairing(
-        request.request.requestId,
-        {
-          roles: ["node", "operator"],
-          scopes: ["node.exec", "operator.pairing", "operator.read", "operator.write"],
-        },
-        baseDir,
-      ),
-    ).resolves.toEqual(expect.objectContaining({ status: "approved" }));
-
-    const paired = await getPairedDevice("bootstrap-device-operator-scope", baseDir);
-    expect(paired?.tokens?.operator?.scopes).toEqual(["operator.read", "operator.write"]);
-    expect(paired?.tokens?.node?.scopes).toEqual([]);
-  });
-
-  test("verifies token and rejects mismatches", async () => {
-    const { baseDir, token } = await setupOperatorToken(["operator.read"]);
-
-    const ok = await verifyOperatorToken({
-      baseDir,
-      token,
-      scopes: ["operator.read"],
     });
-    expect(ok.ok).toBe(true);
 
-    const mismatch = await verifyOperatorToken({
-      baseDir,
-      token: "x".repeat(token.length),
-      scopes: ["operator.read"],
+    const paired = await getPairedDevice("device-1", baseDir);
+    expect(paired).toMatchObject({
+      displayName: "connected",
+      remoteIp: "10.0.0.2",
+      lastSeenAtMs: firstSeenAtMs,
+      lastSeenReason: "connect",
     });
-    expect(mismatch.ok).toBe(false);
-    expect(mismatch.reason).toBe("token-mismatch");
   });
 
-  test("rejects persisted tokens whose scopes exceed the approved scope baseline", async () => {
-    const { baseDir, token } = await setupOperatorToken(["operator.read"]);
-    await overwritePairedOperatorTokenScopes(baseDir, ["operator.admin"]);
+  test("bootstrap node approval preserves existing operator token scopes", async () => {
+    await pairDevice(["operator.admin"]);
+    const before = await getPairedDevice("device-1", baseDir);
+    const operatorToken = requireToken(before?.tokens?.operator?.token);
 
-    await expect(
-      verifyOperatorToken({
-        baseDir,
-        token,
-        scopes: ["operator.admin"],
-      }),
-    ).resolves.toEqual({ ok: false, reason: "scope-mismatch" });
-  });
+    const { request } = await requestBootstrap();
 
-  test("fails closed when the paired device approval baseline is missing during verification", async () => {
-    const { baseDir, token } = await setupOperatorToken(["operator.read"]);
-    await clearPairedOperatorApprovalBaseline(baseDir);
+    await approveBootstrap(request);
 
-    await expect(
-      verifyOperatorToken({
-        baseDir,
-        token,
-        scopes: ["operator.read"],
-      }),
-    ).resolves.toEqual({ ok: false, reason: "scope-mismatch" });
-  });
-
-  test("accepts operator.read/operator.write requests with an operator.admin token scope", async () => {
-    const { baseDir, token } = await setupOperatorToken(["operator.admin"]);
-
-    const readOk = await verifyOperatorToken({
-      baseDir,
-      token,
-      scopes: ["operator.read"],
+    const paired = await getPairedDevice("device-1", baseDir);
+    expect(paired?.approvedScopes).toEqual(["operator.admin"]);
+    expect(paired?.tokens?.operator?.token).toBe(operatorToken);
+    expect(paired?.tokens?.node?.scopes).toStrictEqual([]);
+    await expect(verifyOperatorToken(operatorToken, ["operator.read"])).resolves.toEqual({
+      ok: true,
     });
-    expect(readOk.ok).toBe(true);
-
-    const writeOk = await verifyOperatorToken({
-      baseDir,
-      token,
-      scopes: ["operator.write"],
-    });
-    expect(writeOk.ok).toBe(true);
   });
 
-  test("accepts custom operator scopes under an operator.admin approval baseline", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
-
-    const rotated = await rotateDeviceToken({
-      deviceId: "device-1",
-      role: "operator",
-      scopes: ["operator.talk.secrets"],
-      baseDir,
+  test("bootstrap pairing bounds approved baseline to handoff scopes", async () => {
+    const { request } = await requestBootstrap({
+      roles: ["node", "operator"],
+      scopes: ["node.exec", "operator.approvals", "operator.read", "operator.write"],
     });
-    const entry = requireRotatedEntry(rotated);
-    expect(entry.scopes).toEqual(["operator.talk.secrets"]);
 
-    await expect(
-      verifyOperatorToken({
-        baseDir,
-        token: requireToken(entry.token),
-        scopes: ["operator.talk.secrets"],
-      }),
-    ).resolves.toEqual({ ok: true });
-  });
+    await approveBootstrap(request, overbroadBootstrapProfile());
 
-  test("fails closed when the paired device approval baseline is missing during ensure", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
-    await clearPairedOperatorApprovalBaseline(baseDir);
-
+    const paired = await getPairedDevice("device-1", baseDir);
+    const granted = ["operator.approvals", "operator.read", "operator.write"];
+    expect(paired?.approvedScopes).toEqual(granted);
+    expect(paired?.tokens?.operator?.scopes).toEqual(granted);
+    expect(paired?.tokens?.node?.scopes).toStrictEqual([]);
     await expect(
       ensureDeviceToken({
         deviceId: "device-1",
         role: "operator",
         scopes: ["operator.admin"],
-        baseDir,
+      }),
+    ).resolves.toBeNull();
+    expect(await getPairedDevice("device-1", baseDir)).toEqual(paired);
+  });
+
+  test("bootstrap repair removes stale privileges from a legacy approval baseline", async () => {
+    const profile = {
+      roles: ["node", "operator"],
+      scopes: ["operator.approvals", "operator.read", "operator.write"],
+    };
+    const first = await requestBootstrap(profile);
+    await approveBootstrap(first.request, profile);
+    await mutatePairedDevice(baseDir, "device-1", (device) => {
+      device.approvedScopes = ["operator.admin"];
+      device.scopes = ["operator.admin"];
+    });
+
+    const repair = await requestBootstrap({ ...profile, publicKey: "rotated-public-key" });
+    await expect(approveBootstrap(repair.request, profile)).resolves.toMatchObject({
+      status: "approved",
+    });
+
+    const paired = await getPairedDevice("device-1", baseDir);
+    expect(paired?.approvedScopes).toEqual(profile.scopes);
+    await expect(
+      ensureDeviceToken({
+        deviceId: "device-1",
+        role: "operator",
+        scopes: ["operator.admin"],
       }),
     ).resolves.toBeNull();
   });
 
-  test("fails closed when the paired device approval baseline is missing during rotation", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
-    await clearPairedOperatorApprovalBaseline(baseDir);
+  test("rejects persisted tokens whose scopes exceed the approved scope baseline", async () => {
+    const token = await setupOperatorToken(["operator.read"]);
+    await setOperatorScopes(baseDir, ["operator.admin"]);
+    await expect(verifyOperatorToken(token, ["operator.admin"])).resolves.toEqual({
+      ok: false,
+      reason: "scope-mismatch",
+    });
+  });
 
-    await expect(
-      rotateDeviceToken({
+  test.each([
+    ["verification", { ok: false, reason: "scope-mismatch" }],
+    ["ensure", null],
+    ["rotation", { ok: false, reason: "missing-approved-scope-baseline" }],
+  ] as const)(
+    "fails closed without an approval baseline during %s",
+    async (operation, expected) => {
+      const token = await setupOperatorToken(["operator.admin"]);
+      await mutatePairedDevice(baseDir, "device-1", (device) => {
+        delete device.approvedScopes;
+        delete device.scopes;
+      });
+      const params = {
         deviceId: "device-1",
         role: "operator",
         scopes: ["operator.admin"],
-        baseDir,
-      }),
-    ).resolves.toEqual({ ok: false, reason: "missing-approved-scope-baseline" });
-  });
+      };
+      const result =
+        operation === "verification"
+          ? await verifyDeviceToken({ ...params, token })
+          : operation === "ensure"
+            ? await ensureDeviceToken(params)
+            : await rotateDeviceToken(params);
+      expect(result).toEqual(expected);
+    },
+  );
 
   test("treats multibyte same-length token input as mismatch without throwing", async () => {
-    const { baseDir, token } = await setupOperatorToken(["operator.read"]);
+    const token = await setupOperatorToken(["operator.read"]);
     const multibyteToken = "é".repeat(token.length);
     expect(Buffer.from(multibyteToken).length).not.toBe(Buffer.from(token).length);
 
-    await expect(
-      verifyOperatorToken({
-        baseDir,
-        token: multibyteToken,
-        scopes: ["operator.read"],
-      }),
-    ).resolves.toEqual({ ok: false, reason: "token-mismatch" });
+    await expect(verifyOperatorToken(multibyteToken, ["operator.read"])).resolves.toEqual({
+      ok: false,
+      reason: "token-mismatch",
+    });
   });
 
-  test("derives effective roles from active tokens instead of sticky historical roles", async () => {
-    const baseDir = await makeDevicePairingDir();
-    const request = await requestDevicePairing(
-      {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-        role: "node",
-      },
+  test.each(["owner", "bootstrap"] as const)(
+    "clears APNs only when a $approval reapproval changes installation identity",
+    async (approval) => {
+      await pairNodeSurface(["system.run", "system.which"]);
+      await registerPush("node-1");
+      const approve = (request: { requestId: string }) =>
+        approval === "owner" ? approveRequest(request, []) : approveBootstrap(request);
+
+      const sameInstallationRepair = await requestPairing({ ...nodeIdentity, scopes: [] });
+      await expect(approve(sameInstallationRepair.request)).resolves.toMatchObject({
+        status: "approved",
+        nodePairingGenerationChanged: true,
+      });
+      expect(
+        (await listDevicePairing(baseDir)).pending.map((request) => request.requestId),
+      ).not.toContain(sameInstallationRepair.request.requestId);
+      await expect(loadApnsRegistration("node-1", baseDir)).resolves.toMatchObject({
+        token: "abcd1234abcd1234abcd1234abcd1234",
+      });
+
+      const previousGeneration = requireValue(
+        resolveNodePairingGeneration(await getPairedDevice("node-1", baseDir)),
+        "expected node generation",
+      );
+      await expect(
+        updatePairedNodeBins("node-1", ["retired-bin"], previousGeneration, baseDir),
+      ).resolves.toBe(true);
+      const replacementRepair = await requestPairing({
+        ...nodeIdentity,
+        publicKey: "public-key-node-1-replacement",
+        scopes: [],
+      });
+      await expect(approve(replacementRepair.request)).resolves.toMatchObject({
+        status: "approved",
+        nodePairingGenerationChanged: true,
+      });
+      expect(
+        (await listDevicePairing(baseDir)).pending.map((request) => request.requestId),
+      ).not.toContain(replacementRepair.request.requestId);
+      await expect(loadApnsRegistration("node-1", baseDir)).resolves.toBeNull();
+      const paired = await getPairedDevice("node-1", baseDir);
+      expect(resolveNodePairingGeneration(paired)?.key).not.toBe(previousGeneration.key);
+      expect(paired?.nodeSurface?.commands).toEqual(["system.run", "system.which"]);
+      expect(paired?.nodeSurface?.bins).toBeUndefined();
+    },
+  );
+
+  test("removal clears the device, repair, APNs registration, and renderer cache", async () => {
+    await pairDevice(["operator.read"]);
+    await updatePairedDeviceMetadata(
+      "device-1",
+      { clientId: "openclaw-control-ui", clientMode: "webchat" },
       baseDir,
     );
-    await approveDevicePairing(request.request.requestId, { callerScopes: [] }, baseDir);
+    await registerPush("device-1");
 
-    let paired = await getPairedDevice("device-1", baseDir);
-    expect(paired).toBeDefined();
-    if (!paired) {
-      throw new Error("expected paired node device");
-    }
-    expect(paired?.roles).toContain("node");
-    expect(listEffectivePairedDeviceRoles(paired)).toEqual(["node"]);
-    expect(hasEffectivePairedDeviceRole(paired, "node")).toBe(true);
-
-    await revokeDeviceToken({ deviceId: "device-1", role: "node", baseDir });
-
-    paired = await getPairedDevice("device-1", baseDir);
-    expect(paired).toBeDefined();
-    if (!paired) {
-      throw new Error("expected paired node device after revoke");
-    }
-    expect(paired?.roles).toContain("node");
-    expect(listEffectivePairedDeviceRoles(paired)).toEqual([]);
-    expect(hasEffectivePairedDeviceRole(paired, "node")).toBe(false);
-  });
-
-  test("fails closed for tokenless legacy role fields", async () => {
-    const device: PairedDevice = {
-      deviceId: "device-fallback",
-      publicKey: "pk-fallback",
-      role: "node",
-      roles: ["node", "operator"],
-      tokens: {},
-      createdAtMs: Date.now(),
-      approvedAtMs: Date.now(),
-    };
-    expect(listEffectivePairedDeviceRoles(device)).toEqual([]);
-    expect(hasEffectivePairedDeviceRole(device, "node")).toBe(false);
-    expect(hasEffectivePairedDeviceRole(device, "operator")).toBe(false);
-  });
-
-  test("filters active token roles to the approved pairing role set", async () => {
-    const now = Date.now();
-    const device: PairedDevice = {
-      deviceId: "device-filtered",
-      publicKey: "pk-filtered",
+    const staleRepair = await requestPairing({
+      publicKey: "public-key-1-rotated",
       role: "operator",
-      roles: ["operator"],
-      tokens: {
-        node: {
-          token: "forged-node-token",
-          role: "node",
-          scopes: [],
-          createdAtMs: now,
-        },
-        operator: {
-          token: "real-operator-token",
-          role: "operator",
-          scopes: ["operator.read"],
-          createdAtMs: now,
-        },
-      },
-      createdAtMs: now,
-      approvedAtMs: now,
-    };
+      scopes: ["operator.read"],
+    });
+    const otherPending = await requestPairing({
+      deviceId: "device-2",
+      publicKey: "public-key-2",
+      role: "node",
+      scopes: [],
+    });
 
-    expect(listEffectivePairedDeviceRoles(device)).toEqual(["operator"]);
-    expect(hasEffectivePairedDeviceRole(device, "node")).toBe(false);
-  });
+    await expect(hasPairedCardRenderer(baseDir)).resolves.toBe(true);
+    await expect(removePairedDevice("device-1", baseDir)).resolves.toEqual({
+      deviceId: "device-1",
+    });
+    await expect(hasPairedCardRenderer(baseDir)).resolves.toBe(false);
 
-  test("rejects rotating a token for a role that was never approved", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.pairing"]);
-
-    await expect(
-      rotateDeviceToken({
-        deviceId: "device-1",
-        role: "node",
-        baseDir,
-      }),
-    ).resolves.toEqual({ ok: false, reason: "unknown-device-or-role" });
-
-    const paired = await getPairedDevice("device-1", baseDir);
-    expect(paired?.tokens?.node).toBeUndefined();
-    expect(paired && listEffectivePairedDeviceRoles(paired)).toEqual(["operator"]);
-  });
-
-  test("removes paired devices by device id", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
-
-    const removed = await removePairedDevice("device-1", baseDir);
-    expect(removed).toEqual({ deviceId: "device-1" });
+    const pending = (await listDevicePairing(baseDir)).pending;
+    expect(pending.map((entry) => entry.requestId)).not.toContain(staleRepair.request.requestId);
+    expect(pending.map((entry) => entry.requestId)).toContain(otherPending.request.requestId);
+    await expect(approveRequest(staleRepair.request, ["operator.read"])).resolves.toBeNull();
     await expect(getPairedDevice("device-1", baseDir)).resolves.toBeNull();
-
+    await expect(loadApnsRegistration("device-1", baseDir)).resolves.toBeNull();
     await expect(removePairedDevice("device-1", baseDir)).resolves.toBeNull();
-  });
-
-  test("clears paired device state by device id", async () => {
-    const baseDir = await makeDevicePairingDir();
-    await setupPairedOperatorDevice(baseDir, ["operator.read"]);
-
-    await expect(clearDevicePairing("device-1", baseDir)).resolves.toBe(true);
-    await expect(getPairedDevice("device-1", baseDir)).resolves.toBeNull();
-    await expect(clearDevicePairing("device-1", baseDir)).resolves.toBe(false);
   });
 });
